@@ -31,14 +31,14 @@ try {
 let worktreePath;
 
 try {
-    const worktrees = JSON.parse(run('git', ['worktree', 'list', '--porcelain', '-z']).split('\0').filter(Boolean).reduce((items, entry) => {
+    const worktrees = run('git', ['worktree', 'list', '--porcelain', '-z']).split('\0').filter(Boolean).reduce((items, entry) => {
         if (entry.startsWith('worktree ')) {
             items.push({ path: entry.slice('worktree '.length) });
         } else if (entry.startsWith('branch ') && items.length > 0) {
             items[items.length - 1].branch = entry.slice('branch '.length).replace('refs/heads/', '');
         }
         return items;
-    }, []));
+    }, []);
 
     const worktree = worktrees.find((item) => item.branch === branch);
 
