@@ -37,16 +37,35 @@ program
     .version('0.0.1')
     .description('The Orchestrator');
 
+program.addHelpText(
+    'after',
+    `
+Examples:
+  $ orch run -f task.md
+  $ orch run -t "fix the typo in the README" --agent claude
+  $ orch run -t "add a --verbose flag to the CLI" --agent cursor -v
+`,
+);
+
 program
     .command('run')
-    .description('Run the Orchestrator')
-    .option('-f, --file <file>', 'The task file to run')
-    .option('-t, --text <text>', 'The text to run')
-    .option('-v, --verbose', 'Stream thinking deltas to stderr')
+    .description('Run the triage -> research -> plan -> implement pipeline on a task')
+    .option('-f, --file <file>', 'Path to a task file whose contents are used as the prompt')
+    .option('-t, --text <text>', 'Inline task description to use as the prompt (alternative to --file)')
+    .option('-v, --verbose', 'Stream agent thinking/output deltas to stderr as the pipeline runs')
     .addOption(
-        new Option('--agent <agent>', 'Agent backend for the whole pipeline')
+        new Option('--agent <agent>', 'Agent backend to run the pipeline with: "cursor" (Cursor Agent CLI) or "claude" (Claude Code CLI)')
             .choices(['cursor', 'claude'])
             .default('cursor'),
+    )
+    .addHelpText(
+        'after',
+        `
+Examples:
+  $ orch run -f task.md
+  $ orch run -t "fix the typo in the README" --agent claude
+  $ orch run -t "add a --verbose flag to the CLI" --agent cursor -v
+`,
     )
     .action(async (options) => {
         let prompt = '';
