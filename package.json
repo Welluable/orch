@@ -6,7 +6,6 @@
   "main": "main.js",
   "scripts": {
     "test": "node --test \"test/**/*.test.js\"",
-    "merge-branch": "node scripts/merge-branch.js",
     "commit": "agn 'commit with a message'"
   },
   "keywords": [],
