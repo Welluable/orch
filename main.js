@@ -143,9 +143,6 @@ class Agent {
                                 : `[${this.name}] failed in ${durationMs}ms`;
                             if (ok) this.spinner.succeed(msg);
                             else this.spinner.fail(msg);
-                            if (event.result != null && event.result !== '') {
-                                console.log(event.result);
-                            }
                             finish(null, { ok, result: event.result, durationMs });
                             break;
                         }
