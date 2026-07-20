@@ -35,23 +35,8 @@ const program = new Command();
 
 program
     .version('0.0.1')
-    .description('The Orchestrator');
-
-program.addHelpText(
-    'after',
-    `
-Examples:
-  $ orch run -f task.md
-  $ orch run -t "fix the typo in the README" --agent claude
-  $ orch run -t "add a --verbose flag to the CLI" --agent cursor -v
-`,
-);
-
-program
-    .command('run')
-    .description('Run the triage -> research -> plan -> implement pipeline on a task')
-    .option('-f, --file <file>', 'Path to a task file whose contents are used as the prompt')
-    .option('-t, --text <text>', 'Inline task description to use as the prompt (alternative to --file)')
+    .description('The Orchestrator')
+    .argument('<text...>', 'Task description to use as the prompt (mention a file path and the agent will read it)')
     .option('-v, --verbose', 'Stream agent thinking/output deltas to stderr as the pipeline runs')
     .addOption(
         new Option('--agent <agent>', 'Agent backend to run the pipeline with: "cursor" (Cursor Agent CLI) or "claude" (Claude Code CLI)')
@@ -62,19 +47,12 @@ program
         'after',
         `
 Examples:
-  $ orch run -f task.md
-  $ orch run -t "fix the typo in the README" --agent claude
-  $ orch run -t "add a --verbose flag to the CLI" --agent cursor -v
+  $ orch "fix the typo in the README" --agent claude
+  $ orch "add a --verbose flag to the CLI" --agent cursor -v
 `,
     )
-    .action(async (options) => {
-        let prompt = '';
-
-        if (options.file) {
-            prompt = fs.readFileSync(options.file, 'utf8');
-        } else if (options.text) {
-            prompt = options.text;
-        }
+    .action(async (text, options) => {
+        const prompt = text.join(' ');
 
         const verbose = Boolean(options.verbose);
         const AgentClass = options.agent === 'claude' ? AgentClaude : AgentCursor;

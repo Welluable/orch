@@ -15,11 +15,13 @@ Requires a local agent CLI on your `PATH`. Two backends are currently supported:
 ## Usage
 
 ```bash
-node main.js run -t "fix the typo in the README"
-node main.js run -f task.md --agent claude
-node main.js run -t "add a --verbose flag" --agent cursor -v
+node main.js "fix the typo in the README"
+node main.js "fix the bug described in task.md" --agent claude
+node main.js "add a --verbose flag" --agent cursor -v
 ```
 
 ```text
-orch run -f <file> | -t <text> [--agent cursor|claude] [-v]
+orch <text...> [--agent cursor|claude] [-v]
 ```
+
+Mention a file path in the task text and the agent will read it with its own tools.

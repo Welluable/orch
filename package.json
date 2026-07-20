@@ -6,7 +6,7 @@
   "main": "main.js",
   "scripts": {
     "test": "node --test \"test/**/*.test.js\"",
-    "commit": "agn 'commit with a message'"
+    "commit": "agn 'commit with a message and push'"
   },
   "keywords": [],
   "author": "",

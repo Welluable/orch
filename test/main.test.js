@@ -35,7 +35,7 @@ describe('main.js CLI', () => {
     const { code, stdout } = await runCli(['--help']);
     assert.equal(code, 0);
     assert.match(stdout, /The Orchestrator/);
-    assert.match(stdout, /run/);
+    assert.match(stdout, /<text\.\.\.>/);
   });
 
   it('prints version for --version', async () => {
@@ -44,18 +44,24 @@ describe('main.js CLI', () => {
     assert.equal(stdout.trim(), '0.0.1');
   });
 
-  it('prints run help for run --help', async () => {
-    const { code, stdout } = await runCli(['run', '--help']);
+  it('help output mentions --agent and --verbose', async () => {
+    const { code, stdout } = await runCli(['--help']);
     assert.equal(code, 0);
-    assert.match(stdout, /--file/);
-    assert.match(stdout, /--text/);
     assert.match(stdout, /--verbose/);
     assert.match(stdout, /--agent/);
   });
 
   it('rejects invalid --agent value', async () => {
-    const { code, stderr } = await runCli(['run', '--agent', 'foo']);
+    const { code, stderr } = await runCli(['some text', '--agent', 'foo']);
     assert.notEqual(code, 0);
+    assert.match(stderr, /cursor/);
+    assert.match(stderr, /claude/);
+  });
+
+  it('accepts a multi-word positional text argument without an argument-parsing error', async () => {
+    const { code, stderr } = await runCli(['fix', 'the', 'typo', '--agent', 'foo']);
+    assert.notEqual(code, 0);
+    assert.doesNotMatch(stderr, /missing required argument/i);
     assert.match(stderr, /cursor/);
     assert.match(stderr, /claude/);
   });
