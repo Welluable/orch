@@ -30,7 +30,3 @@ orch run -f <file> | -t <text> [--agent cursor|claude] [-v]
 |--------|---------|
 | `npm test` | `node --test "test/**/*.test.js"` |
 | `npm run merge-branch` | Merge helper (`scripts/merge-branch.js`) |
-
-## Specs
-
-Feature docs live in [`.spec/`](.spec/).
