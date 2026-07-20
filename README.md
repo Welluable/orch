@@ -13,16 +13,16 @@ Requires a local agent CLI on your `PATH`: `agent` (Cursor) or `claude` (Claude 
 ## Usage
 
 ```bash
-orch run -t "fix the typo in the README"
-orch run -f task.md --agent claude
-orch run -t "add a --verbose flag" --agent cursor -v
+orch "fix the typo in the README"
+orch "fix the bug described in task.md" --agent claude
+orch "add a --verbose flag" --agent cursor -v
 ```
 
 ```text
-orch run (-t <text> | -f <path>) [--agent cursor|claude] [-v]
+orch <text...> [--agent cursor|claude] [-v]
 ```
 
-If both `-f` and `-t` are set, the file wins. At least one is required.
+Mention a file path in the task text and the agent will read it with its own tools.
 
 ## Development
 

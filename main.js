@@ -35,17 +35,6 @@ function ensureBinaryOnPath(binary, agentName) {
     }
 }
 
-function resolvePrompt(options) {
-    if (options.file) {
-        return fs.readFileSync(options.file, 'utf8');
-    }
-    if (options.text) {
-        return options.text;
-    }
-    console.error('Error: provide a task via -t/--text or -f/--file');
-    process.exit(1);
-}
-
 async function runPipeline(prompt, options) {
     const verbose = Boolean(options.verbose);
     const AgentClass = options.agent === 'claude' ? AgentClaude : AgentCursor;
@@ -171,13 +160,8 @@ const program = new Command();
 program
     .name('orch')
     .version(version)
-    .description('The Orchestrator');
-
-program
-    .command('run')
-    .description('Run the triage → research → plan → implement pipeline')
-    .option('-t, --text <text>', 'Task description to use as the prompt')
-    .option('-f, --file <path>', 'Read the task prompt from a file (wins over --text)')
+    .description('The Orchestrator')
+    .argument('<text...>', 'Task description to use as the prompt (mention a file path and the agent will read it)')
     .option('-v, --verbose', 'Stream agent thinking/output deltas to stderr as the pipeline runs')
     .addOption(
         new Option('--agent <agent>', 'Agent backend to run the pipeline with: "cursor" (Cursor Agent CLI) or "claude" (Claude Code CLI)')
@@ -188,12 +172,12 @@ program
         'after',
         `
 Examples:
-  $ orch run -t "fix the typo in the README" --agent claude
-  $ orch run -f task.md --agent cursor -v
+  $ orch "fix the typo in the README" --agent claude
+  $ orch "fix the bug described in task.md" --agent cursor -v
 `,
     )
-    .action(async (options) => {
-        const prompt = resolvePrompt(options);
+    .action(async (text, options) => {
+        const prompt = text.join(' ');
         await runPipeline(prompt, options);
     });
 

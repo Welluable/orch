@@ -35,7 +35,7 @@ describe('main.js CLI', () => {
     const { code, stdout } = await runCli(['--help']);
     assert.equal(code, 0);
     assert.match(stdout, /The Orchestrator/);
-    assert.match(stdout, /run/);
+    assert.match(stdout, /<text\.\.\.>/);
   });
 
   it('prints version for --version', async () => {
@@ -45,27 +45,27 @@ describe('main.js CLI', () => {
   });
 
   it('help output mentions --agent and --verbose', async () => {
-    const { code, stdout } = await runCli(['run', '--help']);
+    const { code, stdout } = await runCli(['--help']);
     assert.equal(code, 0);
     assert.match(stdout, /--verbose/);
     assert.match(stdout, /--agent/);
   });
 
-  it('rejects run without -f or -t', async () => {
-    const { code, stderr } = await runCli(['run']);
+  it('rejects missing text argument', async () => {
+    const { code, stderr } = await runCli([]);
     assert.notEqual(code, 0);
-    assert.match(stderr, /-t|--text|-f|--file/);
+    assert.match(stderr, /missing required argument/i);
   });
 
   it('rejects invalid --agent value', async () => {
-    const { code, stderr } = await runCli(['run', '-t', 'some text', '--agent', 'foo']);
+    const { code, stderr } = await runCli(['some text', '--agent', 'foo']);
     assert.notEqual(code, 0);
     assert.match(stderr, /cursor/);
     assert.match(stderr, /claude/);
   });
 
-  it('accepts -t text without an argument-parsing error on invalid --agent', async () => {
-    const { code, stderr } = await runCli(['run', '-t', 'fix the typo', '--agent', 'foo']);
+  it('accepts a multi-word positional text argument without an argument-parsing error', async () => {
+    const { code, stderr } = await runCli(['fix', 'the', 'typo', '--agent', 'foo']);
     assert.notEqual(code, 0);
     assert.doesNotMatch(stderr, /missing required argument/i);
     assert.match(stderr, /cursor/);
