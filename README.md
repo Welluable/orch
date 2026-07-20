@@ -19,7 +19,7 @@ orch "add a --verbose flag" --agent cursor -v
 ```
 
 ```text
-orch <text...> [--agent cursor|claude] [-v]
+orch <task...> [--agent cursor|claude] [-v]
 ```
 
 Mention a file path in the task text and the agent will read it with its own tools.

@@ -161,7 +161,7 @@ program
     .name('orch')
     .version(version)
     .description('The Orchestrator')
-    .argument('<text...>', 'Task description to use as the prompt (mention a file path and the agent will read it)')
+    .argument('<task...>', 'Task description to use as the prompt (mention a file path and the agent will read it)')
     .option('-v, --verbose', 'Stream agent thinking/output deltas to stderr as the pipeline runs')
     .addOption(
         new Option('--agent <agent>', 'Agent backend to run the pipeline with: "cursor" (Cursor Agent CLI) or "claude" (Claude Code CLI)')
@@ -176,8 +176,12 @@ Examples:
   $ orch "fix the bug described in task.md" --agent cursor -v
 `,
     )
-    .action(async (text, options) => {
-        const prompt = text.join(' ');
+    .action(async (task, options) => {
+        const prompt = task.join(' ').trim();
+        if (!prompt) {
+            console.error('Error: task cannot be empty');
+            process.exit(1);
+        }
         await runPipeline(prompt, options);
     });
 

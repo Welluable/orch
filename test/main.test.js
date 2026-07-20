@@ -35,7 +35,7 @@ describe('main.js CLI', () => {
     const { code, stdout } = await runCli(['--help']);
     assert.equal(code, 0);
     assert.match(stdout, /The Orchestrator/);
-    assert.match(stdout, /<text\.\.\.>/);
+    assert.match(stdout, /<task\.\.\.>/);
   });
 
   it('prints version for --version', async () => {
@@ -51,10 +51,22 @@ describe('main.js CLI', () => {
     assert.match(stdout, /--agent/);
   });
 
-  it('rejects missing text argument', async () => {
+  it('rejects missing task argument', async () => {
     const { code, stderr } = await runCli([]);
     assert.notEqual(code, 0);
     assert.match(stderr, /missing required argument/i);
+  });
+
+  it('rejects empty task argument', async () => {
+    const { code, stderr } = await runCli(['']);
+    assert.equal(code, 1);
+    assert.match(stderr, /task cannot be empty/i);
+  });
+
+  it('rejects whitespace-only task argument', async () => {
+    const { code, stderr } = await runCli(['   ']);
+    assert.equal(code, 1);
+    assert.match(stderr, /task cannot be empty/i);
   });
 
   it('rejects invalid --agent value', async () => {
@@ -64,7 +76,7 @@ describe('main.js CLI', () => {
     assert.match(stderr, /claude/);
   });
 
-  it('accepts a multi-word positional text argument without an argument-parsing error', async () => {
+  it('accepts a multi-word positional task argument without an argument-parsing error', async () => {
     const { code, stderr } = await runCli(['fix', 'the', 'typo', '--agent', 'foo']);
     assert.notEqual(code, 0);
     assert.doesNotMatch(stderr, /missing required argument/i);
