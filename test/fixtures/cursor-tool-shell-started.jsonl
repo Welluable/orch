@@ -1,0 +1,2 @@
+{"type":"tool_call","subtype":"started","call_id":"c-2","tool_call":{"shellToolCall":{"args":{"command":"npm test"}}}}
+{"type":"tool_call","subtype":"completed","call_id":"c-2","tool_call":{"shellToolCall":{"args":{"command":"npm test"}}}}

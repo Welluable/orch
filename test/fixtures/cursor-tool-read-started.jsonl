@@ -1,0 +1,2 @@
+{"type":"tool_call","subtype":"started","call_id":"c-1","tool_call":{"readToolCall":{"args":{"path":"lib/agent.js"}}}}
+{"type":"tool_call","subtype":"completed","call_id":"c-1","tool_call":{"readToolCall":{"args":{"path":"lib/agent.js"}}}}

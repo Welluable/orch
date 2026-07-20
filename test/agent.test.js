@@ -2,7 +2,8 @@ import { describe, it, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { AgentCursor } from '../lib/agent-cursor.js';
 import { AgentClaude } from '../lib/agent-claude.js';
-import { formatElapsed, formatToolStatus } from '../lib/agent.js';
+import { formatElapsed } from '../lib/agent.js';
+import { formatToolStatus } from '../lib/tool-status.js';
 import { parseTriageJson } from '../lib/parse-triage-json.js';
 
 describe('formatElapsed', () => {
@@ -96,12 +97,12 @@ describe('AgentClaude', () => {
 describe('formatToolStatus', () => {
   it('maps Claude Bash and Edit names', () => {
     assert.match(
-      formatToolStatus({ name: 'Bash', input: { command: 'ls -la' } }),
+      formatToolStatus({ name: 'bash', args: { command: 'ls -la' } }),
       /Running:/,
     );
     assert.match(
-      formatToolStatus({ name: 'Edit', input: { path: 'a.js' } }),
-      /Writing a\.js/,
+      formatToolStatus({ name: 'edit', args: { path: 'a.js' } }),
+      /Editing a\.js/,
     );
   });
 });

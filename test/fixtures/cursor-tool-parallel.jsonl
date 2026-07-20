@@ -1,0 +1,7 @@
+{"type":"tool_call","subtype":"started","call_id":"c-1","tool_call":{"readToolCall":{"args":{"path":"a.js"}}}}
+{"type":"tool_call","subtype":"started","call_id":"c-2","tool_call":{"shellToolCall":{"args":{"command":"npm test"}}}}
+{"type":"tool_call","subtype":"started","call_id":"c-3","tool_call":{"grepToolCall":{"args":{"pattern":"foo"}}}}
+{"type":"tool_call","subtype":"started","call_id":"c-4","tool_call":{"readToolCall":{"args":{"path":"b.js"}}}}
+{"type":"tool_call","subtype":"started","call_id":"c-5","tool_call":{"readToolCall":{"args":{"path":"c.js"}}}}
+{"type":"tool_call","subtype":"completed","call_id":"c-1","tool_call":{"readToolCall":{"args":{"path":"a.js"}}}}
+{"type":"tool_call","subtype":"completed","call_id":"c-2","tool_call":{"shellToolCall":{"args":{"command":"npm test"}}}}
