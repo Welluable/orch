@@ -12,6 +12,10 @@ import { parseTriageJson } from './lib/parse-triage-json.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+const { version } = JSON.parse(
+    fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8'),
+);
+
 const ORCHESTRATOR_PATH = path.join(__dirname, '.orch');
 
 if (!fs.existsSync(ORCHESTRATOR_PATH)) {
@@ -31,37 +35,26 @@ function ensureBinaryOnPath(binary, agentName) {
     }
 }
 
-const program = new Command();
+function resolvePrompt(options) {
+    if (options.file) {
+        return fs.readFileSync(options.file, 'utf8');
+    }
+    if (options.text) {
+        return options.text;
+    }
+    console.error('Error: provide a task via -t/--text or -f/--file');
+    process.exit(1);
+}
 
-program
-    .version('0.0.1')
-    .description('The Orchestrator')
-    .argument('<text...>', 'Task description to use as the prompt (mention a file path and the agent will read it)')
-    .option('-v, --verbose', 'Stream agent thinking/output deltas to stderr as the pipeline runs')
-    .addOption(
-        new Option('--agent <agent>', 'Agent backend to run the pipeline with: "cursor" (Cursor Agent CLI) or "claude" (Claude Code CLI)')
-            .choices(['cursor', 'claude'])
-            .default('cursor'),
-    )
-    .addHelpText(
-        'after',
+async function runPipeline(prompt, options) {
+    const verbose = Boolean(options.verbose);
+    const AgentClass = options.agent === 'claude' ? AgentClaude : AgentCursor;
+    const binary = options.agent === 'claude' ? 'claude' : 'agent';
+    ensureBinaryOnPath(binary, options.agent);
+
+    const triageAgent = new AgentClass(
+        'triage',
         `
-Examples:
-  $ orch "fix the typo in the README" --agent claude
-  $ orch "add a --verbose flag to the CLI" --agent cursor -v
-`,
-    )
-    .action(async (text, options) => {
-        const prompt = text.join(' ');
-
-        const verbose = Boolean(options.verbose);
-        const AgentClass = options.agent === 'claude' ? AgentClaude : AgentCursor;
-        const binary = options.agent === 'claude' ? 'claude' : 'agent';
-        ensureBinaryOnPath(binary, options.agent);
-
-        const triageAgent = new AgentClass(
-            'triage',
-            `
                 You are a Triage Agent.
 
                 Decide if the user's request is a safe minimal fix (typo, small flag tweak,
@@ -78,25 +71,25 @@ Examples:
                 Set "simple": true only when a quick fix in the current working tree is enough.
                 Set "simple": false when research, planning, or a worktree is needed.
             `,
-            prompt,
-        );
+        prompt,
+    );
 
-        try {
-            const triageResult = await triageAgent.run({ verbose });
-            const parsed = parseTriageJson(triageResult.result);
+    try {
+        const triageResult = await triageAgent.run({ verbose });
+        const parsed = parseTriageJson(triageResult.result);
 
-            if (parsed?.simple === true) {
-                const fixPlan = parsed.fix_plan
-                    ? `
+        if (parsed?.simple === true) {
+            const fixPlan = parsed.fix_plan
+                ? `
                     [Triage Fix Plan]
                     ${parsed.fix_plan}
                     [/Triage Fix Plan]
                     `
-                    : '';
+                : '';
 
-                const quickFixAgent = new AgentClass(
-                    'quick-fix',
-                    `
+            const quickFixAgent = new AgentClass(
+                'quick-fix',
+                `
                         You are a Quick Fix Agent.
 
                         * Treat the user prompt as the full task description.
@@ -106,16 +99,16 @@ Examples:
                         * Do not create a git worktree.
                         ${fixPlan}
                     `,
-                    prompt,
-                );
+                prompt,
+            );
 
-                await quickFixAgent.run({ verbose });
-                return;
-            }
+            await quickFixAgent.run({ verbose });
+            return;
+        }
 
-            const researchAgent = new AgentClass(
-                'research',
-                `
+        const researchAgent = new AgentClass(
+            'research',
+            `
                     You are a Research Agent.
 
                     * If a research doc exist skip and return that path.
@@ -124,14 +117,14 @@ Examples:
                     * Do not write any code, after the research is complete, write a ${path.join(ORCHESTRATOR_PATH, 'research')}/<taskname>/research.md file with the research.
                     * Last message should be the path of the research.md file.
                 `,
-                prompt,
-            );
+            prompt,
+        );
 
-            const result = await researchAgent.run({ verbose });
+        const result = await researchAgent.run({ verbose });
 
-            const plannerAgent = new AgentClass(
-                'planner',
-                `
+        const plannerAgent = new AgentClass(
+            'planner',
+            `
                     You are a Planner Agent.
     
                     * If a plan doc exist skip and return that path.
@@ -145,14 +138,14 @@ Examples:
                     ${result.result}
                     [/Research Agent Output]
                 `,
-                prompt,
-            );
+            prompt,
+        );
 
-            const plannerResult = await plannerAgent.run({ verbose });
+        await plannerAgent.run({ verbose });
 
-            const implementerAgent = new AgentClass(
-                'implementer',
-                `
+        const implementerAgent = new AgentClass(
+            'implementer',
+            `
                     You are a Implementer Agent.
 
                     * Do not procceed is this is not a git repository. Ask the user to initialize a git repository.
@@ -163,14 +156,45 @@ Examples:
                     * Implement the steps to accomplish the user's request.
                     * Once all the steps are completed, the task is complete.
                 `,
-                prompt,
-            );
+            prompt,
+        );
 
-            await implementerAgent.run({ verbose });
-        } catch (err) {
-            console.error(`Error: ${err.message}`);
-            process.exit(1);
-        }
+        await implementerAgent.run({ verbose });
+    } catch (err) {
+        console.error(`Error: ${err.message}`);
+        process.exit(1);
+    }
+}
+
+const program = new Command();
+
+program
+    .name('orch')
+    .version(version)
+    .description('The Orchestrator');
+
+program
+    .command('run')
+    .description('Run the triage → research → plan → implement pipeline')
+    .option('-t, --text <text>', 'Task description to use as the prompt')
+    .option('-f, --file <path>', 'Read the task prompt from a file (wins over --text)')
+    .option('-v, --verbose', 'Stream agent thinking/output deltas to stderr as the pipeline runs')
+    .addOption(
+        new Option('--agent <agent>', 'Agent backend to run the pipeline with: "cursor" (Cursor Agent CLI) or "claude" (Claude Code CLI)')
+            .choices(['cursor', 'claude'])
+            .default('cursor'),
+    )
+    .addHelpText(
+        'after',
+        `
+Examples:
+  $ orch run -t "fix the typo in the README" --agent claude
+  $ orch run -f task.md --agent cursor -v
+`,
+    )
+    .action(async (options) => {
+        const prompt = resolvePrompt(options);
+        await runPipeline(prompt, options);
     });
 
 program.parse();

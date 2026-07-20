@@ -5,23 +5,31 @@ CLI orchestrator that runs a triage → research → plan → implement pipeline
 ## Install
 
 ```bash
-git clone git@github.com:Welluable/orch.git
-cd orch
-npm install
+npm install -g @welluable/orch
 ```
 
-Requires a local agent CLI on your `PATH`. Two backends are currently supported: `agent` (Cursor) and `claude` (Claude Code).
+Requires a local agent CLI on your `PATH`: `agent` (Cursor) or `claude` (Claude Code).
 
 ## Usage
 
 ```bash
-node main.js "fix the typo in the README"
-node main.js "fix the bug described in task.md" --agent claude
-node main.js "add a --verbose flag" --agent cursor -v
+orch run -t "fix the typo in the README"
+orch run -f task.md --agent claude
+orch run -t "add a --verbose flag" --agent cursor -v
 ```
 
 ```text
-orch <text...> [--agent cursor|claude] [-v]
+orch run (-t <text> | -f <path>) [--agent cursor|claude] [-v]
 ```
 
-Mention a file path in the task text and the agent will read it with its own tools.
+If both `-f` and `-t` are set, the file wins. At least one is required.
+
+## Development
+
+```bash
+git clone git@github.com:Welluable/orch.git
+cd orch
+npm install
+npm link          # optional: orch on PATH from this checkout
+npm test
+```

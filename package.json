@@ -1,9 +1,16 @@
 {
-  "name": "orch",
+  "name": "@welluable/orch",
   "version": "1.0.0",
-  "description": "",
+  "description": "CLI orchestrator: triage → research → plan → implement",
   "type": "module",
   "main": "main.js",
+  "bin": {
+    "orch": "./main.js"
+  },
+  "files": [
+    "main.js",
+    "lib/**"
+  ],
   "scripts": {
     "test": "node --test \"test/**/*.test.js\"",
     "commit": "agn 'commit with a message and push'"
@@ -11,6 +18,17 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Welluable/orch.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Welluable/orch/issues"
+  },
+  "homepage": "https://github.com/Welluable/orch#readme",
   "dependencies": {
     "commander": "^15.0.0",
     "ora": "^9.4.1"
