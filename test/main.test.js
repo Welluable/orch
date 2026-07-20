@@ -50,5 +50,13 @@ describe('main.js CLI', () => {
     assert.match(stdout, /--file/);
     assert.match(stdout, /--text/);
     assert.match(stdout, /--verbose/);
+    assert.match(stdout, /--agent/);
+  });
+
+  it('rejects invalid --agent value', async () => {
+    const { code, stderr } = await runCli(['run', '--agent', 'foo']);
+    assert.notEqual(code, 0);
+    assert.match(stderr, /cursor/);
+    assert.match(stderr, /claude/);
   });
 });

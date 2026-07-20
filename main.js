@@ -1,11 +1,12 @@
 #!/usr/bin/env node
-import { Command } from 'commander';
-import { spawn } from 'child_process';
+import { Command, Option } from 'commander';
+import { execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
-import ora from 'ora';
 
 import { fileURLToPath } from 'url';
+import { AgentCursor } from './lib/agent-cursor.js';
+import { AgentClaude } from './lib/agent-claude.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -16,171 +17,16 @@ if (!fs.existsSync(ORCHESTRATOR_PATH)) {
     fs.mkdirSync(ORCHESTRATOR_PATH);
 }
 
-function formatToolStatus(event) {
-    const name = event.name ?? event.tool_name ?? event.tool ?? 'tool';
-    const args = event.arguments ?? event.input ?? {};
-
-    switch (name) {
-        case 'grep':
-        case 'Grep':
-            return `Searching: ${args.pattern ?? 'codebase'}…`;
-        case 'read':
-        case 'Read':
-            return `Reading ${args.path ?? 'file'}…`;
-        case 'write':
-        case 'Write':
-            return `Writing ${args.path ?? 'file'}…`;
-        case 'shell':
-        case 'Shell':
-            return `Running: ${(args.command ?? '').slice(0, 60)}…`;
-        default:
-            return `Running ${name}…`;
-    }
-}
-
-class Agent {
-    constructor(name, instructions, prompt) {
-        this.name = name;
-        this.instructions = instructions;
-        this.prompt = prompt;
-        this.process = null;
-        this.spinner = null;
-    }
-
-    setStatus(text) {
-        if (!this.spinner) return;
-        this.spinner.text = `[${this.name}] ${text}`;
-    }
-
-    async run({ verbose = false } = {}) {
-        let promptToSend = `
-            [SYSTEM INSTRUCTIONS]
-            ${this.instructions}
-            [/SYSTEM INSTRUCTIONS]
-
-            [USER PROMPT]
-            ${this.prompt}
-            [/USER PROMPT]
-        `
-
-
-        this.process = spawn('agent', ['-p', '--force', '--output-format', 'stream-json', promptToSend], {
-            cwd: process.cwd(),
-            stdio: ['ignore', 'pipe', 'pipe'],
-            env: process.env,
-        });
-
-        this.spinner = ora({
-            text: `[${this.name}] starting…`,
-            isEnabled: process.stdout.isTTY,
-        }).start();
-
-        let buf = '';
-        let settled = false;
-
-        return new Promise((resolve, reject) => {
-            const finish = (err, value) => {
-                if (settled) return;
-                settled = true;
-                if (err) reject(err);
-                else resolve(value);
-            }
-
-            this.process.stdout.on('data', (chunk) => {
-                buf += chunk;
-                const lines = buf.split('\n');
-                buf = lines.pop();
-
-                lines.forEach(line => {
-                    if (!line.trim()) return;
-
-                    let event;
-                    try {
-                        event = JSON.parse(line);
-                    } catch {
-                        return;
-                    }
-
-                    if (process.env.ORCH_DEBUG) {
-                        process.stderr.write(JSON.stringify(event) + '\n');
-                    }
-
-                    switch (event.type) {
-                        case 'system': {
-                            this.setStatus('connected');
-                            break;
-                        }
-                        case 'thinking': {
-                            switch (event.subtype) {
-                                case 'delta': {
-                                    if (verbose) {
-                                        process.stderr.write(event.text ?? '');
-                                    } else {
-                                        this.setStatus('thinking…');
-                                    }
-                                    break;
-                                }
-                                case 'completed': {
-                                    break;
-                                }
-                            }
-                            break;
-                        }
-                        case 'tool_call': {
-                            this.setStatus(formatToolStatus(event));
-                            break;
-                        }
-                        case 'assistant': {
-                            this.setStatus('composing response…');
-                            break;
-                        }
-                        case 'result': {
-                            const ok = !event.is_error;
-                            const durationMs = event.duration_ms;
-                            this.ok = ok;
-                            const msg = ok
-                                ? `[${this.name}] done in ${durationMs}ms`
-                                : `[${this.name}] failed in ${durationMs}ms`;
-                            if (ok) this.spinner.succeed(msg);
-                            else this.spinner.fail(msg);
-                            finish(null, { ok, result: event.result, durationMs });
-                            break;
-                        }
-                    }
-                })
-            })
-
-            this.process.on('error', (err) => {
-                this.process = null;
-                if (this.spinner?.isSpinning) {
-                    this.spinner.fail(`[${this.name}] failed`);
-                }
-                finish(err);
-            });
-
-            this.process.on('close', (code) => {
-                this.process = null;
-                if (!settled) {
-                    if (this.spinner?.isSpinning) {
-                        this.spinner.fail(`[${this.name}] exited ${code}`);
-                    }
-                    finish(new Error(`[${this.name}] exited ${code} before result`));
-                }
-            });
-        });
-    }
-
-    async stop() {
-        if (!this.process) return;
-        const proc = this.process;
-        proc.kill();
-        await new Promise((resolve) => proc.once('close', resolve));
-        this.process = null;
-    }
-
-    async restart() {
-        this.stop();
-        this.run();
+function ensureBinaryOnPath(binary, agentName) {
+    try {
+        execFileSync('which', [binary], { stdio: 'ignore' });
+    } catch {
+        const hint =
+            agentName === 'claude'
+                ? 'claude not found; install Claude Code or use --agent cursor'
+                : 'agent not found; install Cursor Agent CLI or use --agent claude';
+        console.error(hint);
+        process.exit(1);
     }
 }
 
@@ -196,7 +42,12 @@ program
     .option('-f, --file <file>', 'The task file to run')
     .option('-t, --text <text>', 'The text to run')
     .option('-v, --verbose', 'Stream thinking deltas to stderr')
-    .action(async options => {
+    .addOption(
+        new Option('--agent <agent>', 'Agent backend for the whole pipeline')
+            .choices(['cursor', 'claude'])
+            .default('cursor'),
+    )
+    .action(async (options) => {
         let prompt = '';
 
         if (options.file) {
@@ -206,8 +57,11 @@ program
         }
 
         const verbose = Boolean(options.verbose);
+        const AgentClass = options.agent === 'claude' ? AgentClaude : AgentCursor;
+        const binary = options.agent === 'claude' ? 'claude' : 'agent';
+        ensureBinaryOnPath(binary, options.agent);
 
-        const researchAgent = new Agent(
+        const researchAgent = new AgentClass(
             'research',
             `
                 You are a Research Agent.
@@ -219,12 +73,12 @@ program
                 * Last message should be the path of the research.md file.
             `,
             prompt,
-        )
+        );
 
         try {
             const result = await researchAgent.run({ verbose });
 
-            const plannerAgent = new Agent(
+            const plannerAgent = new AgentClass(
                 'planner',
                 `
                     You are a Planner Agent.
@@ -239,13 +93,13 @@ program
                     [Research Agent Output]
                     ${result.result}
                     [/Research Agent Output]
-                `
+                `,
             );
 
             const plannerResult = await plannerAgent.run({ verbose });
 
-            const ImplementerAgent = new Agent(
-                'Implementer',
+            const implementerAgent = new AgentClass(
+                'implementer',
                 `
                     You are a Implementer Agent.
 
@@ -256,10 +110,10 @@ program
                     * Read the task.md created in the previous step.
                     * Implement the steps to accomplish the user's request.
                     * Once all the steps are completed, the task is complete.
-                `
+                `,
             );
 
-            const ImplementerResult = await ImplementerAgent.run({ verbose });
+            const implementerResult = await implementerAgent.run({ verbose });
         } catch (err) {
             console.error(`Error: ${err.message}`);
             process.exit(1);
