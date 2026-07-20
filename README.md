@@ -16,11 +16,14 @@ Requires a local agent CLI on your `PATH`: `agent` (Cursor) or `claude` (Claude 
 orch "fix the typo in the README"
 orch "fix the bug described in task.md" --agent claude
 orch "add a --verbose flag" --agent cursor -v
+orch "noop" --dry-run --agent cursor
 ```
 
 ```text
-orch <task...> [--agent cursor|claude] [-v]
+orch <task...> [--agent cursor|claude] [-v] [--dry-run]
 ```
+
+`--dry-run` checks that the selected agent CLI (`agent` or `claude`) is on your `PATH`, prints `cwd` / `agent` / `pass` or `fail`, and exits without running the pipeline.
 
 Mention a file path in the task text and the agent will read it with its own tools.
 

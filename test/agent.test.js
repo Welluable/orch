@@ -1,8 +1,8 @@
-import { describe, it, mock } from 'node:test';
+import { describe, it, mock, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { AgentCursor } from '../lib/agent-cursor.js';
 import { AgentClaude } from '../lib/agent-claude.js';
-import { formatElapsed } from '../lib/agent.js';
+import { formatElapsed, maybePrintModelLine, modelPrintState } from '../lib/agent.js';
 import { formatToolStatus } from '../lib/tool-status.js';
 import { parseTriageJson } from '../lib/parse-triage-json.js';
 
@@ -91,6 +91,60 @@ describe('AgentClaude', () => {
     );
 
     assert.deepEqual(statuses, ['connected']);
+  });
+});
+
+describe('maybePrintModelLine', () => {
+  beforeEach(() => {
+    modelPrintState.printed = false;
+  });
+
+  it('prints exactly one model: line for the first init with a model', () => {
+    const logs = [];
+    const restore = mock.method(console, 'log', (msg) => logs.push(msg));
+
+    maybePrintModelLine({ type: 'system', subtype: 'init', model: 'claude-sonnet-5' }, null);
+
+    restore.mock.restore();
+    assert.deepEqual(logs, ['model: claude-sonnet-5']);
+    assert.equal(modelPrintState.printed, true);
+  });
+
+  it('does not print again for a second agent\'s init', () => {
+    const logs = [];
+    const restore = mock.method(console, 'log', (msg) => logs.push(msg));
+
+    maybePrintModelLine({ type: 'system', subtype: 'init', model: 'claude-sonnet-5' }, null);
+    maybePrintModelLine({ type: 'system', subtype: 'init', model: 'claude-opus-4-8' }, null);
+
+    restore.mock.restore();
+    assert.deepEqual(logs, ['model: claude-sonnet-5']);
+  });
+
+  it('prints nothing when init has no model', () => {
+    const logs = [];
+    const restore = mock.method(console, 'log', (msg) => logs.push(msg));
+
+    maybePrintModelLine({ type: 'system', subtype: 'init' }, null);
+
+    restore.mock.restore();
+    assert.deepEqual(logs, []);
+    assert.equal(modelPrintState.printed, false);
+  });
+
+  it('pauses and resumes a spinning spinner around the print', () => {
+    const calls = [];
+    const spinner = {
+      isSpinning: true,
+      stop: () => calls.push('stop'),
+      start: () => calls.push('start'),
+    };
+    const restore = mock.method(console, 'log', () => {});
+
+    maybePrintModelLine({ type: 'system', subtype: 'init', model: 'Auto' }, spinner);
+
+    restore.mock.restore();
+    assert.deepEqual(calls, ['stop', 'start']);
   });
 });
 

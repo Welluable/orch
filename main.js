@@ -22,15 +22,24 @@ if (!fs.existsSync(ORCHESTRATOR_PATH)) {
     fs.mkdirSync(ORCHESTRATOR_PATH);
 }
 
-function ensureBinaryOnPath(binary, agentName) {
+function isBinaryOnPath(binary) {
     try {
         execFileSync('which', [binary], { stdio: 'ignore' });
+        return true;
     } catch {
-        const hint =
-            agentName === 'claude'
-                ? 'claude not found; install Claude Code or use --agent cursor'
-                : 'agent not found; install Cursor Agent CLI or use --agent claude';
-        console.error(hint);
+        return false;
+    }
+}
+
+function binaryMissingHint(agentName) {
+    return agentName === 'claude'
+        ? 'claude not found; install Claude Code or use --agent cursor'
+        : 'agent not found; install Cursor Agent CLI or use --agent claude';
+}
+
+function ensureBinaryOnPath(binary, agentName) {
+    if (!isBinaryOnPath(binary)) {
+        console.error(binaryMissingHint(agentName));
         process.exit(1);
     }
 }
@@ -39,7 +48,22 @@ async function runPipeline(prompt, options) {
     const verbose = Boolean(options.verbose);
     const AgentClass = options.agent === 'claude' ? AgentClaude : AgentCursor;
     const binary = options.agent === 'claude' ? 'claude' : 'agent';
+
+    console.log(`cwd:   ${process.cwd()}`);
+    console.log(`agent: ${options.agent}`);
+
+    if (options.dryRun) {
+        const ready = isBinaryOnPath(binary);
+        console.log(ready ? 'pass' : 'fail');
+        if (!ready) {
+            console.error(binaryMissingHint(options.agent));
+            process.exit(1);
+        }
+        return;
+    }
+
     ensureBinaryOnPath(binary, options.agent);
+    console.log();
 
     const triageAgent = new AgentClass(
         'triage',
@@ -163,6 +187,7 @@ program
     .description('The Orchestrator')
     .argument('<task...>', 'Task description to use as the prompt (mention a file path and the agent will read it)')
     .option('-v, --verbose', 'Stream agent thinking/output deltas to stderr as the pipeline runs')
+    .option('--dry-run', 'Check that the selected agent CLI is on PATH and exit; do not run the pipeline')
     .addOption(
         new Option('--agent <agent>', 'Agent backend to run the pipeline with: "cursor" (Cursor Agent CLI) or "claude" (Claude Code CLI)')
             .choices(['cursor', 'claude'])
@@ -174,6 +199,7 @@ program
 Examples:
   $ orch "fix the typo in the README" --agent claude
   $ orch "fix the bug described in task.md" --agent cursor -v
+  $ orch "noop" --dry-run --agent cursor
 `,
     )
     .action(async (task, options) => {

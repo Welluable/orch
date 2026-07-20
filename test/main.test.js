@@ -44,11 +44,28 @@ describe('main.js CLI', () => {
     assert.equal(stdout.trim(), '1.0.0');
   });
 
-  it('help output mentions --agent and --verbose', async () => {
+  it('help output mentions --agent, --verbose, and --dry-run', async () => {
     const { code, stdout } = await runCli(['--help']);
     assert.equal(code, 0);
     assert.match(stdout, /--verbose/);
     assert.match(stdout, /--agent/);
+    assert.match(stdout, /--dry-run/);
+  });
+
+  it('--dry-run reports readiness without running the pipeline', async () => {
+    const { code, stdout, stderr } = await runCli(['noop', '--dry-run']);
+    assert.match(stdout, /cwd:/);
+    assert.match(stdout, /agent:\s+cursor/);
+    assert.match(stdout, /^(pass|fail)$/m);
+    assert.doesNotMatch(stdout, /triage|research|planner|implementer/i);
+    assert.doesNotMatch(stdout, /model:/);
+    if (code === 0) {
+      assert.match(stdout, /^pass$/m);
+    } else {
+      assert.equal(code, 1);
+      assert.match(stdout, /^fail$/m);
+      assert.match(stderr, /agent not found/i);
+    }
   });
 
   it('rejects missing task argument', async () => {
