@@ -23,10 +23,3 @@ node main.js run -t "add a --verbose flag" --agent cursor -v
 ```text
 orch run -f <file> | -t <text> [--agent cursor|claude] [-v]
 ```
-
-## Scripts
-
-| Script | Command |
-|--------|---------|
-| `npm test` | `node --test "test/**/*.test.js"` |
-| `npm run merge-branch` | Merge helper (`scripts/merge-branch.js`) |
