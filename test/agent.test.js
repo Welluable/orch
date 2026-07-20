@@ -2,7 +2,39 @@ import { describe, it, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { AgentCursor } from '../lib/agent-cursor.js';
 import { AgentClaude } from '../lib/agent-claude.js';
-import { formatToolStatus } from '../lib/agent.js';
+import { formatElapsed, formatToolStatus } from '../lib/agent.js';
+import { parseTriageJson } from '../lib/parse-triage-json.js';
+
+describe('formatElapsed', () => {
+  it('formats whole seconds under a minute', () => {
+    assert.equal(formatElapsed(0), '0s');
+    assert.equal(formatElapsed(45000), '45s');
+  });
+
+  it('formats minutes and seconds', () => {
+    assert.equal(formatElapsed(182000), '3m 2s');
+  });
+});
+
+describe('parseTriageJson', () => {
+  it('parses valid JSON with simple true', () => {
+    const parsed = parseTriageJson('{"simple":true,"why":"typo","fix_plan":"fix it"}');
+    assert.equal(parsed.simple, true);
+    assert.equal(parsed.why, 'typo');
+  });
+
+  it('extracts JSON from markdown fences', () => {
+    const parsed = parseTriageJson('```json\n{"simple":false,"why":"big"}\n```');
+    assert.equal(parsed.simple, false);
+  });
+
+  it('returns null for invalid JSON', () => {
+    assert.equal(parseTriageJson('not json'), null);
+    assert.equal(parseTriageJson(''), null);
+    assert.equal(parseTriageJson(null), null);
+  });
+});
+
 
 describe('AgentCursor', () => {
   it('builds Cursor spawn config', () => {
