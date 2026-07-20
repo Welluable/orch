@@ -3,6 +3,7 @@ import { Command } from 'commander';
 import { spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import ora from 'ora';
 
 import { fileURLToPath } from 'url';
 
@@ -15,15 +16,43 @@ if (!fs.existsSync(ORCHESTRATOR_PATH)) {
     fs.mkdirSync(ORCHESTRATOR_PATH);
 }
 
+function formatToolStatus(event) {
+    const name = event.name ?? event.tool_name ?? event.tool ?? 'tool';
+    const args = event.arguments ?? event.input ?? {};
+
+    switch (name) {
+        case 'grep':
+        case 'Grep':
+            return `Searching: ${args.pattern ?? 'codebase'}…`;
+        case 'read':
+        case 'Read':
+            return `Reading ${args.path ?? 'file'}…`;
+        case 'write':
+        case 'Write':
+            return `Writing ${args.path ?? 'file'}…`;
+        case 'shell':
+        case 'Shell':
+            return `Running: ${(args.command ?? '').slice(0, 60)}…`;
+        default:
+            return `Running ${name}…`;
+    }
+}
+
 class Agent {
     constructor(name, instructions, prompt) {
         this.name = name;
         this.instructions = instructions;
         this.prompt = prompt;
         this.process = null;
+        this.spinner = null;
     }
 
-    async run() {
+    setStatus(text) {
+        if (!this.spinner) return;
+        this.spinner.text = `[${this.name}] ${text}`;
+    }
+
+    async run({ verbose = false } = {}) {
         let promptToSend = `
             [SYSTEM INSTRUCTIONS]
             ${this.instructions}
@@ -41,9 +70,13 @@ class Agent {
             env: process.env,
         });
 
+        this.spinner = ora({
+            text: `[${this.name}] starting…`,
+            isEnabled: process.stdout.isTTY,
+        }).start();
+
         let buf = '';
         let settled = false;
-        
 
         return new Promise((resolve, reject) => {
             const finish = (err, value) => {
@@ -52,43 +85,68 @@ class Agent {
                 if (err) reject(err);
                 else resolve(value);
             }
-            
+
             this.process.stdout.on('data', (chunk) => {
                 buf += chunk;
                 const lines = buf.split('\n');
                 buf = lines.pop();
-    
+
                 lines.forEach(line => {
-                    const event = JSON.parse(line);
-    
+                    if (!line.trim()) return;
+
+                    let event;
+                    try {
+                        event = JSON.parse(line);
+                    } catch {
+                        return;
+                    }
+
+                    if (process.env.ORCH_DEBUG) {
+                        process.stderr.write(JSON.stringify(event) + '\n');
+                    }
+
                     switch (event.type) {
                         case 'system': {
-                            console.log(`Agent Started`);
+                            this.setStatus('connected');
                             break;
                         }
                         case 'thinking': {
                             switch (event.subtype) {
                                 case 'delta': {
-                                    process.stdout.write(event.text);
+                                    if (verbose) {
+                                        process.stderr.write(event.text ?? '');
+                                    } else {
+                                        this.setStatus('thinking…');
+                                    }
                                     break;
                                 }
                                 case 'completed': {
-                                    console.log(`\n\nAgent Thinking Completed \n\n`);
                                     break;
                                 }
                             }
+                            break;
                         }
                         case 'tool_call': {
+                            this.setStatus(formatToolStatus(event));
                             break;
                         }
                         case 'assistant': {
+                            this.setStatus('composing response…');
                             break;
                         }
                         case 'result': {
-                            this.ok = !event.is_error;
-                            console.log(`\n\n${event.result}`);
-                            console.log(`[${this.name}] finished in ${event.duration_ms}ms`);
-                            finish(null, { ok: this.ok, result: event.result, durationMs: event.duration_ms });
+                            const ok = !event.is_error;
+                            const durationMs = event.duration_ms;
+                            this.ok = ok;
+                            const msg = ok
+                                ? `[${this.name}] done in ${durationMs}ms`
+                                : `[${this.name}] failed in ${durationMs}ms`;
+                            if (ok) this.spinner.succeed(msg);
+                            else this.spinner.fail(msg);
+                            if (event.result != null && event.result !== '') {
+                                console.log(event.result);
+                            }
+                            finish(null, { ok, result: event.result, durationMs });
                             break;
                         }
                     }
@@ -97,12 +155,20 @@ class Agent {
 
             this.process.on('error', (err) => {
                 this.process = null;
+                if (this.spinner?.isSpinning) {
+                    this.spinner.fail(`[${this.name}] failed`);
+                }
                 finish(err);
             });
 
             this.process.on('close', (code) => {
                 this.process = null;
-                if (!settled) finish(new Error(`[${this.name}] exited ${code} before result`));
+                if (!settled) {
+                    if (this.spinner?.isSpinning) {
+                        this.spinner.fail(`[${this.name}] exited ${code}`);
+                    }
+                    finish(new Error(`[${this.name}] exited ${code} before result`));
+                }
             });
         });
     }
@@ -132,6 +198,7 @@ program
     .description('Run the Orchestrator')
     .option('-f, --file <file>', 'The task file to run')
     .option('-t, --text <text>', 'The text to run')
+    .option('-v, --verbose', 'Stream thinking deltas to stderr')
     .action(async options => {
         let prompt = '';
 
@@ -140,6 +207,8 @@ program
         } else if (options.text) {
             prompt = options.text;
         }
+
+        const verbose = Boolean(options.verbose);
 
         const researchAgent = new Agent(
             'research',
@@ -156,7 +225,7 @@ program
         )
 
         try {
-            const result = await researchAgent.run();
+            const result = await researchAgent.run({ verbose });
 
             const plannerAgent = new Agent(
                 'planner',
@@ -176,7 +245,7 @@ program
                 `
             );
 
-            const plannerResult = await plannerAgent.run();
+            const plannerResult = await plannerAgent.run({ verbose });
 
             const ImplementerAgent = new Agent(
                 'Implementer',
@@ -193,8 +262,7 @@ program
                 `
             );
 
-            const ImplementerResult = await ImplementerAgent.run();
-
+            const ImplementerResult = await ImplementerAgent.run({ verbose });
         } catch (err) {
             console.error(`Error: ${err.message}`);
             process.exit(1);

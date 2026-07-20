@@ -49,5 +49,6 @@ describe('main.js CLI', () => {
     assert.equal(code, 0);
     assert.match(stdout, /--file/);
     assert.match(stdout, /--text/);
+    assert.match(stdout, /--verbose/);
   });
 });
