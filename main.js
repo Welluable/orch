@@ -44,9 +44,9 @@ function ensureBinaryOnPath(binary, agentName) {
     }
 }
 
-async function runPipeline(prompt, options) {
+export async function runPipeline(prompt, options) {
     const verbose = Boolean(options.verbose);
-    const AgentClass = options.agent === 'claude' ? AgentClaude : AgentCursor;
+    const AgentClass = options.AgentClass ?? (options.agent === 'claude' ? AgentClaude : AgentCursor);
     const binary = options.agent === 'claude' ? 'claude' : 'agent';
 
     console.log(`cwd:   ${process.cwd()}`);
@@ -62,7 +62,9 @@ async function runPipeline(prompt, options) {
         return;
     }
 
-    ensureBinaryOnPath(binary, options.agent);
+    if (!options.AgentClass) {
+        ensureBinaryOnPath(binary, options.agent);
+    }
     console.log();
 
     const triageAgent = new AgentClass(
@@ -156,23 +158,60 @@ async function runPipeline(prompt, options) {
 
         await plannerAgent.run({ verbose });
 
-        const implementerAgent = new AgentClass(
-            'implementer',
+        const testWriter = new AgentClass(
+            'test-writer',
             `
-                    You are a Implementer Agent.
+                    You are a Test Writer Agent.
 
                     * Do not procceed is this is not a git repository. Ask the user to initialize a git repository.
                     * Always spawn a new git worktree for the task.
-                    * Create a status.md file in the <taskname> directory.
-                    * Keep the status.md file updated with the status of the step.
+                    * Create a status.md file in the <taskname> directory; record the worktree path in it.
                     * Read the task.md created in the previous step.
-                    * Implement the steps to accomplish the user's request.
-                    * Once all the steps are completed, the task is complete.
+                    * Before making any production-code changes, decide how to verify the work:
+                      - If automated tests are practical, write the relevant test cases/files first,
+                        extending the existing test runner and conventions.
+                      - If automated tests are not practical, write a "## Verification" section in
+                        status.md describing what a human or later reviewer should check in the diff.
+                        Do not invent a fake test harness.
+                    * Do not implement the feature/fix itself in this stage — tests and criteria only
+                      (plus worktree / status scaffolding).
+                    * Your final message must include the worktree path (and test file paths / run
+                      command, if applicable) so it can be handed to the next stage.
                 `,
             prompt,
         );
 
-        await implementerAgent.run({ verbose });
+        const testOut = await testWriter.run({ verbose });
+        if (!testOut.ok) {
+            throw new Error('test-writer failed; stopping before code-writer');
+        }
+
+        const codeWriter = new AgentClass(
+            'code-writer',
+            `
+                    You are a Code Writer Agent.
+
+                    * Read the task.md and the current status.md.
+                    * Reuse the existing worktree created by the test-writer — do not create a
+                      second one.
+                    * Implement the steps in task.md.
+                    * Keep status.md updated as steps complete.
+                    * If tests were added or already exist, run them and record the results (pass or
+                      fail) in status.md. Do not fix failures beyond this stage — finish regardless
+                      of failure.
+                    * If only verification criteria exist, implement so those criteria are met, and
+                      note that in status.md.
+                    * Do not delete or weaken tests just to force a green run.
+                    * Once implementation is done, the task is complete.
+
+                    [Test Writer Output]
+                    ${testOut.result}
+                    [/Test Writer Output]
+                `,
+            prompt,
+        );
+
+        await codeWriter.run({ verbose });
     } catch (err) {
         console.error(`Error: ${err.message}`);
         process.exit(1);
@@ -211,4 +250,6 @@ Examples:
         await runPipeline(prompt, options);
     });
 
-program.parse();
+if (process.argv[1] === __filename) {
+    program.parse();
+}
