@@ -7,6 +7,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { AgentCursor } from './lib/agent-cursor.js';
 import { AgentClaude } from './lib/agent-claude.js';
+import { AgentAgn } from './lib/agent-agn.js';
 import { parseTriageJson } from './lib/parse-triage-json.js';
 import { createRunContext } from './lib/run-context.js';
 import { createWorktree } from './lib/worktree.js';
@@ -18,6 +19,24 @@ const { version } = JSON.parse(
     fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8'),
 );
 
+const AGENT_BACKENDS = {
+    cursor: {
+        AgentClass: AgentCursor,
+        binary: 'agent',
+        missingHint: 'agent not found; install Cursor Agent CLI or use --agent claude',
+    },
+    claude: {
+        AgentClass: AgentClaude,
+        binary: 'claude',
+        missingHint: 'claude not found; install Claude Code or use --agent cursor',
+    },
+    agn: {
+        AgentClass: AgentAgn,
+        binary: 'agn',
+        missingHint: 'agn not found; run npm install -g @welluable/agn-cli or use --agent cursor',
+    },
+};
+
 function isBinaryOnPath(binary) {
     try {
         execFileSync('which', [binary], { stdio: 'ignore' });
@@ -28,9 +47,9 @@ function isBinaryOnPath(binary) {
 }
 
 function binaryMissingHint(agentName) {
-    return agentName === 'claude'
-        ? 'claude not found; install Claude Code or use --agent cursor'
-        : 'agent not found; install Cursor Agent CLI or use --agent claude';
+    const backend = AGENT_BACKENDS[agentName];
+    if (!backend) throw new Error(`Unknown agent backend: ${agentName}`);
+    return backend.missingHint;
 }
 
 function ensureBinaryOnPath(binary, agentName) {
@@ -42,8 +61,12 @@ function ensureBinaryOnPath(binary, agentName) {
 
 export async function runPipeline(prompt, options) {
     const verbose = Boolean(options.verbose);
-    const AgentClass = options.AgentClass ?? (options.agent === 'claude' ? AgentClaude : AgentCursor);
-    const binary = options.agent === 'claude' ? 'claude' : 'agent';
+    const backend = AGENT_BACKENDS[options.agent];
+    if (!backend) {
+        throw new Error(`Unknown agent backend: ${options.agent}`);
+    }
+    const AgentClass = options.AgentClass ?? backend.AgentClass;
+    const binary = backend.binary;
     const createRunContextFn = options.createRunContext ?? createRunContext;
     const createWorktreeFn = options.createWorktree ?? createWorktree;
     const invocationCwd = process.cwd();
@@ -247,8 +270,8 @@ program
     .option('-v, --verbose', 'Stream agent thinking/output deltas to stderr as the pipeline runs')
     .option('--dry-run', 'Check that the selected agent CLI is on PATH and exit; do not run the pipeline')
     .addOption(
-        new Option('--agent <agent>', 'Agent backend to run the pipeline with: "cursor" (Cursor Agent CLI) or "claude" (Claude Code CLI)')
-            .choices(['cursor', 'claude'])
+        new Option('--agent <agent>', 'Agent backend to run the pipeline with: "cursor" (Cursor Agent CLI), "claude" (Claude Code CLI), or "agn" (agn CLI)')
+            .choices(['cursor', 'claude', 'agn'])
             .default('cursor'),
     )
     .addHelpText(
@@ -257,6 +280,7 @@ program
 Examples:
   $ orch "fix the typo in the README" --agent claude
   $ orch "fix the bug described in task.md" --agent cursor -v
+  $ orch "implement the local spec" --agent agn -v
   $ orch "noop" --dry-run --agent cursor
 `,
     )

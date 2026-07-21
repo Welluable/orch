@@ -1,0 +1,2 @@
+{"type":"result","subtype":"error","session_id":"s-1","error":"agn config missing API key"}
+{"type":"result","subtype":"max_iterations","session_id":"s-1","result":"reached max iterations","iterations":10}

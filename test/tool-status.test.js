@@ -8,6 +8,7 @@ import {
   formatActiveTools,
   normalizeCursorToolEvent,
   normalizeClaudeToolEvent,
+  normalizeAgnToolEvent,
   truncate,
   basename,
   formatArgPreview,
@@ -208,6 +209,101 @@ describe('normalizeClaudeToolEvent', () => {
 
   it('returns empty array for unrelated event types', () => {
     assert.deepEqual(normalizeClaudeToolEvent({ type: 'system', subtype: 'init' }), []);
+  });
+});
+
+describe('normalizeAgnToolEvent', () => {
+  it('returns null for non-tool_call events', () => {
+    assert.equal(normalizeAgnToolEvent({ type: 'assistant' }), null);
+    assert.equal(normalizeAgnToolEvent({ type: 'system', subtype: 'init' }), null);
+  });
+
+  it('returns null for a tool_call with an invalid subtype', () => {
+    assert.equal(
+      normalizeAgnToolEvent({ type: 'tool_call', subtype: 'progress', call_id: 'a-1', name: 'read_file' }),
+      null,
+    );
+  });
+
+  it('returns null when call_id is missing or not a non-empty string', () => {
+    assert.equal(
+      normalizeAgnToolEvent({ type: 'tool_call', subtype: 'started', name: 'read_file' }),
+      null,
+    );
+    assert.equal(
+      normalizeAgnToolEvent({ type: 'tool_call', subtype: 'started', call_id: '', name: 'read_file' }),
+      null,
+    );
+    assert.equal(
+      normalizeAgnToolEvent({ type: 'tool_call', subtype: 'started', call_id: 42, name: 'read_file' }),
+      null,
+    );
+  });
+
+  it('normalizes a started tool_call from fixture, canonicalizing read_file to read', () => {
+    const [started] = loadFixture('agn-tool-read-started.jsonl');
+    assert.deepEqual(normalizeAgnToolEvent(started), {
+      name: 'read',
+      args: { path: 'lib/agent.js' },
+      phase: 'started',
+      callId: 'a-1',
+    });
+  });
+
+  it('normalizes a completed tool_call from fixture with empty args and matching call_id', () => {
+    const [completed] = loadFixture('agn-tool-read-completed.jsonl');
+    assert.deepEqual(normalizeAgnToolEvent(completed), {
+      name: 'read',
+      args: {},
+      phase: 'completed',
+      callId: 'a-1',
+    });
+  });
+
+  it('canonicalizes write_file to write and patch to edit', () => {
+    assert.equal(
+      normalizeAgnToolEvent({
+        type: 'tool_call',
+        subtype: 'started',
+        call_id: 'a-2',
+        name: 'write_file',
+        input: { path: 'a.js' },
+      }).name,
+      'write',
+    );
+    assert.equal(
+      normalizeAgnToolEvent({
+        type: 'tool_call',
+        subtype: 'started',
+        call_id: 'a-3',
+        name: 'patch',
+        input: { path: 'a.js' },
+      }).name,
+      'edit',
+    );
+  });
+
+  it('leaves unmapped tool names (e.g. read_skill, shell) unchanged', () => {
+    assert.equal(
+      normalizeAgnToolEvent({
+        type: 'tool_call',
+        subtype: 'started',
+        call_id: 'a-4',
+        name: 'read_skill',
+        input: { name: 'foo' },
+      }).name,
+      'read_skill',
+    );
+    assert.equal(
+      normalizeAgnToolEvent({
+        type: 'tool_call',
+        subtype: 'started',
+        call_id: 'a-5',
+        name: 'shell',
+        input: { command: 'npm test' },
+      }).name,
+      'shell',
+    );
   });
 });
 

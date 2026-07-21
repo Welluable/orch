@@ -1,10 +1,34 @@
 import { describe, it, mock, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
 import { AgentCursor } from '../lib/agent-cursor.js';
 import { AgentClaude } from '../lib/agent-claude.js';
+import { AgentAgn } from '../lib/agent-agn.js';
 import { formatElapsed, maybePrintModelLine, modelPrintState } from '../lib/agent.js';
 import { formatToolStatus } from '../lib/tool-status.js';
 import { parseTriageJson } from '../lib/parse-triage-json.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+function loadFixture(name) {
+  const text = readFileSync(path.join(__dirname, 'fixtures', name), 'utf8');
+  return text
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+}
+
+/** A stand-in ora spinner so settleResult() can run without a real TTY. */
+function fakeSpinner() {
+  return {
+    isSpinning: true,
+    succeed: mock.fn(),
+    fail: mock.fn(),
+  };
+}
 
 describe('formatElapsed', () => {
   it('formats whole seconds under a minute', () => {
@@ -115,6 +139,211 @@ describe('AgentClaude', () => {
     );
 
     assert.deepEqual(statuses, ['connected']);
+  });
+});
+
+describe('AgentAgn', () => {
+  it('builds agn spawn config with exact args, prompt last', () => {
+    const agent = new AgentAgn('research', 'instr', 'prompt');
+    const { command, args } = agent.getSpawnConfig('hello');
+    assert.equal(command, 'agn');
+    assert.deepEqual(args, ['-p', '--output-format', 'stream-json', 'hello']);
+  });
+
+  it('does not add --stream-partial-output, a permission-bypass flag, or a model flag', () => {
+    const agent = new AgentAgn('research', 'instr', 'prompt');
+    const { args } = agent.getSpawnConfig('hello');
+    assert.equal(args.length, 4);
+    assert.ok(!args.includes('--stream-partial-output'));
+    assert.ok(!args.some((a) => /model/i.test(a)));
+    assert.ok(!args.some((a) => /permission/i.test(a)));
+  });
+
+  it('defaults spawn cwd to process.cwd() when no cwd option is given', () => {
+    const agent = new AgentAgn('research', 'instr', 'prompt');
+    const { options } = agent.getSpawnConfig('hello');
+    assert.equal(options.cwd, process.cwd());
+  });
+
+  it('uses an explicit cwd option for the spawn config', () => {
+    const agent = new AgentAgn('code-writer', 'instr', 'prompt', { cwd: '/tmp/some-worktree' });
+    const { options } = agent.getSpawnConfig('hello');
+    assert.equal(options.cwd, '/tmp/some-worktree');
+  });
+
+  it('uses the same stdio/env spawn options shape as the other backends', () => {
+    const agent = new AgentAgn('research', 'instr', 'prompt');
+    const { options } = agent.getSpawnConfig('hello');
+    assert.deepEqual(options.stdio, ['ignore', 'pipe', 'pipe']);
+    assert.equal(options.env, process.env);
+  });
+
+  it('sets connected only for system/init, not other system subtypes', () => {
+    const agent = new AgentAgn('research', 'instr', 'prompt');
+    const statuses = [];
+    agent.setStatus = (text) => statuses.push(text);
+
+    agent.handleStreamEvent(
+      { type: 'system', subtype: 'other' },
+      { verbose: false, finish: mock.fn() },
+    );
+    agent.handleStreamEvent(
+      { type: 'system', subtype: 'init' },
+      { verbose: false, finish: mock.fn() },
+    );
+
+    assert.deepEqual(statuses, ['connected']);
+  });
+
+  it('ignores user events', () => {
+    const agent = new AgentAgn('research', 'instr', 'prompt');
+    const statuses = [];
+    agent.setStatus = (text) => statuses.push(text);
+
+    agent.handleStreamEvent(
+      { type: 'user', message: { role: 'user', content: 'hi' } },
+      { verbose: false, finish: mock.fn() },
+    );
+
+    assert.deepEqual(statuses, []);
+  });
+
+  it('sets composing response… on a full assistant segment when no tool is active', () => {
+    const agent = new AgentAgn('research', 'instr', 'prompt');
+    const statuses = [];
+    agent.setStatus = (text) => statuses.push(text);
+
+    agent.handleStreamEvent(
+      { type: 'assistant', message: { role: 'assistant', content: 'partial answer' } },
+      { verbose: false, finish: mock.fn() },
+    );
+
+    assert.deepEqual(statuses, ['composing response…']);
+  });
+
+  it('does not set composing response… on assistant when a tool is active', () => {
+    const agent = new AgentAgn('research', 'instr', 'prompt');
+    const statuses = [];
+    agent.setStatus = (text) => statuses.push(text);
+    agent.activeTools.set('a-1', { name: 'read', args: {} });
+
+    agent.handleStreamEvent(
+      { type: 'assistant', message: { role: 'assistant', content: 'partial answer' } },
+      { verbose: false, finish: mock.fn() },
+    );
+
+    assert.deepEqual(statuses, []);
+  });
+
+  it('assistant/delta in verbose mode writes the delta text to stderr instead of setStatus', () => {
+    const agent = new AgentAgn('research', 'instr', 'prompt');
+    const statuses = [];
+    agent.setStatus = (text) => statuses.push(text);
+    const writes = [];
+    const restore = mock.method(process.stderr, 'write', (chunk) => {
+      writes.push(chunk);
+      return true;
+    });
+
+    agent.handleStreamEvent(
+      { type: 'assistant', subtype: 'delta', text: 'partial text' },
+      { verbose: true, finish: mock.fn() },
+    );
+
+    restore.mock.restore();
+    assert.deepEqual(writes, ['partial text']);
+    assert.deepEqual(statuses, []);
+  });
+
+  it('assistant/delta in non-verbose mode sets thinking… when no tool is active', () => {
+    const agent = new AgentAgn('research', 'instr', 'prompt');
+    const statuses = [];
+    agent.setStatus = (text) => statuses.push(text);
+
+    agent.handleStreamEvent(
+      { type: 'assistant', subtype: 'delta', text: 'partial text' },
+      { verbose: false, finish: mock.fn() },
+    );
+
+    assert.deepEqual(statuses, ['thinking…']);
+  });
+
+  it('tool_call started/completed lifecycle: normalizes via normalizeAgnToolEvent and drives onToolEvent', () => {
+    const agent = new AgentAgn('code-writer', 'instr', 'prompt');
+    const [started] = loadFixture('agn-tool-read-started.jsonl');
+    const [completed] = loadFixture('agn-tool-read-completed.jsonl');
+
+    agent.handleStreamEvent(started, { verbose: false, finish: mock.fn() });
+    assert.equal(agent.activeTools.size, 1);
+    assert.deepEqual(agent.activeTools.get('a-1'), {
+      name: 'read',
+      args: { path: 'lib/agent.js' },
+    });
+
+    agent.handleStreamEvent(completed, { verbose: false, finish: mock.fn() });
+    assert.equal(agent.activeTools.size, 0);
+  });
+
+  it('result/success settles ok:true with the event result text', () => {
+    const agent = new AgentAgn('code-writer', 'instr', 'prompt');
+    agent.spinner = fakeSpinner();
+    agent.startedAt = Date.now();
+    const finish = mock.fn();
+
+    agent.handleStreamEvent(
+      { type: 'result', subtype: 'success', result: 'done', iterations: 2, is_error: false },
+      { verbose: false, finish },
+    );
+
+    assert.equal(finish.mock.calls.length, 1);
+    const [err, value] = finish.mock.calls[0].arguments;
+    assert.equal(err, null);
+    assert.equal(value.ok, true);
+    assert.equal(value.result, 'done');
+  });
+
+  it('result/max_iterations settles ok:false, preserving event.result', () => {
+    const agent = new AgentAgn('code-writer', 'instr', 'prompt');
+    agent.spinner = fakeSpinner();
+    agent.startedAt = Date.now();
+    const finish = mock.fn();
+    const [, maxIterationsEvent] = loadFixture('agn-result-error.jsonl');
+
+    agent.handleStreamEvent(maxIterationsEvent, { verbose: false, finish });
+
+    assert.equal(finish.mock.calls.length, 1);
+    const [err, value] = finish.mock.calls[0].arguments;
+    assert.equal(err, null);
+    assert.equal(value.ok, false);
+    assert.equal(value.result, 'reached max iterations');
+  });
+
+  it('result/error settles ok:false, using event.error as the result text', () => {
+    const agent = new AgentAgn('code-writer', 'instr', 'prompt');
+    agent.spinner = fakeSpinner();
+    agent.startedAt = Date.now();
+    const finish = mock.fn();
+    const [errorEvent] = loadFixture('agn-result-error.jsonl');
+
+    agent.handleStreamEvent(errorEvent, { verbose: false, finish });
+
+    assert.equal(finish.mock.calls.length, 1);
+    const [err, value] = finish.mock.calls[0].arguments;
+    assert.equal(err, null);
+    assert.equal(value.ok, false);
+    assert.equal(value.result, 'agn config missing API key');
+  });
+
+  it('ignores unknown event types (no status change, no finish call)', () => {
+    const agent = new AgentAgn('research', 'instr', 'prompt');
+    const statuses = [];
+    agent.setStatus = (text) => statuses.push(text);
+    const finish = mock.fn();
+
+    agent.handleStreamEvent({ type: 'rate_limit_event' }, { verbose: false, finish });
+
+    assert.deepEqual(statuses, []);
+    assert.equal(finish.mock.calls.length, 0);
   });
 });
 

@@ -10,11 +10,11 @@ import { runPipeline } from '../main.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const mainPath = path.join(__dirname, '..', 'main.js');
 
-function runCli(args) {
+function runCli(args, { env = process.env } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [mainPath, ...args], {
       cwd: path.join(__dirname, '..'),
-      env: process.env,
+      env,
     });
 
     let stdout = '';
@@ -39,6 +39,14 @@ describe('main.js CLI', () => {
     assert.equal(code, 0);
     assert.match(stdout, /The Orchestrator/);
     assert.match(stdout, /<task\.\.\.>/);
+  });
+
+  it('--help lists agn alongside cursor and claude', async () => {
+    const { code, stdout } = await runCli(['--help']);
+    assert.equal(code, 0);
+    assert.match(stdout, /cursor/);
+    assert.match(stdout, /claude/);
+    assert.match(stdout, /agn/);
   });
 
   it('prints version for --version', async () => {
@@ -71,6 +79,34 @@ describe('main.js CLI', () => {
     }
   });
 
+  it('--agent agn --dry-run prints agent: agn and resolves the agn binary', async () => {
+    const { code, stdout, stderr } = await runCli(['noop', '--dry-run', '--agent', 'agn']);
+    assert.match(stdout, /cwd:/);
+    assert.match(stdout, /agent:\s+agn/);
+    assert.match(stdout, /^(pass|fail)$/m);
+    assert.doesNotMatch(stdout, /model:/);
+    if (code === 0) {
+      assert.match(stdout, /^pass$/m);
+    } else {
+      assert.equal(code, 1);
+      assert.match(stdout, /^fail$/m);
+      assert.match(stderr, /agn not found/i);
+    }
+  });
+
+  it('reports the agn-specific install hint when the agn binary is not on PATH', async () => {
+    // Force a PATH with no binaries at all, so `which agn` deterministically
+    // fails regardless of whether the local dev machine has agn installed.
+    const { code, stdout, stderr } = await runCli(
+      ['noop', '--dry-run', '--agent', 'agn'],
+      { env: { ...process.env, PATH: '/nonexistent-empty-path-for-tests' } },
+    );
+    assert.equal(code, 1);
+    assert.match(stdout, /^fail$/m);
+    assert.match(stderr, /agn not found/i);
+    assert.match(stderr, /npm install -g @welluable\/agn-cli/);
+  });
+
   it('rejects missing task argument', async () => {
     const { code, stderr } = await runCli([]);
     assert.notEqual(code, 0);
@@ -94,6 +130,7 @@ describe('main.js CLI', () => {
     assert.notEqual(code, 0);
     assert.match(stderr, /cursor/);
     assert.match(stderr, /claude/);
+    assert.match(stderr, /agn/);
   });
 
   it('accepts a multi-word positional task argument without an argument-parsing error', async () => {
@@ -102,6 +139,7 @@ describe('main.js CLI', () => {
     assert.doesNotMatch(stderr, /missing required argument/i);
     assert.match(stderr, /cursor/);
     assert.match(stderr, /claude/);
+    assert.match(stderr, /agn/);
   });
 
   it('does not create .orch merely from being invoked, in either the install dir or the invocation cwd', async () => {

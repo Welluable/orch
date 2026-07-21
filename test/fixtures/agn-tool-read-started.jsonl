@@ -1,0 +1,1 @@
+{"type":"tool_call","subtype":"started","session_id":"s-1","call_id":"a-1","name":"read_file","input":{"path":"lib/agent.js"}}

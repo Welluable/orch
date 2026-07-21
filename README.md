@@ -1,6 +1,6 @@
 # orch
 
-CLI orchestrator that runs a triage → research → plan → implement pipeline against a task, using Cursor Agent or Claude Code as the backend.
+CLI orchestrator that runs a triage → research → plan → implement pipeline against a task, using Cursor Agent, Claude Code, or agn as the backend.
 
 ## Install
 
@@ -8,7 +8,16 @@ CLI orchestrator that runs a triage → research → plan → implement pipeline
 npm install -g @welluable/orch
 ```
 
-Requires a local agent CLI on your `PATH`: `agent` (Cursor) or `claude` (Claude Code).
+Requires a local agent CLI on your `PATH`: `agent` (Cursor), `claude` (Claude Code), or `agn`.
+
+To use the `agn` backend:
+
+```bash
+npm install -g @welluable/agn-cli
+agn init
+```
+
+Requires `@welluable/agn-cli` version `0.0.12` or later.
 
 ## Usage
 
@@ -16,14 +25,15 @@ Requires a local agent CLI on your `PATH`: `agent` (Cursor) or `claude` (Claude 
 orch "fix the typo in the README"
 orch "fix the bug described in task.md" --agent claude
 orch "add a --verbose flag" --agent cursor -v
+orch "implement the local spec" --agent agn -v
 orch "noop" --dry-run --agent cursor
 ```
 
 ```text
-orch <task...> [--agent cursor|claude] [-v] [--dry-run]
+orch <task...> [--agent cursor|claude|agn] [-v] [--dry-run]
 ```
 
-`--dry-run` checks that the selected agent CLI (`agent` or `claude`) is on your `PATH`, prints `cwd` / `agent` / `pass` or `fail`, and exits without running the pipeline.
+`--dry-run` checks that the selected agent CLI (`agent`, `claude`, or `agn`) is on your `PATH`, prints `cwd` / `agent` / `pass` or `fail`, and exits without running the pipeline.
 
 Mention a file path in the task text and the agent will read it with its own tools.
 
