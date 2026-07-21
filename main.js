@@ -11,6 +11,7 @@ import { AgentAgn } from './lib/agent-agn.js';
 import { parseTriageJson } from './lib/parse-triage-json.js';
 import { createRunContext } from './lib/run-context.js';
 import { createWorktree } from './lib/worktree.js';
+import { commitWorktree } from './lib/commit.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -69,6 +70,7 @@ export async function runPipeline(prompt, options) {
     const binary = backend.binary;
     const createRunContextFn = options.createRunContext ?? createRunContext;
     const createWorktreeFn = options.createWorktree ?? createWorktree;
+    const commitWorktreeFn = options.commitWorktree ?? commitWorktree;
     const invocationCwd = process.cwd();
 
     console.log(`cwd:   ${invocationCwd}`);
@@ -212,6 +214,8 @@ export async function runPipeline(prompt, options) {
                         test harness.
                     * Do not implement the feature/fix itself in this stage — tests and criteria only.
                     * Update the exact status file at: ${runContext.statusPath}
+                    * Do not run \`git add\`, \`git commit\`, or any other git branch/commit
+                      command. Leave changes unstaged — orch commits after the pipeline finishes.
                     * Your final message must include test file paths / run command, if
                       applicable, so it can be handed to the next stage.
                 `,
@@ -243,6 +247,8 @@ export async function runPipeline(prompt, options) {
                     * If only verification criteria exist, implement so those criteria are met, and
                       note that in the status file.
                     * Do not delete or weaken tests just to force a green run.
+                    * Do not run \`git add\`, \`git commit\`, or any other git branch/commit
+                      command. Leave changes unstaged — orch commits after the pipeline finishes.
                     * Once implementation is done, the task is complete.
 
                     [Test Writer Output]
@@ -253,7 +259,32 @@ export async function runPipeline(prompt, options) {
             { cwd: worktree.worktreePath },
         );
 
-        await codeWriter.run({ verbose });
+        const codeOut = await codeWriter.run({ verbose });
+        if (!codeOut.ok) {
+            throw new Error('code-writer failed; stopping before commit');
+        }
+
+        const message = `orch: ${runContext.slug} ${prompt.split('\n')[0]}`;
+        const commitResult = commitWorktreeFn({
+            worktreePath: worktree.worktreePath,
+            branch: worktree.branch,
+            message,
+        });
+
+        if (commitResult.committed) {
+            fs.appendFileSync(
+                runContext.statusPath,
+                `\n## Commit\n\n- SHA: \`${commitResult.sha}\`\n- Branch: \`${commitResult.branch}\`\n`,
+            );
+            console.log(`commit: ${commitResult.sha.slice(0, 7)} on ${commitResult.branch}`);
+            console.log(`merge:  git merge ${commitResult.branch}`);
+        } else {
+            fs.appendFileSync(
+                runContext.statusPath,
+                `\n## Commit\n\n- No changes to commit on \`${commitResult.branch}\`.\n`,
+            );
+            console.log(`commit: no changes on ${commitResult.branch}`);
+        }
     } catch (err) {
         console.error(`Error: ${err.message}`);
         process.exit(1);

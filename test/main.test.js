@@ -232,6 +232,12 @@ function fakeWorktree(cwd, slug = 'stub-stub-0000') {
   };
 }
 
+/** A stand-in for `commitWorktree(...)`'s return value on a successful,
+ * non-empty commit. */
+function fakeCommitResult(branch, sha = 'deadbeefcafebabe0000000000000000000000') {
+  return { committed: true, sha, branch };
+}
+
 describe('runPipeline nested implementer stages', () => {
   it('constructs test-writer then code-writer (not implementer) after planner', async () => {
     const invocationCwd = process.cwd();
@@ -245,6 +251,8 @@ describe('runPipeline nested implementer stages', () => {
       'code-writer': { ok: true, result: 'done' },
     });
 
+    const commitWorktreeMock = mock.fn(() => fakeCommitResult(worktree.branch));
+
     const logSpy = mock.method(console, 'log', () => {});
     try {
       await runPipeline('do something complex', {
@@ -252,6 +260,7 @@ describe('runPipeline nested implementer stages', () => {
         AgentClass: MockAgentClass,
         createRunContext: mock.fn(() => runContext),
         createWorktree: mock.fn(() => worktree),
+        commitWorktree: commitWorktreeMock,
       });
     } finally {
       logSpy.mock.restore();
@@ -261,6 +270,7 @@ describe('runPipeline nested implementer stages', () => {
       MockAgentClass.instances.map((i) => i.name),
       ['triage', 'research', 'planner', 'test-writer', 'code-writer'],
     );
+    assert.equal(commitWorktreeMock.mock.calls.length, 1);
   });
 
   it('skips code-writer and exits non-zero when test-writer resolves ok:false', async () => {
@@ -273,6 +283,7 @@ describe('runPipeline nested implementer stages', () => {
       planner: { ok: true, result: 'planner-output' },
       'test-writer': { ok: false, result: 'not a git repository' },
     });
+    const commitWorktreeMock = mock.fn(() => fakeCommitResult(worktree.branch));
 
     const logSpy = mock.method(console, 'log', () => {});
     const errorSpy = mock.method(console, 'error', () => {});
@@ -283,6 +294,7 @@ describe('runPipeline nested implementer stages', () => {
         AgentClass: MockAgentClass,
         createRunContext: mock.fn(() => runContext),
         createWorktree: mock.fn(() => worktree),
+        commitWorktree: commitWorktreeMock,
       });
     } finally {
       logSpy.mock.restore();
@@ -296,6 +308,7 @@ describe('runPipeline nested implementer stages', () => {
     );
     assert.equal(exitSpy.mock.calls.length, 1);
     assert.equal(exitSpy.mock.calls[0].arguments[0], 1);
+    assert.equal(commitWorktreeMock.mock.calls.length, 0);
   });
 });
 
@@ -308,6 +321,7 @@ describe('runPipeline cwd-scoped artifacts and orch-owned worktrees', () => {
     );
     const createRunContextMock = mock.fn(() => fakeRunContext(process.cwd()));
     const createWorktreeMock = mock.fn(() => fakeWorktree(process.cwd()));
+    const commitWorktreeMock = mock.fn(() => fakeCommitResult('orch/stub-stub-0000'));
 
     const logSpy = mock.method(console, 'log', () => {});
     try {
@@ -316,6 +330,7 @@ describe('runPipeline cwd-scoped artifacts and orch-owned worktrees', () => {
         AgentClass: MockAgentClass,
         createRunContext: createRunContextMock,
         createWorktree: createWorktreeMock,
+        commitWorktree: commitWorktreeMock,
       });
     } finally {
       logSpy.mock.restore();
@@ -324,6 +339,7 @@ describe('runPipeline cwd-scoped artifacts and orch-owned worktrees', () => {
     assert.deepEqual(order, ['triage', 'quick-fix']);
     assert.equal(createRunContextMock.mock.calls.length, 0);
     assert.equal(createWorktreeMock.mock.calls.length, 0);
+    assert.equal(commitWorktreeMock.mock.calls.length, 0);
   });
 
   it('creates one run context and one worktree, in order, between planner and test-writer', async () => {
@@ -342,6 +358,12 @@ describe('runPipeline cwd-scoped artifacts and orch-owned worktrees', () => {
       assert.equal(opts.cwd, invocationCwd);
       assert.equal(opts.slug, runContext.slug);
       return worktree;
+    });
+    const commitWorktreeMock = mock.fn((opts) => {
+      order.push('commitWorktree');
+      assert.equal(opts.worktreePath, worktree.worktreePath);
+      assert.equal(opts.branch, worktree.branch);
+      return fakeCommitResult(worktree.branch);
     });
 
     const MockAgentClass = createMockAgentClass(
@@ -362,6 +384,7 @@ describe('runPipeline cwd-scoped artifacts and orch-owned worktrees', () => {
         AgentClass: MockAgentClass,
         createRunContext: createRunContextMock,
         createWorktree: createWorktreeMock,
+        commitWorktree: commitWorktreeMock,
       });
     } finally {
       logSpy.mock.restore();
@@ -375,9 +398,11 @@ describe('runPipeline cwd-scoped artifacts and orch-owned worktrees', () => {
       'createWorktree',
       'test-writer',
       'code-writer',
+      'commitWorktree',
     ]);
     assert.equal(createRunContextMock.mock.calls.length, 1);
     assert.equal(createWorktreeMock.mock.calls.length, 1);
+    assert.equal(commitWorktreeMock.mock.calls.length, 1);
 
     const [triage, research, planner, testWriter, codeWriter] = MockAgentClass.instances;
     assert.equal(research.options?.cwd, invocationCwd);
@@ -406,6 +431,7 @@ describe('runPipeline cwd-scoped artifacts and orch-owned worktrees', () => {
         AgentClass: MockAgentClass,
         createRunContext: mock.fn(() => runContext),
         createWorktree: mock.fn(() => worktree),
+        commitWorktree: mock.fn(() => fakeCommitResult(worktree.branch)),
       });
     } finally {
       logSpy.mock.restore();
@@ -441,6 +467,7 @@ describe('runPipeline cwd-scoped artifacts and orch-owned worktrees', () => {
         AgentClass: MockAgentClass,
         createRunContext: mock.fn(() => runContext),
         createWorktree: mock.fn(() => worktree),
+        commitWorktree: mock.fn(() => fakeCommitResult(worktree.branch)),
       });
     } finally {
       logSpy.mock.restore();
@@ -483,6 +510,7 @@ describe('runPipeline cwd-scoped artifacts and orch-owned worktrees', () => {
           AgentClass: RecordingAgentClass,
           createRunContext: mock.fn(() => runContext),
           createWorktree: mock.fn(() => worktree),
+          commitWorktree: mock.fn(() => fakeCommitResult(worktree.branch)),
         });
       } finally {
         logSpy.mock.restore();
@@ -492,6 +520,184 @@ describe('runPipeline cwd-scoped artifacts and orch-owned worktrees', () => {
       assert.match(statusAtTestWriterStart, new RegExp(runContext.slug));
       assert.match(statusAtTestWriterStart, new RegExp(worktree.branch.replace('/', '\\/')));
       assert.match(statusAtTestWriterStart, new RegExp(worktree.worktreePath.replace(/[/\\]/g, '\\$&')));
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('a failed code-writer (ok: false) skips commitWorktree entirely', async () => {
+    const invocationCwd = process.cwd();
+    const runContext = fakeRunContext(invocationCwd);
+    const worktree = fakeWorktree(invocationCwd);
+    const order = [];
+
+    const MockAgentClass = createMockAgentClass(
+      {
+        triage: COMPLEX_TRIAGE,
+        research: { ok: true, result: 'research-output' },
+        planner: { ok: true, result: 'planner-output' },
+        'test-writer': { ok: true, result: 'tests written' },
+        'code-writer': { ok: false, result: 'implementation failed' },
+      },
+      { order },
+    );
+    const commitWorktreeMock = mock.fn(() => fakeCommitResult(worktree.branch));
+
+    const logSpy = mock.method(console, 'log', () => {});
+    const errorSpy = mock.method(console, 'error', () => {});
+    const exitSpy = mock.method(process, 'exit', () => {});
+    try {
+      await runPipeline('do something complex', {
+        agent: 'claude',
+        AgentClass: MockAgentClass,
+        createRunContext: mock.fn(() => runContext),
+        createWorktree: mock.fn(() => worktree),
+        commitWorktree: commitWorktreeMock,
+      });
+    } finally {
+      logSpy.mock.restore();
+      errorSpy.mock.restore();
+      exitSpy.mock.restore();
+    }
+
+    assert.deepEqual(order, ['triage', 'research', 'planner', 'test-writer', 'code-writer']);
+    assert.equal(commitWorktreeMock.mock.calls.length, 0);
+    assert.equal(exitSpy.mock.calls.length, 1);
+    assert.equal(exitSpy.mock.calls[0].arguments[0], 1);
+  });
+
+  it('a commitWorktree result of committed: false appends a "no changes" ## Commit section and exits 0', async () => {
+    const tmpCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-commit-noop-'));
+    try {
+      const runContext = fakeRunContext(tmpCwd);
+      fs.mkdirSync(runContext.artifactDir, { recursive: true });
+      const worktree = fakeWorktree(tmpCwd);
+
+      const MockAgentClass = createMockAgentClass({
+        triage: COMPLEX_TRIAGE,
+        research: { ok: true, result: 'research-output' },
+        planner: { ok: true, result: 'planner-output' },
+        'test-writer': { ok: true, result: 'tests written' },
+        'code-writer': { ok: true, result: 'done' },
+      });
+      const commitWorktreeMock = mock.fn(() => ({ committed: false, sha: null, branch: worktree.branch }));
+
+      const logSpy = mock.method(console, 'log', () => {});
+      const errorSpy = mock.method(console, 'error', () => {});
+      const exitSpy = mock.method(process, 'exit', () => {});
+      try {
+        await runPipeline('do something complex', {
+          agent: 'claude',
+          AgentClass: MockAgentClass,
+          createRunContext: mock.fn(() => runContext),
+          createWorktree: mock.fn(() => worktree),
+          commitWorktree: commitWorktreeMock,
+        });
+      } finally {
+        logSpy.mock.restore();
+        errorSpy.mock.restore();
+        exitSpy.mock.restore();
+      }
+
+      assert.equal(commitWorktreeMock.mock.calls.length, 1);
+      assert.equal(exitSpy.mock.calls.length, 0);
+
+      const status = fs.readFileSync(runContext.statusPath, 'utf8');
+      assert.match(status, /## Commit/);
+      assert.match(status, /no changes/i);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('a commitWorktree throw exits non-zero without reporting false success in status.md', async () => {
+    const tmpCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-commit-fail-'));
+    try {
+      const runContext = fakeRunContext(tmpCwd);
+      fs.mkdirSync(runContext.artifactDir, { recursive: true });
+      const worktree = fakeWorktree(tmpCwd);
+
+      const MockAgentClass = createMockAgentClass({
+        triage: COMPLEX_TRIAGE,
+        research: { ok: true, result: 'research-output' },
+        planner: { ok: true, result: 'planner-output' },
+        'test-writer': { ok: true, result: 'tests written' },
+        'code-writer': { ok: true, result: 'done' },
+      });
+      const commitWorktreeMock = mock.fn(() => {
+        throw new Error('git commit -m failed: hook declined');
+      });
+
+      const logSpy = mock.method(console, 'log', () => {});
+      const errorSpy = mock.method(console, 'error', () => {});
+      const exitSpy = mock.method(process, 'exit', () => {});
+      try {
+        await runPipeline('do something complex', {
+          agent: 'claude',
+          AgentClass: MockAgentClass,
+          createRunContext: mock.fn(() => runContext),
+          createWorktree: mock.fn(() => worktree),
+          commitWorktree: commitWorktreeMock,
+        });
+      } finally {
+        logSpy.mock.restore();
+        errorSpy.mock.restore();
+        exitSpy.mock.restore();
+      }
+
+      assert.equal(commitWorktreeMock.mock.calls.length, 1);
+      assert.equal(exitSpy.mock.calls.length, 1);
+      assert.equal(exitSpy.mock.calls[0].arguments[0], 1);
+      assert.ok(
+        errorSpy.mock.calls.some((call) => /hook declined/.test(call.arguments[0] ?? '')),
+        'the commitWorktree error message should be surfaced via console.error',
+      );
+
+      const status = fs.readFileSync(runContext.statusPath, 'utf8');
+      assert.doesNotMatch(status, /## Commit/);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('appends a ## Commit section with sha and branch to status.md without clobbering earlier content', async () => {
+    const tmpCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-commit-append-'));
+    try {
+      const runContext = fakeRunContext(tmpCwd);
+      fs.mkdirSync(runContext.artifactDir, { recursive: true });
+      const worktree = fakeWorktree(tmpCwd);
+
+      const MockAgentClass = createMockAgentClass({
+        triage: COMPLEX_TRIAGE,
+        research: { ok: true, result: 'research-output' },
+        planner: { ok: true, result: 'planner-output' },
+        'test-writer': { ok: true, result: 'tests written' },
+        'code-writer': { ok: true, result: 'done' },
+      });
+      const sha = 'deadbeefcafebabe0000000000000000000000';
+      const commitWorktreeMock = mock.fn(() => ({ committed: true, sha, branch: worktree.branch }));
+
+      const logSpy = mock.method(console, 'log', () => {});
+      try {
+        await runPipeline('do something complex', {
+          agent: 'claude',
+          AgentClass: MockAgentClass,
+          createRunContext: mock.fn(() => runContext),
+          createWorktree: mock.fn(() => worktree),
+          commitWorktree: commitWorktreeMock,
+        });
+      } finally {
+        logSpy.mock.restore();
+      }
+
+      const status = fs.readFileSync(runContext.statusPath, 'utf8');
+      // Earlier content (written before test-writer runs) must survive the append.
+      assert.match(status, new RegExp(runContext.slug));
+      assert.match(status, new RegExp(worktree.branch.replace('/', '\\/')));
+      assert.match(status, new RegExp(worktree.worktreePath.replace(/[/\\]/g, '\\$&')));
+      // Appended commit section.
+      assert.match(status, /## Commit/);
+      assert.match(status, new RegExp(sha.slice(0, 7)));
     } finally {
       fs.rmSync(tmpCwd, { recursive: true, force: true });
     }
