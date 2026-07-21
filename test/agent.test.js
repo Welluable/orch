@@ -44,6 +44,18 @@ describe('AgentCursor', () => {
     assert.equal(command, 'agent');
     assert.deepEqual(args, ['-p', '--force', '--output-format', 'stream-json', 'hello']);
   });
+
+  it('defaults spawn cwd to process.cwd() when no cwd option is given', () => {
+    const agent = new AgentCursor('research', 'instr', 'prompt');
+    const { options } = agent.getSpawnConfig('hello');
+    assert.equal(options.cwd, process.cwd());
+  });
+
+  it('uses an explicit cwd option for the spawn config', () => {
+    const agent = new AgentCursor('code-writer', 'instr', 'prompt', { cwd: '/tmp/some-worktree' });
+    const { options } = agent.getSpawnConfig('hello');
+    assert.equal(options.cwd, '/tmp/some-worktree');
+  });
 });
 
 describe('AgentClaude', () => {
@@ -55,6 +67,18 @@ describe('AgentClaude', () => {
     assert.ok(args.includes('--dangerously-skip-permissions'));
     assert.ok(args.includes('stream-json'));
     assert.equal(args[args.length - 1], 'hello');
+  });
+
+  it('defaults spawn cwd to process.cwd() when no cwd option is given', () => {
+    const agent = new AgentClaude('research', 'instr', 'prompt');
+    const { options } = agent.getSpawnConfig('hello');
+    assert.equal(options.cwd, process.cwd());
+  });
+
+  it('uses an explicit cwd option for the spawn config', () => {
+    const agent = new AgentClaude('test-writer', 'instr', 'prompt', { cwd: '/tmp/some-worktree' });
+    const { options } = agent.getSpawnConfig('hello');
+    assert.equal(options.cwd, '/tmp/some-worktree');
   });
 
   it('maps assistant tool_use to formatToolStatus', () => {
