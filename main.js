@@ -250,6 +250,7 @@ Examples:
         await runPipeline(prompt, options);
     });
 
-if (process.argv[1] === __filename) {
+const invokedPath = process.argv[1] ? fs.realpathSync(process.argv[1]) : '';
+if (invokedPath === __filename) {
     program.parse();
 }
