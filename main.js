@@ -206,6 +206,7 @@ export async function runPipeline(prompt, options) {
         }
 
         const runContext = createRunContextFn({ cwd: invocationCwd });
+        console.log(`task ${runContext.slug} is started`);
 
         const researchAgent = new AgentClass(
             'research',
