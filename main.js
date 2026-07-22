@@ -13,6 +13,15 @@ import { parseVerdict } from './lib/parse-verdict.js';
 import { createRunContext } from './lib/run-context.js';
 import { createWorktree } from './lib/worktree.js';
 import { commitWorktree } from './lib/commit.js';
+import { askAgentArgs } from './agents/ask.js';
+import { triageAgentArgs } from './agents/triage.js';
+import { quickFixAgentArgs } from './agents/quick-fix.js';
+import { researchAgentArgs } from './agents/research.js';
+import { plannerAgentArgs } from './agents/planner.js';
+import { testWriterAgentArgs } from './agents/test-writer.js';
+import { testCriticAgentArgs } from './agents/test-critic.js';
+import { codeWriterAgentArgs } from './agents/code-writer.js';
+import { testRunnerAgentArgs } from './agents/test-runner.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -119,20 +128,8 @@ export async function runPipeline(prompt, options) {
     console.log();
 
     if (options.ask) {
-        const askAgent = new AgentClass(
-            'ask',
-            `
-                You are an Ask Agent.
-
-                * Answer the user's question about the codebase.
-                * This is read-only: do not edit files, write orch artifacts under .orch/,
-                  or create worktrees.
-                * Put the full answer in your final message.
-                * Your final message should only have the answer, no other text.
-            `,
-            prompt,
-            { cwd: invocationCwd, readOnly: true },
-        );
+        const ask = askAgentArgs({ prompt, cwd: invocationCwd });
+        const askAgent = new AgentClass(ask.name, ask.instructions, ask.prompt, ask.options);
 
         try {
             const askResult = await askAgent.run({ verbose });
@@ -149,27 +146,12 @@ export async function runPipeline(prompt, options) {
         return;
     }
 
+    const triage = triageAgentArgs({ prompt, cwd: invocationCwd });
     const triageAgent = new AgentClass(
-        'triage',
-        `
-                You are a Triage Agent.
-
-                Decide if the user's request is a safe minimal fix (typo, small flag tweak,
-                implement an already-written local spec, one-file change, etc.).
-
-                Your final message MUST be valid JSON only — no markdown, no prose outside JSON:
-
-                {
-                  "simple": true,
-                  "why": "short reason",
-                  "fix_plan": "optional short plan (1-5 bullets or a paragraph)"
-                }
-
-                Set "simple": true only when a quick fix in the current working tree is enough.
-                Set "simple": false when research, planning, or a worktree is needed.
-            `,
-        prompt,
-        { cwd: invocationCwd },
+        triage.name,
+        triage.instructions,
+        triage.prompt,
+        triage.options,
     );
 
     try {
@@ -177,28 +159,16 @@ export async function runPipeline(prompt, options) {
         const parsed = parseTriageJson(triageResult.result);
 
         if (parsed?.simple === true) {
-            const fixPlan = parsed.fix_plan
-                ? `
-                    [Triage Fix Plan]
-                    ${parsed.fix_plan}
-                    [/Triage Fix Plan]
-                    `
-                : '';
-
-            const quickFixAgent = new AgentClass(
-                'quick-fix',
-                `
-                        You are a Quick Fix Agent.
-
-                        * Treat the user prompt as the full task description.
-                        * Make the smallest set of edits necessary to complete the request.
-                        * Apply changes in the current working tree.
-                        * Do not write research.md or task.md.
-                        * Do not create a git worktree.
-                        ${fixPlan}
-                    `,
+            const quickFix = quickFixAgentArgs({
                 prompt,
-                { cwd: invocationCwd },
+                cwd: invocationCwd,
+                fix_plan: parsed.fix_plan,
+            });
+            const quickFixAgent = new AgentClass(
+                quickFix.name,
+                quickFix.instructions,
+                quickFix.prompt,
+                quickFix.options,
             );
 
             await quickFixAgent.run({ verbose });
@@ -208,41 +178,32 @@ export async function runPipeline(prompt, options) {
         const runContext = createRunContextFn({ cwd: invocationCwd });
         console.log(`task ${runContext.slug} is started`);
 
-        const researchAgent = new AgentClass(
-            'research',
-            `
-                    You are a Research Agent.
-
-                    * Research the codebase rooted at ${invocationCwd} for the relevant
-                      information to accomplish the user's request.
-                    * Don't plan just research.
-                    * Do not write any code. After the research is complete, write your
-                      findings only to the exact path: ${runContext.researchPath}
-                    * Last message should be the exact path: ${runContext.researchPath}
-                `,
+        const research = researchAgentArgs({
             prompt,
-            { cwd: invocationCwd },
+            cwd: invocationCwd,
+            researchPath: runContext.researchPath,
+        });
+        const researchAgent = new AgentClass(
+            research.name,
+            research.instructions,
+            research.prompt,
+            research.options,
         );
 
         const result = await researchAgent.run({ verbose });
 
-        const plannerAgent = new AgentClass(
-            'planner',
-            `
-                    You are a Planner Agent.
-
-                    * Read the research doc at the exact path: ${runContext.researchPath}
-                    * Plan the steps to accomplish the user's request.
-                    * Write a checklist of the steps to accomplish the user's request only to
-                      the exact path: ${runContext.taskPath}
-                    * Last message should be the exact path: ${runContext.taskPath}
-
-                    [Research Agent Output]
-                    ${result.result}
-                    [/Research Agent Output]
-                `,
+        const planner = plannerAgentArgs({
             prompt,
-            { cwd: invocationCwd },
+            cwd: invocationCwd,
+            researchPath: runContext.researchPath,
+            taskPath: runContext.taskPath,
+            researchOutput: result.result,
+        });
+        const plannerAgent = new AgentClass(
+            planner.name,
+            planner.instructions,
+            planner.prompt,
+            planner.options,
         );
 
         await plannerAgent.run({ verbose });
@@ -264,41 +225,20 @@ export async function runPipeline(prompt, options) {
         for (let round = 1; round <= maxRounds; round++) {
             testRound = round;
 
-            const criticBlock = criticFeedback
-                ? `
-                    [Test Critic Feedback]
-                    ${criticFeedback}
-                    [/Test Critic Feedback]
-                `
-                : '';
-
+            const testWriterArgs = testWriterAgentArgs({
+                prompt,
+                cwd: worktree.worktreePath,
+                worktreePath: worktree.worktreePath,
+                branch: worktree.branch,
+                taskPath: runContext.taskPath,
+                statusPath: runContext.statusPath,
+                criticFeedback,
+            });
             const testWriter = new AgentClass(
                 roundLabel('test-writer', round, maxRounds),
-                `
-                    You are a Test Writer Agent.
-
-                    * You are already running inside the git worktree for this task
-                      (worktree: ${worktree.worktreePath}, branch: ${worktree.branch}). Do not
-                      create, select, or switch worktrees or branches.
-                    * Read the task checklist at the exact path: ${runContext.taskPath}
-                    * Before making any production-code changes, decide how to verify the work:
-                      - If automated tests are practical, write the relevant test cases/files first,
-                        extending the existing test runner and conventions.
-                      - If automated tests are not practical, update the exact status file at
-                        ${runContext.statusPath} with a "## Verification" section describing what
-                        a human or later reviewer should check in the diff. Do not invent a fake
-                        test harness.
-                    * Do not implement the feature/fix itself in this stage — tests and criteria only.
-                    * Update the exact status file at: ${runContext.statusPath}
-                    * Do not run \`git add\`, \`git commit\`, or any other git branch/commit
-                      command. Leave changes unstaged — orch commits after the pipeline finishes.
-                    * Your final message must include test file paths / run command, if
-                      applicable, so it can be handed to the next stage.
-                    * Later rounds must address critic feedback; do not write production code.
-                    ${criticBlock}
-                `,
-                prompt,
-                { cwd: worktree.worktreePath },
+                testWriterArgs.instructions,
+                testWriterArgs.prompt,
+                testWriterArgs.options,
             );
 
             const testOut = await testWriter.run({ verbose });
@@ -312,30 +252,20 @@ export async function runPipeline(prompt, options) {
                 throw new Error('test-writer failed; stopping before code-writer');
             }
 
+            const testCriticArgs = testCriticAgentArgs({
+                prompt,
+                cwd: worktree.worktreePath,
+                worktreePath: worktree.worktreePath,
+                branch: worktree.branch,
+                taskPath: runContext.taskPath,
+                statusPath: runContext.statusPath,
+                testWriterOutput: testOut.result,
+            });
             const testCritic = new AgentClass(
                 roundLabel('test-critic', round, maxRounds),
-                `
-                    You are a Test Critic Agent.
-
-                    * You are already running inside the git worktree for this task
-                      (worktree: ${worktree.worktreePath}, branch: ${worktree.branch}). Do not
-                      create, select, or switch worktrees or branches.
-                    * Read the task checklist at the exact path: ${runContext.taskPath} and the
-                      status at the exact path: ${runContext.statusPath}
-                    * Judge whether the current tests / "## Verification" section are adequate
-                      for the task checklist intent (coverage of requirements, not merely that
-                      files exist).
-                    * Do not edit production code or rewrite tests. Feedback only.
-                    * Your final message MUST include a JSON verdict:
-                      {"passed": true|false, "summary": "short reason", "failures": ["optional"]}
-                    * Set passed: true only when verification is adequate to freeze for implementation.
-
-                    [Test Writer Output]
-                    ${testOut.result}
-                    [/Test Writer Output]
-                `,
-                prompt,
-                { cwd: worktree.worktreePath },
+                testCriticArgs.instructions,
+                testCriticArgs.prompt,
+                testCriticArgs.options,
             );
 
             const criticOut = await testCritic.run({ verbose });
@@ -385,44 +315,22 @@ export async function runPipeline(prompt, options) {
         for (let round = 1; round <= maxRounds; round++) {
             codeRound = round;
 
-            const feedbackBlock =
-                round === 1
-                    ? `
-                    [Accepted Verification]
-                    ${acceptedVerification}
-                    [/Accepted Verification]
-                `
-                    : `
-                    [Test Runner Feedback]
-                    ${runnerFeedback}
-                    [/Test Runner Feedback]
-                `;
-
+            const codeWriterArgs = codeWriterAgentArgs({
+                prompt,
+                cwd: worktree.worktreePath,
+                worktreePath: worktree.worktreePath,
+                branch: worktree.branch,
+                taskPath: runContext.taskPath,
+                statusPath: runContext.statusPath,
+                round,
+                acceptedVerification,
+                runnerFeedback,
+            });
             const codeWriter = new AgentClass(
                 roundLabel('code-writer', round, maxRounds),
-                `
-                    You are a Code Writer Agent.
-
-                    * You are already running inside the git worktree for this task
-                      (worktree: ${worktree.worktreePath}, branch: ${worktree.branch}). Do not
-                      create, select, or switch worktrees or branches.
-                    * Read the task checklist at the exact path: ${runContext.taskPath} and the
-                      current status at the exact path: ${runContext.statusPath}
-                    * Implement the steps in the task checklist against the frozen verification
-                      from the test loop.
-                    * Keep the exact status file at ${runContext.statusPath} updated as steps
-                      complete.
-                    * Do not run the test suite as a gate — that is the test-runner's job. Do not
-                      delete or weaken tests just to force a green run.
-                    * If only verification criteria exist, implement so those criteria are met, and
-                      note that in the status file.
-                    * Do not run \`git add\`, \`git commit\`, or any other git branch/commit
-                      command. Leave changes unstaged — orch commits after the pipeline finishes.
-                    * Once implementation is done, the task is complete.
-                    ${feedbackBlock}
-                `,
-                prompt,
-                { cwd: worktree.worktreePath },
+                codeWriterArgs.instructions,
+                codeWriterArgs.prompt,
+                codeWriterArgs.options,
             );
 
             const codeOut = await codeWriter.run({ verbose });
@@ -436,30 +344,19 @@ export async function runPipeline(prompt, options) {
                 throw new Error('code-writer failed; stopping before commit');
             }
 
+            const testRunnerArgs = testRunnerAgentArgs({
+                prompt,
+                cwd: worktree.worktreePath,
+                worktreePath: worktree.worktreePath,
+                branch: worktree.branch,
+                statusPath: runContext.statusPath,
+                codeWriterOutput: codeOut.result,
+            });
             const testRunner = new AgentClass(
                 roundLabel('test-runner', round, maxRounds),
-                `
-                    You are a Test Runner Agent.
-
-                    * You are already running inside the git worktree for this task
-                      (worktree: ${worktree.worktreePath}, branch: ${worktree.branch}). Do not
-                      create, select, or switch worktrees or branches.
-                    * Read the status at the exact path: ${runContext.statusPath} and prior stage
-                      output for the test command(s) to run.
-                    * If a runnable command is recorded, run it and report the outcome.
-                    * If only a "## Verification" section exists, evaluate the current diff against
-                      those criteria by inspection.
-                    * Do not edit production code or tests. Report only.
-                    * Your final message MUST include a JSON verdict:
-                      {"passed": true|false, "summary": "short reason", "failures": ["optional"]}
-                    * Set passed: true only when the verification gate is green.
-
-                    [Code Writer Output]
-                    ${codeOut.result}
-                    [/Code Writer Output]
-                `,
-                prompt,
-                { cwd: worktree.worktreePath },
+                testRunnerArgs.instructions,
+                testRunnerArgs.prompt,
+                testRunnerArgs.options,
             );
 
             const runnerOut = await testRunner.run({ verbose });
