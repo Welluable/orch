@@ -191,6 +191,11 @@ function agentRole(name) {
   return String(name).replace(/\s+\d+\/\d+$/, '');
 }
 
+/** Escape a string for safe embedding in a `new RegExp(...)` pattern. */
+function escapeRegex(text) {
+  return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 /** Builds a fake `AgentClass` that records construction order (and, per
  * instance, the options/prompt it was constructed with) and resolves
  * per-name canned results, so `runPipeline`'s branching can be tested without
@@ -235,42 +240,76 @@ function createMockAgentClass(behaviors, { order } = {}) {
   return MockAgent;
 }
 
-const COMPLEX_TRIAGE = { ok: true, result: JSON.stringify({ simple: false, why: 'needs research' }) };
-const SIMPLE_TRIAGE = { ok: true, result: JSON.stringify({ simple: true, why: 'typo' }) };
+const SUMMARY_DELIM = '<<<SUMMARY>>>';
+
+/** Appends a `<<<SUMMARY>>>` block with a distinct fixture paragraph to a
+ * stage's canned result, mirroring what agents/*.js instructs each stage to
+ * append after its required final message/JSON/path. */
+function withSummary(content, summary) {
+  return `${content}\n${SUMMARY_DELIM}\n${summary}`;
+}
+
+const TRIAGE_SUMMARY = 'Triage judged the request too involved for a quick fix and routed it to the research pipeline.';
+const SIMPLE_TRIAGE_SUMMARY = 'Triage judged the request a safe one-file typo fix and routed it straight to quick-fix.';
+const QUICK_FIX_SUMMARY = 'Quick-fix applied the smallest edit needed to resolve the typo.';
+const RESEARCH_SUMMARY = 'Research walked the codebase and wrote its findings to the research doc.';
+const PLANNER_SUMMARY = 'Planner turned the research findings into a step-by-step task checklist.';
+const TEST_WRITER_SUMMARY = 'Test writer added coverage for the new behavior and recorded a verification plan in status.md.';
+const TEST_CRITIC_SUMMARY = 'Test critic reviewed the new tests and judged the coverage adequate to freeze.';
+const FAIL_CRITIC_SUMMARY = 'Test critic found the tests missing coverage for the max-rounds edge case.';
+const CODE_WRITER_SUMMARY = 'Code writer implemented the checklist against the frozen verification.';
+const TEST_RUNNER_SUMMARY = 'Test runner executed the suite and confirmed every test passed.';
+const FAIL_RUNNER_SUMMARY = 'Test runner executed the suite and found that parseVerdict was missing.';
+const ASK_SUMMARY = 'Ask agent explained where the CLI entrypoint lives without changing any files.';
+
+const COMPLEX_TRIAGE = {
+  ok: true,
+  result: withSummary(JSON.stringify({ simple: false, why: 'needs research' }), TRIAGE_SUMMARY),
+};
+const SIMPLE_TRIAGE = {
+  ok: true,
+  result: withSummary(JSON.stringify({ simple: true, why: 'typo' }), SIMPLE_TRIAGE_SUMMARY),
+};
 const PASS_CRITIC = {
   ok: true,
-  result: JSON.stringify({ passed: true, summary: 'tests adequate' }),
+  result: withSummary(JSON.stringify({ passed: true, summary: 'tests adequate' }), TEST_CRITIC_SUMMARY),
 };
 const PASS_RUNNER = {
   ok: true,
-  result: JSON.stringify({ passed: true, summary: 'suite green' }),
+  result: withSummary(JSON.stringify({ passed: true, summary: 'suite green' }), TEST_RUNNER_SUMMARY),
 };
 const FAIL_CRITIC = {
   ok: true,
-  result: JSON.stringify({
-    passed: false,
-    summary: 'missing coverage',
-    failures: ['no assert for max-rounds'],
-  }),
+  result: withSummary(
+    JSON.stringify({
+      passed: false,
+      summary: 'missing coverage',
+      failures: ['no assert for max-rounds'],
+    }),
+    FAIL_CRITIC_SUMMARY,
+  ),
 };
 const FAIL_RUNNER = {
   ok: true,
-  result: JSON.stringify({
-    passed: false,
-    summary: 'tests failed',
-    failures: ['parseVerdict missing'],
-  }),
+  result: withSummary(
+    JSON.stringify({
+      passed: false,
+      summary: 'tests failed',
+      failures: ['parseVerdict missing'],
+    }),
+    FAIL_RUNNER_SUMMARY,
+  ),
 };
 
 /** Default stubs for a complex path that passes both loops in one round. */
 function complexPassBehaviors(overrides = {}) {
   return {
     triage: COMPLEX_TRIAGE,
-    research: { ok: true, result: 'research-output' },
-    planner: { ok: true, result: 'planner-output' },
-    'test-writer': { ok: true, result: 'tests written' },
+    research: { ok: true, result: withSummary('research-output', RESEARCH_SUMMARY) },
+    planner: { ok: true, result: withSummary('planner-output', PLANNER_SUMMARY) },
+    'test-writer': { ok: true, result: withSummary('tests written', TEST_WRITER_SUMMARY) },
     'test-critic': PASS_CRITIC,
-    'code-writer': { ok: true, result: 'done' },
+    'code-writer': { ok: true, result: withSummary('done', CODE_WRITER_SUMMARY) },
     'test-runner': PASS_RUNNER,
     ...overrides,
   };
@@ -1328,5 +1367,280 @@ describe('runPipeline --ask (read-only Q&A)', () => {
     }
 
     assert.deepEqual(order, ['triage', 'quick-fix']);
+  });
+});
+
+describe('runPipeline per-stage summary output (<<<SUMMARY>>> paragraphs)', () => {
+  /** Spy on console.log, returning the captured lines and a restore fn. */
+  function collectLogs() {
+    const logs = [];
+    const restore = mock.method(console, 'log', (...args) => logs.push(args.map(String).join(' ')));
+    return { logs, restore: () => restore.mock.restore() };
+  }
+
+  it('--ask prints a "[ask] summary: ..." line and the exact stripped answer, never leaking the raw delimiter', async () => {
+    const answer = 'The entrypoint is main.js.';
+    const MockAgentClass = createMockAgentClass({
+      ask: { ok: true, result: withSummary(answer, ASK_SUMMARY) },
+    });
+
+    const { logs, restore } = collectLogs();
+    const errorSpy = mock.method(console, 'error', () => {});
+    const exitSpy = mock.method(process, 'exit', () => {});
+    try {
+      await runPipeline('where is the CLI entrypoint?', {
+        agent: 'claude',
+        ask: true,
+        AgentClass: MockAgentClass,
+        createRunContext: mock.fn(() => fakeRunContext(process.cwd())),
+        createWorktree: mock.fn(() => fakeWorktree(process.cwd())),
+        commitWorktree: mock.fn(() => fakeCommitResult('orch/stub')),
+      });
+    } finally {
+      restore();
+      errorSpy.mock.restore();
+      exitSpy.mock.restore();
+    }
+
+    const joined = logs.join('\n');
+    assert.doesNotMatch(joined, /<<<SUMMARY>>>/);
+    assert.ok(
+      logs.some((line) => line.trim() === answer),
+      `expected the exact stripped answer among logs; got: ${JSON.stringify(logs)}`,
+    );
+    assert.match(joined, new RegExp(`\\[ask\\] summary: ${escapeRegex(ASK_SUMMARY)}`));
+  });
+
+  it('--ask with a canned result that omits the delimiter prints no summary line (backward compat)', async () => {
+    const answer = 'The entrypoint is main.js.';
+    const MockAgentClass = createMockAgentClass({
+      ask: { ok: true, result: answer },
+    });
+
+    const { logs, restore } = collectLogs();
+    const errorSpy = mock.method(console, 'error', () => {});
+    const exitSpy = mock.method(process, 'exit', () => {});
+    try {
+      await runPipeline('where is the CLI entrypoint?', {
+        agent: 'claude',
+        ask: true,
+        AgentClass: MockAgentClass,
+        createRunContext: mock.fn(() => fakeRunContext(process.cwd())),
+        createWorktree: mock.fn(() => fakeWorktree(process.cwd())),
+        commitWorktree: mock.fn(() => fakeCommitResult('orch/stub')),
+      });
+    } finally {
+      restore();
+      errorSpy.mock.restore();
+      exitSpy.mock.restore();
+    }
+
+    assert.ok(
+      logs.some((line) => line.trim() === answer),
+      `expected the (unchanged) answer among logs; got: ${JSON.stringify(logs)}`,
+    );
+    assert.ok(
+      !logs.some((line) => /summary:/.test(line)),
+      `expected no summary line when the delimiter is absent; got: ${JSON.stringify(logs)}`,
+    );
+  });
+
+  it('quick-fix path prints [triage] and [quick-fix] summary lines and still routes off the stripped JSON', async () => {
+    const MockAgentClass = createMockAgentClass({
+      triage: SIMPLE_TRIAGE,
+      'quick-fix': { ok: true, result: withSummary('fixed the typo', QUICK_FIX_SUMMARY) },
+    });
+
+    const { logs, restore } = collectLogs();
+    try {
+      await runPipeline('fix the typo', {
+        agent: 'claude',
+        AgentClass: MockAgentClass,
+        createRunContext: mock.fn(() => fakeRunContext(process.cwd())),
+        createWorktree: mock.fn(() => fakeWorktree(process.cwd())),
+        commitWorktree: mock.fn(() => fakeCommitResult('orch/stub-stub-0000')),
+      });
+    } finally {
+      restore();
+    }
+
+    assert.deepEqual(MockAgentClass.instances.map((i) => agentRole(i.name)), ['triage', 'quick-fix']);
+    const joined = logs.join('\n');
+    assert.match(joined, new RegExp(`\\[triage\\] summary: ${escapeRegex(SIMPLE_TRIAGE_SUMMARY)}`));
+    assert.match(joined, new RegExp(`\\[quick-fix\\] summary: ${escapeRegex(QUICK_FIX_SUMMARY)}`));
+    assert.doesNotMatch(joined, /<<<SUMMARY>>>/);
+  });
+
+  it('complex path prints a distinct summary line per stage, using roundLabel for looped stages', async () => {
+    const invocationCwd = process.cwd();
+    const runContext = fakeRunContext(invocationCwd);
+    const worktree = fakeWorktree(invocationCwd);
+
+    const behaviors = complexPassBehaviors({
+      research: { ok: true, result: withSummary(runContext.researchPath, RESEARCH_SUMMARY) },
+      planner: { ok: true, result: withSummary(runContext.taskPath, PLANNER_SUMMARY) },
+    });
+    const MockAgentClass = createMockAgentClass(behaviors);
+
+    const { logs, restore } = collectLogs();
+    try {
+      await runPipeline('do something complex', {
+        agent: 'claude',
+        AgentClass: MockAgentClass,
+        createRunContext: mock.fn(() => runContext),
+        createWorktree: mock.fn(() => worktree),
+        commitWorktree: mock.fn(() => fakeCommitResult(worktree.branch)),
+      });
+    } finally {
+      restore();
+    }
+
+    const joined = logs.join('\n');
+    const expectations = [
+      ['triage', TRIAGE_SUMMARY],
+      ['research', RESEARCH_SUMMARY],
+      ['planner', PLANNER_SUMMARY],
+      ['test-writer 1/5', TEST_WRITER_SUMMARY],
+      ['test-critic 1/5', TEST_CRITIC_SUMMARY],
+      ['code-writer 1/5', CODE_WRITER_SUMMARY],
+      ['test-runner 1/5', TEST_RUNNER_SUMMARY],
+    ];
+    for (const [label, summary] of expectations) {
+      assert.match(
+        joined,
+        new RegExp(`\\[${escapeRegex(label)}\\] summary: ${escapeRegex(summary)}`),
+        `expected a summary line for ${label}; got logs: ${JSON.stringify(logs)}`,
+      );
+    }
+    assert.doesNotMatch(joined, /<<<SUMMARY>>>/);
+  });
+
+  it('strips the summary before forwarding content downstream (research→planner, test-writer→test-critic, code-writer→test-runner)', async () => {
+    const invocationCwd = process.cwd();
+    const runContext = fakeRunContext(invocationCwd);
+    const worktree = fakeWorktree(invocationCwd);
+
+    const testWriterContent = 'npm test\ntest/main.test.js';
+    const codeWriterContent = 'moved factories under agents/';
+
+    const behaviors = complexPassBehaviors({
+      research: { ok: true, result: withSummary(runContext.researchPath, RESEARCH_SUMMARY) },
+      planner: { ok: true, result: withSummary(runContext.taskPath, PLANNER_SUMMARY) },
+      'test-writer': { ok: true, result: withSummary(testWriterContent, TEST_WRITER_SUMMARY) },
+      'code-writer': { ok: true, result: withSummary(codeWriterContent, CODE_WRITER_SUMMARY) },
+    });
+    const MockAgentClass = createMockAgentClass(behaviors);
+
+    const logSpy = mock.method(console, 'log', () => {});
+    try {
+      await runPipeline('do something complex', {
+        agent: 'claude',
+        AgentClass: MockAgentClass,
+        createRunContext: mock.fn(() => runContext),
+        createWorktree: mock.fn(() => worktree),
+        commitWorktree: mock.fn(() => fakeCommitResult(worktree.branch)),
+      });
+    } finally {
+      logSpy.mock.restore();
+    }
+
+    const byRole = Object.fromEntries(MockAgentClass.instances.map((i) => [agentRole(i.name), i]));
+
+    // Planner must receive the exact research path, never the raw delimiter or
+    // the research stage's summary paragraph.
+    const plannerPrompt = `${byRole.planner.instructions}\n${byRole.planner.prompt}`;
+    assert.ok(plannerPrompt.includes(runContext.researchPath));
+    assert.doesNotMatch(plannerPrompt, /<<<SUMMARY>>>/);
+    assert.doesNotMatch(plannerPrompt, new RegExp(escapeRegex(RESEARCH_SUMMARY)));
+
+    // test-critic must receive the exact test-writer content, not its summary paragraph.
+    const criticPrompt = `${byRole['test-critic'].instructions}\n${byRole['test-critic'].prompt}`;
+    assert.ok(criticPrompt.includes(testWriterContent));
+    assert.doesNotMatch(criticPrompt, /<<<SUMMARY>>>/);
+    assert.doesNotMatch(criticPrompt, new RegExp(escapeRegex(TEST_WRITER_SUMMARY)));
+
+    // test-runner must receive the exact code-writer content, not its summary paragraph.
+    const runnerPrompt = `${byRole['test-runner'].instructions}\n${byRole['test-runner'].prompt}`;
+    assert.ok(runnerPrompt.includes(codeWriterContent));
+    assert.doesNotMatch(runnerPrompt, /<<<SUMMARY>>>/);
+    assert.doesNotMatch(runnerPrompt, new RegExp(escapeRegex(CODE_WRITER_SUMMARY)));
+  });
+
+  it('parseTriageJson/parseVerdict still parse correctly and status.md is unaffected by the appended summary block', async () => {
+    const tmpCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-summary-status-'));
+    try {
+      const runContext = fakeRunContext(tmpCwd);
+      fs.mkdirSync(runContext.artifactDir, { recursive: true });
+      const worktree = fakeWorktree(tmpCwd);
+
+      const MockAgentClass = createMockAgentClass(complexPassBehaviors());
+      const commitWorktreeMock = mock.fn(() => fakeCommitResult(worktree.branch));
+
+      const logSpy = mock.method(console, 'log', () => {});
+      const exitSpy = mock.method(process, 'exit', () => {});
+      try {
+        await runPipeline('do something complex', {
+          agent: 'claude',
+          AgentClass: MockAgentClass,
+          createRunContext: mock.fn(() => runContext),
+          createWorktree: mock.fn(() => worktree),
+          commitWorktree: commitWorktreeMock,
+        });
+      } finally {
+        logSpy.mock.restore();
+        exitSpy.mock.restore();
+      }
+
+      assert.equal(exitSpy.mock.calls.length, 0);
+      assert.equal(commitWorktreeMock.mock.calls.length, 1);
+
+      const status = fs.readFileSync(runContext.statusPath, 'utf8');
+      assert.match(status, /## Test loop/);
+      assert.match(status, /Result:\s*passed/i);
+      assert.match(status, /## Code loop/);
+      assert.match(status, /## Commit/);
+      // The JSON verdict's own "summary" field (a short, unrelated string) must
+      // still show up unmangled by the appended paragraph delimiter/text.
+      assert.match(status, /Summary:\s*tests adequate/);
+      assert.match(status, /Summary:\s*suite green/);
+      assert.doesNotMatch(status, /<<<SUMMARY>>>/);
+      assert.doesNotMatch(status, new RegExp(escapeRegex(TEST_CRITIC_SUMMARY)));
+      assert.doesNotMatch(status, new RegExp(escapeRegex(TEST_RUNNER_SUMMARY)));
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('a canned result that omits the delimiter mid-pipeline prints no summary line for that stage (backward compat)', async () => {
+    const invocationCwd = process.cwd();
+    const runContext = fakeRunContext(invocationCwd);
+    const worktree = fakeWorktree(invocationCwd);
+
+    // research/planner deliberately omit the delimiter; every other stage keeps it.
+    const behaviors = complexPassBehaviors({
+      research: { ok: true, result: 'research-output-no-summary' },
+      planner: { ok: true, result: 'planner-output-no-summary' },
+    });
+    const MockAgentClass = createMockAgentClass(behaviors);
+
+    const { logs, restore } = collectLogs();
+    try {
+      await runPipeline('do something complex', {
+        agent: 'claude',
+        AgentClass: MockAgentClass,
+        createRunContext: mock.fn(() => runContext),
+        createWorktree: mock.fn(() => worktree),
+        commitWorktree: mock.fn(() => fakeCommitResult(worktree.branch)),
+      });
+    } finally {
+      restore();
+    }
+
+    const joined = logs.join('\n');
+    assert.doesNotMatch(joined, /\[research\] summary:/);
+    assert.doesNotMatch(joined, /\[planner\] summary:/);
+    // Other stages, which still include the delimiter, keep printing normally.
+    assert.match(joined, new RegExp(`\\[triage\\] summary: ${escapeRegex(TRIAGE_SUMMARY)}`));
+    assert.match(joined, new RegExp(`\\[test-writer 1/5\\] summary: ${escapeRegex(TEST_WRITER_SUMMARY)}`));
   });
 });
