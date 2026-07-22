@@ -157,6 +157,10 @@ describe('main.js CLI', () => {
       fs.copyFileSync(path.join(repoRoot, 'main.js'), path.join(installDir, 'main.js'));
       fs.copyFileSync(path.join(repoRoot, 'package.json'), path.join(installDir, 'package.json'));
       fs.cpSync(path.join(repoRoot, 'lib'), path.join(installDir, 'lib'), { recursive: true });
+      const agentsSrc = path.join(repoRoot, 'agents');
+      if (fs.existsSync(agentsSrc)) {
+        fs.cpSync(agentsSrc, path.join(installDir, 'agents'), { recursive: true });
+      }
       fs.symlinkSync(path.join(repoRoot, 'node_modules'), path.join(installDir, 'node_modules'), 'dir');
 
       const { code } = await new Promise((resolve, reject) => {
@@ -328,6 +332,37 @@ describe('runPipeline nested implementer stages', () => {
       ['triage', 'research', 'planner', 'test-writer', 'test-critic', 'code-writer', 'test-runner'],
     );
     assert.equal(commitWorktreeMock.mock.calls.length, 1);
+  });
+
+  it('labels implementer agents with roundLabel N/M suffixes (default maxRounds=5)', async () => {
+    const invocationCwd = process.cwd();
+    const runContext = fakeRunContext(invocationCwd);
+    const worktree = fakeWorktree(invocationCwd);
+    const MockAgentClass = createMockAgentClass(complexPassBehaviors());
+
+    const logSpy = mock.method(console, 'log', () => {});
+    try {
+      await runPipeline('do something complex', {
+        agent: 'claude',
+        AgentClass: MockAgentClass,
+        createRunContext: mock.fn(() => runContext),
+        createWorktree: mock.fn(() => worktree),
+        commitWorktree: mock.fn(() => fakeCommitResult(worktree.branch)),
+      });
+    } finally {
+      logSpy.mock.restore();
+    }
+
+    const names = MockAgentClass.instances.map((i) => i.name);
+    assert.deepEqual(
+      names.filter((n) => /^(test-writer|test-critic|code-writer|test-runner)\b/.test(n)),
+      ['test-writer 1/5', 'test-critic 1/5', 'code-writer 1/5', 'test-runner 1/5'],
+    );
+    // Static roles stay unsuffixed.
+    assert.ok(names.includes('triage'));
+    assert.ok(names.includes('research'));
+    assert.ok(names.includes('planner'));
+    assert.equal(names.includes('triage 1/5'), false);
   });
 
   it('skips critic/code loop and exits non-zero when test-writer resolves ok:false', async () => {
@@ -905,6 +940,11 @@ describe('runPipeline implementer loops', () => {
 
     const writers = MockAgentClass.instances.filter((i) => agentRole(i.name) === 'test-writer');
     assert.equal(writers.length, 2);
+    assert.equal(writers[0].name, 'test-writer 1/3');
+    assert.equal(writers[1].name, 'test-writer 2/3');
+    const critics = MockAgentClass.instances.filter((i) => agentRole(i.name) === 'test-critic');
+    assert.equal(critics[0].name, 'test-critic 1/3');
+    assert.equal(critics[1].name, 'test-critic 2/3');
     const secondPrompt = `${writers[1].instructions}\n${writers[1].prompt}`;
     assert.match(secondPrompt, /\[Test Critic Feedback\]/);
     assert.match(secondPrompt, /missing coverage|no assert for max-rounds/);
@@ -972,6 +1012,11 @@ describe('runPipeline implementer loops', () => {
 
     const writers = MockAgentClass.instances.filter((i) => agentRole(i.name) === 'code-writer');
     assert.equal(writers.length, 2);
+    assert.equal(writers[0].name, 'code-writer 1/3');
+    assert.equal(writers[1].name, 'code-writer 2/3');
+    const runners = MockAgentClass.instances.filter((i) => agentRole(i.name) === 'test-runner');
+    assert.equal(runners[0].name, 'test-runner 1/3');
+    assert.equal(runners[1].name, 'test-runner 2/3');
     assert.match(`${writers[0].instructions}\n${writers[0].prompt}`, /\[Accepted Verification\]/);
     assert.match(`${writers[1].instructions}\n${writers[1].prompt}`, /\[Test Runner Feedback\]/);
     assert.match(`${writers[1].instructions}\n${writers[1].prompt}`, /parseVerdict missing|tests failed/);
