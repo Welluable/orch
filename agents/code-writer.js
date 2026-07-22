@@ -42,6 +42,11 @@ export function codeWriterAgentArgs({
                     * Do not run \`git add\`, \`git commit\`, or any other git branch/commit
                       command. Leave changes unstaged — orch commits after the pipeline finishes.
                     * Once implementation is done, the task is complete.
+                    * After your final message above, on a new line write the summary
+                      marker (three '<' characters, then SUMMARY, then three '>'
+                      characters, with no spaces), followed by one paragraph in natural,
+                      human-readable language explaining what you did in this step and
+                      what happened — no lists, no headers, just prose.
                     ${feedbackBlock}
                 `,
         prompt,

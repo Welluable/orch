@@ -17,6 +17,11 @@ export function quickFixAgentArgs({ prompt, cwd, fix_plan }) {
                         * Apply changes in the current working tree.
                         * Do not write research.md or task.md.
                         * Do not create a git worktree.
+                        * After your final message above, on a new line write the summary
+                          marker (three '<' characters, then SUMMARY, then three '>'
+                          characters, with no spaces), followed by one paragraph in
+                          natural, human-readable language explaining what you did in this
+                          step and what happened — no lists, no headers, just prose.
                         ${fixPlan}
                     `,
         prompt,

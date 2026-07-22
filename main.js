@@ -10,6 +10,7 @@ import { AgentClaude } from './lib/agent-claude.js';
 import { AgentAgn } from './lib/agent-agn.js';
 import { parseTriageJson } from './lib/parse-triage-json.js';
 import { parseVerdict } from './lib/parse-verdict.js';
+import { splitStageSummary, printStageSummary } from './lib/stage-summary.js';
 import { createRunContext } from './lib/run-context.js';
 import { createWorktree } from './lib/worktree.js';
 import { commitWorktree } from './lib/commit.js';
@@ -138,7 +139,9 @@ export async function runPipeline(prompt, options) {
                 process.exit(1);
                 return;
             }
-            console.log(askResult.result);
+            const { content, summary } = splitStageSummary(askResult.result);
+            printStageSummary('ask', summary);
+            console.log(content);
         } catch (err) {
             console.error(`Error: ${err.message}`);
             process.exit(1);
@@ -179,7 +182,9 @@ export async function runPipeline(prompt, options) {
 
     try {
         const triageResult = await triageAgent.run({ verbose });
-        const parsed = parseTriageJson(triageResult.result);
+        const { content: triageContent, summary: triageSummary } = splitStageSummary(triageResult.result);
+        printStageSummary('triage', triageSummary);
+        const parsed = parseTriageJson(triageContent);
 
         if (parsed?.simple === true) {
             const quickFix = quickFixAgentArgs({
@@ -194,7 +199,9 @@ export async function runPipeline(prompt, options) {
                 quickFix.options,
             );
 
-            await quickFixAgent.run({ verbose });
+            const quickFixResult = await quickFixAgent.run({ verbose });
+            const { summary: quickFixSummary } = splitStageSummary(quickFixResult.result);
+            printStageSummary('quick-fix', quickFixSummary);
             return;
         }
 
@@ -214,13 +221,15 @@ export async function runPipeline(prompt, options) {
         );
 
         const result = await researchAgent.run({ verbose });
+        const { content: researchContent, summary: researchSummary } = splitStageSummary(result.result);
+        printStageSummary('research', researchSummary);
 
         const planner = plannerAgentArgs({
             prompt,
             cwd: invocationCwd,
             researchPath: runContext.researchPath,
             taskPath: runContext.taskPath,
-            researchOutput: result.result,
+            researchOutput: researchContent,
         });
         const plannerAgent = new AgentClass(
             planner.name,
@@ -229,7 +238,9 @@ export async function runPipeline(prompt, options) {
             planner.options,
         );
 
-        await plannerAgent.run({ verbose });
+        const plannerResult = await plannerAgent.run({ verbose });
+        const { summary: plannerSummary } = splitStageSummary(plannerResult.result);
+        printStageSummary('planner', plannerSummary);
 
         const worktree = createWorktreeFn({ cwd: invocationCwd, slug: runContext.slug });
 
@@ -265,6 +276,8 @@ export async function runPipeline(prompt, options) {
             );
 
             const testOut = await testWriter.run({ verbose });
+            const { content: testWriterContent, summary: testWriterSummary } = splitStageSummary(testOut.result);
+            printStageSummary(roundLabel('test-writer', round, maxRounds), testWriterSummary);
             if (!testOut.ok) {
                 appendLoopStatus(runContext.statusPath, 'Test loop', {
                     round: testRound,
@@ -282,7 +295,7 @@ export async function runPipeline(prompt, options) {
                 branch: worktree.branch,
                 taskPath: runContext.taskPath,
                 statusPath: runContext.statusPath,
-                testWriterOutput: testOut.result,
+                testWriterOutput: testWriterContent,
             });
             const testCritic = new AgentClass(
                 roundLabel('test-critic', round, maxRounds),
@@ -292,6 +305,8 @@ export async function runPipeline(prompt, options) {
             );
 
             const criticOut = await testCritic.run({ verbose });
+            const { content: testCriticContent, summary: testCriticSummary } = splitStageSummary(criticOut.result);
+            printStageSummary(roundLabel('test-critic', round, maxRounds), testCriticSummary);
             if (!criticOut.ok) {
                 appendLoopStatus(runContext.statusPath, 'Test loop', {
                     round: testRound,
@@ -302,13 +317,13 @@ export async function runPipeline(prompt, options) {
                 throw new Error('test-critic failed; stopping before code-writer');
             }
 
-            const verdict = parseVerdict(criticOut.result);
+            const verdict = parseVerdict(testCriticContent);
             testSummary = verdict.summary;
             if (verdict.passed) {
-                testAccepted = { writerOut: testOut, criticOut, verdict, round };
+                testAccepted = { writerContent: testWriterContent, criticOut, verdict, round };
                 break;
             }
-            criticFeedback = formatVerdictFeedback(verdict, criticOut.result);
+            criticFeedback = formatVerdictFeedback(verdict, testCriticContent);
         }
 
         appendLoopStatus(runContext.statusPath, 'Test loop', {
@@ -330,7 +345,7 @@ export async function runPipeline(prompt, options) {
 
         const acceptedVerification = [
             testAccepted.verdict.summary,
-            testAccepted.writerOut.result,
+            testAccepted.writerContent,
         ]
             .filter(Boolean)
             .join('\n');
@@ -357,6 +372,8 @@ export async function runPipeline(prompt, options) {
             );
 
             const codeOut = await codeWriter.run({ verbose });
+            const { content: codeWriterContent, summary: codeWriterSummary } = splitStageSummary(codeOut.result);
+            printStageSummary(roundLabel('code-writer', round, maxRounds), codeWriterSummary);
             if (!codeOut.ok) {
                 appendLoopStatus(runContext.statusPath, 'Code loop', {
                     round: codeRound,
@@ -373,7 +390,7 @@ export async function runPipeline(prompt, options) {
                 worktreePath: worktree.worktreePath,
                 branch: worktree.branch,
                 statusPath: runContext.statusPath,
-                codeWriterOutput: codeOut.result,
+                codeWriterOutput: codeWriterContent,
             });
             const testRunner = new AgentClass(
                 roundLabel('test-runner', round, maxRounds),
@@ -383,6 +400,8 @@ export async function runPipeline(prompt, options) {
             );
 
             const runnerOut = await testRunner.run({ verbose });
+            const { content: testRunnerContent, summary: testRunnerSummary } = splitStageSummary(runnerOut.result);
+            printStageSummary(roundLabel('test-runner', round, maxRounds), testRunnerSummary);
             if (!runnerOut.ok) {
                 appendLoopStatus(runContext.statusPath, 'Code loop', {
                     round: codeRound,
@@ -393,13 +412,13 @@ export async function runPipeline(prompt, options) {
                 throw new Error('test-runner failed; stopping before commit');
             }
 
-            const verdict = parseVerdict(runnerOut.result);
+            const verdict = parseVerdict(testRunnerContent);
             codeSummary = verdict.summary;
             if (verdict.passed) {
-                codeAccepted = { writerOut: codeOut, runnerOut, verdict, round };
+                codeAccepted = { writerContent: codeWriterContent, verdict, round };
                 break;
             }
-            runnerFeedback = formatVerdictFeedback(verdict, runnerOut.result);
+            runnerFeedback = formatVerdictFeedback(verdict, testRunnerContent);
         }
 
         appendLoopStatus(runContext.statusPath, 'Code loop', {

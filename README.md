@@ -97,6 +97,16 @@ paths point back at the invocation directory. The worktree is left in place
 after the run so you can inspect or continue the work; it is never deleted
 automatically.
 
+After every stage finishes, `orch` prints a one-paragraph, natural-language
+summary of what happened in that step, e.g. `[test-writer 1/5] summary: ...`
+(round-suffixed for looped stages, matching the spinner name). Each agent is
+asked to append this paragraph after its required final message/JSON/path, and
+`orch` strips it out before parsing JSON, forwarding content to the next
+stage, or writing to `status.md`, so none of those existing contracts change.
+This summary output is unrelated to `-v/--verbose`, which streams the raw
+agent thinking/tool-use deltas as the pipeline runs — the per-step summary
+always prints, with or without `-v`.
+
 ## Development
 
 ```bash
