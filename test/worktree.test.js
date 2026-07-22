@@ -139,7 +139,10 @@ describe('createWorktree (real temporary git repo, integration)', () => {
 
       assert.equal(fs.realpathSync(result.repoRoot), fs.realpathSync(repoDir));
       assert.equal(result.branch, 'orch/test-abcd');
-      assert.equal(result.worktreePath, path.join(parent, 'repo-test-abcd'));
+      assert.equal(
+        fs.realpathSync(result.worktreePath),
+        fs.realpathSync(path.join(parent, 'repo-test-abcd')),
+      );
       assert.ok(fs.existsSync(result.worktreePath));
       assert.ok(fs.statSync(result.worktreePath).isDirectory());
 

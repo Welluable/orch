@@ -37,6 +37,16 @@ orch <task...> [--agent cursor|claude|agn] [-v] [--dry-run] [--max-rounds <n>]
 
 Mention a file path in the task text and the agent will read it with its own tools.
 
+## Interrupts
+
+Ctrl+C (`SIGINT`), terminal hangup (`SIGHUP`), and `SIGTERM` reap every detached agent process group, then exit with the usual shell statuses (130 / 129 / 143). If orch is force-killed (`SIGKILL`), handlers never run and orphans may remain — clean up manually:
+
+```bash
+pkill -f 'agent -p'    # --agent cursor
+pkill -f 'claude '     # --agent claude, adjust to local argv
+pkill -f 'agn '        # --agent agn
+```
+
 ## How it works
 
 Quick fixes run in place: triage decides the request is a small, safe change and a
