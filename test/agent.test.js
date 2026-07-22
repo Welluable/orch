@@ -9,6 +9,7 @@ import { AgentAgn } from '../lib/agent-agn.js';
 import { formatElapsed, maybePrintModelLine, modelPrintState } from '../lib/agent.js';
 import { formatToolStatus } from '../lib/tool-status.js';
 import { parseTriageJson } from '../lib/parse-triage-json.js';
+import { parseVerdict } from '../lib/parse-verdict.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -57,6 +58,45 @@ describe('parseTriageJson', () => {
     assert.equal(parseTriageJson('not json'), null);
     assert.equal(parseTriageJson(''), null);
     assert.equal(parseTriageJson(null), null);
+  });
+});
+
+describe('parseVerdict', () => {
+  it('parses a valid pass verdict', () => {
+    assert.deepEqual(parseVerdict('{"passed":true,"summary":"looks good"}'), {
+      passed: true,
+      summary: 'looks good',
+    });
+  });
+
+  it('parses a valid fail verdict with optional failures', () => {
+    const verdict = parseVerdict(
+      '{"passed":false,"summary":"gaps","failures":["missing assert on max-rounds"]}',
+    );
+    assert.equal(verdict.passed, false);
+    assert.equal(verdict.summary, 'gaps');
+    assert.deepEqual(verdict.failures, ['missing assert on max-rounds']);
+  });
+
+  it('extracts verdict JSON from markdown fences', () => {
+    const verdict = parseVerdict('Here you go:\n```json\n{"passed":true,"summary":"ok"}\n```\n');
+    assert.equal(verdict.passed, true);
+    assert.equal(verdict.summary, 'ok');
+  });
+
+  it('extracts verdict JSON by slicing the first { to last }', () => {
+    const verdict = parseVerdict('Verdict follows: {"passed":false,"summary":"weak"} end.');
+    assert.equal(verdict.passed, false);
+    assert.equal(verdict.summary, 'weak');
+  });
+
+  it('treats missing, unparseable, or non-boolean passed as fail with unparseable verdict', () => {
+    for (const input of [null, undefined, '', 'not json', '{"summary":"no passed field"}', '{"passed":"yes"}']) {
+      assert.deepEqual(parseVerdict(input), {
+        passed: false,
+        summary: 'unparseable verdict',
+      });
+    }
   });
 });
 

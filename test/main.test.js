@@ -55,12 +55,13 @@ describe('main.js CLI', () => {
     assert.equal(stdout.trim(), '1.0.0');
   });
 
-  it('help output mentions --agent, --verbose, and --dry-run', async () => {
+  it('help output mentions --agent, --verbose, --dry-run, and --max-rounds', async () => {
     const { code, stdout } = await runCli(['--help']);
     assert.equal(code, 0);
     assert.match(stdout, /--verbose/);
     assert.match(stdout, /--agent/);
     assert.match(stdout, /--dry-run/);
+    assert.match(stdout, /--max-rounds/);
   });
 
   it('--dry-run reports readiness without running the pipeline', async () => {
@@ -180,14 +181,24 @@ describe('main.js CLI', () => {
   });
 });
 
+/** Strip an optional ` k/N` round suffix from an agent spinner name. */
+function agentRole(name) {
+  return String(name).replace(/\s+\d+\/\d+$/, '');
+}
+
 /** Builds a fake `AgentClass` that records construction order (and, per
  * instance, the options/prompt it was constructed with) and resolves
  * per-name canned results, so `runPipeline`'s branching can be tested without
  * spawning real agent CLIs. `order`, if given, is a shared array that also
  * receives a push for every construction — used to interleave agent
- * construction with createRunContext/createWorktree calls. */
+ * construction with createRunContext/createWorktree calls.
+ *
+ * Behaviors may be a single result object, or an array queue consumed in order
+ * (needed for multi-round critic/runner loops). Lookup matches the full name
+ * or the role without a `k/N` suffix. */
 function createMockAgentClass(behaviors, { order } = {}) {
   const instances = [];
+  const queues = Object.create(null);
 
   class MockAgent {
     constructor(name, instructions, prompt, options) {
@@ -196,11 +207,22 @@ function createMockAgentClass(behaviors, { order } = {}) {
       this.prompt = prompt;
       this.options = options;
       instances.push(this);
-      order?.push(name);
+      order?.push(agentRole(name));
     }
 
     async run() {
-      return behaviors[this.name] ?? { ok: true, result: '' };
+      const role = agentRole(this.name);
+      const behavior = behaviors[this.name] ?? behaviors[role];
+      if (Array.isArray(behavior)) {
+        if (!(role in queues)) {
+          queues[role] = behavior.slice();
+        }
+        if (queues[role].length > 0) {
+          return queues[role].shift();
+        }
+        return behavior[behavior.length - 1] ?? { ok: true, result: '' };
+      }
+      return behavior ?? { ok: true, result: '' };
     }
   }
 
@@ -210,6 +232,44 @@ function createMockAgentClass(behaviors, { order } = {}) {
 
 const COMPLEX_TRIAGE = { ok: true, result: JSON.stringify({ simple: false, why: 'needs research' }) };
 const SIMPLE_TRIAGE = { ok: true, result: JSON.stringify({ simple: true, why: 'typo' }) };
+const PASS_CRITIC = {
+  ok: true,
+  result: JSON.stringify({ passed: true, summary: 'tests adequate' }),
+};
+const PASS_RUNNER = {
+  ok: true,
+  result: JSON.stringify({ passed: true, summary: 'suite green' }),
+};
+const FAIL_CRITIC = {
+  ok: true,
+  result: JSON.stringify({
+    passed: false,
+    summary: 'missing coverage',
+    failures: ['no assert for max-rounds'],
+  }),
+};
+const FAIL_RUNNER = {
+  ok: true,
+  result: JSON.stringify({
+    passed: false,
+    summary: 'tests failed',
+    failures: ['parseVerdict missing'],
+  }),
+};
+
+/** Default stubs for a complex path that passes both loops in one round. */
+function complexPassBehaviors(overrides = {}) {
+  return {
+    triage: COMPLEX_TRIAGE,
+    research: { ok: true, result: 'research-output' },
+    planner: { ok: true, result: 'planner-output' },
+    'test-writer': { ok: true, result: 'tests written' },
+    'test-critic': PASS_CRITIC,
+    'code-writer': { ok: true, result: 'done' },
+    'test-runner': PASS_RUNNER,
+    ...overrides,
+  };
+}
 
 /** A stand-in for `createRunContext({ cwd })`'s return value, matching the
  * shape orch itself would produce for a given invocation cwd/slug. */
@@ -239,17 +299,13 @@ function fakeCommitResult(branch, sha = 'deadbeefcafebabe0000000000000000000000'
 }
 
 describe('runPipeline nested implementer stages', () => {
-  it('constructs test-writer then code-writer (not implementer) after planner', async () => {
+  it('constructs test-writer → test-critic → code-writer → test-runner after planner', async () => {
     const invocationCwd = process.cwd();
     const runContext = fakeRunContext(invocationCwd);
     const worktree = fakeWorktree(invocationCwd);
-    const MockAgentClass = createMockAgentClass({
-      triage: COMPLEX_TRIAGE,
-      research: { ok: true, result: 'research-output' },
-      planner: { ok: true, result: 'planner-output' },
+    const MockAgentClass = createMockAgentClass(complexPassBehaviors({
       'test-writer': { ok: true, result: 'worktree: /tmp/foo' },
-      'code-writer': { ok: true, result: 'done' },
-    });
+    }));
 
     const commitWorktreeMock = mock.fn(() => fakeCommitResult(worktree.branch));
 
@@ -267,22 +323,19 @@ describe('runPipeline nested implementer stages', () => {
     }
 
     assert.deepEqual(
-      MockAgentClass.instances.map((i) => i.name),
-      ['triage', 'research', 'planner', 'test-writer', 'code-writer'],
+      MockAgentClass.instances.map((i) => agentRole(i.name)),
+      ['triage', 'research', 'planner', 'test-writer', 'test-critic', 'code-writer', 'test-runner'],
     );
     assert.equal(commitWorktreeMock.mock.calls.length, 1);
   });
 
-  it('skips code-writer and exits non-zero when test-writer resolves ok:false', async () => {
+  it('skips critic/code loop and exits non-zero when test-writer resolves ok:false', async () => {
     const invocationCwd = process.cwd();
     const runContext = fakeRunContext(invocationCwd);
     const worktree = fakeWorktree(invocationCwd);
-    const MockAgentClass = createMockAgentClass({
-      triage: COMPLEX_TRIAGE,
-      research: { ok: true, result: 'research-output' },
-      planner: { ok: true, result: 'planner-output' },
+    const MockAgentClass = createMockAgentClass(complexPassBehaviors({
       'test-writer': { ok: false, result: 'not a git repository' },
-    });
+    }));
     const commitWorktreeMock = mock.fn(() => fakeCommitResult(worktree.branch));
 
     const logSpy = mock.method(console, 'log', () => {});
@@ -303,7 +356,7 @@ describe('runPipeline nested implementer stages', () => {
     }
 
     assert.deepEqual(
-      MockAgentClass.instances.map((i) => i.name),
+      MockAgentClass.instances.map((i) => agentRole(i.name)),
       ['triage', 'research', 'planner', 'test-writer'],
     );
     assert.equal(exitSpy.mock.calls.length, 1);
@@ -366,16 +419,7 @@ describe('runPipeline cwd-scoped artifacts and orch-owned worktrees', () => {
       return fakeCommitResult(worktree.branch);
     });
 
-    const MockAgentClass = createMockAgentClass(
-      {
-        triage: COMPLEX_TRIAGE,
-        research: { ok: true, result: 'research-output' },
-        planner: { ok: true, result: 'planner-output' },
-        'test-writer': { ok: true, result: 'tests written' },
-        'code-writer': { ok: true, result: 'done' },
-      },
-      { order },
-    );
+    const MockAgentClass = createMockAgentClass(complexPassBehaviors(), { order });
 
     const logSpy = mock.method(console, 'log', () => {});
     try {
@@ -397,18 +441,24 @@ describe('runPipeline cwd-scoped artifacts and orch-owned worktrees', () => {
       'planner',
       'createWorktree',
       'test-writer',
+      'test-critic',
       'code-writer',
+      'test-runner',
       'commitWorktree',
     ]);
     assert.equal(createRunContextMock.mock.calls.length, 1);
     assert.equal(createWorktreeMock.mock.calls.length, 1);
     assert.equal(commitWorktreeMock.mock.calls.length, 1);
 
-    const [triage, research, planner, testWriter, codeWriter] = MockAgentClass.instances;
-    assert.equal(research.options?.cwd, invocationCwd);
-    assert.equal(planner.options?.cwd, invocationCwd);
-    assert.equal(testWriter.options?.cwd, worktree.worktreePath);
-    assert.equal(codeWriter.options?.cwd, worktree.worktreePath);
+    const byRole = Object.fromEntries(
+      MockAgentClass.instances.map((i) => [agentRole(i.name), i]),
+    );
+    assert.equal(byRole.research.options?.cwd, invocationCwd);
+    assert.equal(byRole.planner.options?.cwd, invocationCwd);
+    assert.equal(byRole['test-writer'].options?.cwd, worktree.worktreePath);
+    assert.equal(byRole['test-critic'].options?.cwd, worktree.worktreePath);
+    assert.equal(byRole['code-writer'].options?.cwd, worktree.worktreePath);
+    assert.equal(byRole['test-runner'].options?.cwd, worktree.worktreePath);
   });
 
   it('research and planner prompts reference the exact absolute paths, not a <taskname> placeholder', async () => {
@@ -416,13 +466,7 @@ describe('runPipeline cwd-scoped artifacts and orch-owned worktrees', () => {
     const runContext = fakeRunContext(invocationCwd);
     const worktree = fakeWorktree(invocationCwd);
 
-    const MockAgentClass = createMockAgentClass({
-      triage: COMPLEX_TRIAGE,
-      research: { ok: true, result: 'research-output' },
-      planner: { ok: true, result: 'planner-output' },
-      'test-writer': { ok: true, result: 'tests written' },
-      'code-writer': { ok: true, result: 'done' },
-    });
+    const MockAgentClass = createMockAgentClass(complexPassBehaviors());
 
     const logSpy = mock.method(console, 'log', () => {});
     try {
@@ -450,15 +494,11 @@ describe('runPipeline cwd-scoped artifacts and orch-owned worktrees', () => {
     const runContext = fakeRunContext(invocationCwd);
     const worktree = fakeWorktree(invocationCwd);
 
-    const MockAgentClass = createMockAgentClass({
-      triage: COMPLEX_TRIAGE,
-      research: { ok: true, result: 'research-output' },
-      planner: { ok: true, result: 'planner-output' },
+    const MockAgentClass = createMockAgentClass(complexPassBehaviors({
       // Deliberately does not mention the worktree path or branch in its
       // prose result, so code-writer can only have gotten them structurally.
       'test-writer': { ok: true, result: 'tests written, see status.md' },
-      'code-writer': { ok: true, result: 'done' },
-    });
+    }));
 
     const logSpy = mock.method(console, 'log', () => {});
     try {
@@ -473,7 +513,7 @@ describe('runPipeline cwd-scoped artifacts and orch-owned worktrees', () => {
       logSpy.mock.restore();
     }
 
-    const [, , , , codeWriter] = MockAgentClass.instances;
+    const codeWriter = MockAgentClass.instances.find((i) => agentRole(i.name) === 'code-writer');
     assert.ok(codeWriter.instructions.includes(worktree.worktreePath) || codeWriter.prompt.includes(worktree.worktreePath));
     assert.equal(codeWriter.options?.cwd, worktree.worktreePath);
   });
@@ -486,17 +526,11 @@ describe('runPipeline cwd-scoped artifacts and orch-owned worktrees', () => {
       const worktree = fakeWorktree(tmpCwd);
 
       let statusAtTestWriterStart = null;
-      const MockAgentClass = createMockAgentClass({
-        triage: COMPLEX_TRIAGE,
-        research: { ok: true, result: 'research-output' },
-        planner: { ok: true, result: 'planner-output' },
-        'test-writer': { ok: true, result: 'tests written' },
-        'code-writer': { ok: true, result: 'done' },
-      });
+      const MockAgentClass = createMockAgentClass(complexPassBehaviors());
 
       const RecordingAgentClass = class extends MockAgentClass {
         async run(...args) {
-          if (this.name === 'test-writer' && fs.existsSync(runContext.statusPath)) {
+          if (agentRole(this.name) === 'test-writer' && fs.existsSync(runContext.statusPath)) {
             statusAtTestWriterStart = fs.readFileSync(runContext.statusPath, 'utf8');
           }
           return super.run(...args);
@@ -532,13 +566,9 @@ describe('runPipeline cwd-scoped artifacts and orch-owned worktrees', () => {
     const order = [];
 
     const MockAgentClass = createMockAgentClass(
-      {
-        triage: COMPLEX_TRIAGE,
-        research: { ok: true, result: 'research-output' },
-        planner: { ok: true, result: 'planner-output' },
-        'test-writer': { ok: true, result: 'tests written' },
+      complexPassBehaviors({
         'code-writer': { ok: false, result: 'implementation failed' },
-      },
+      }),
       { order },
     );
     const commitWorktreeMock = mock.fn(() => fakeCommitResult(worktree.branch));
@@ -560,7 +590,14 @@ describe('runPipeline cwd-scoped artifacts and orch-owned worktrees', () => {
       exitSpy.mock.restore();
     }
 
-    assert.deepEqual(order, ['triage', 'research', 'planner', 'test-writer', 'code-writer']);
+    assert.deepEqual(order, [
+      'triage',
+      'research',
+      'planner',
+      'test-writer',
+      'test-critic',
+      'code-writer',
+    ]);
     assert.equal(commitWorktreeMock.mock.calls.length, 0);
     assert.equal(exitSpy.mock.calls.length, 1);
     assert.equal(exitSpy.mock.calls[0].arguments[0], 1);
@@ -573,13 +610,7 @@ describe('runPipeline cwd-scoped artifacts and orch-owned worktrees', () => {
       fs.mkdirSync(runContext.artifactDir, { recursive: true });
       const worktree = fakeWorktree(tmpCwd);
 
-      const MockAgentClass = createMockAgentClass({
-        triage: COMPLEX_TRIAGE,
-        research: { ok: true, result: 'research-output' },
-        planner: { ok: true, result: 'planner-output' },
-        'test-writer': { ok: true, result: 'tests written' },
-        'code-writer': { ok: true, result: 'done' },
-      });
+      const MockAgentClass = createMockAgentClass(complexPassBehaviors());
       const commitWorktreeMock = mock.fn(() => ({ committed: false, sha: null, branch: worktree.branch }));
 
       const logSpy = mock.method(console, 'log', () => {});
@@ -617,13 +648,7 @@ describe('runPipeline cwd-scoped artifacts and orch-owned worktrees', () => {
       fs.mkdirSync(runContext.artifactDir, { recursive: true });
       const worktree = fakeWorktree(tmpCwd);
 
-      const MockAgentClass = createMockAgentClass({
-        triage: COMPLEX_TRIAGE,
-        research: { ok: true, result: 'research-output' },
-        planner: { ok: true, result: 'planner-output' },
-        'test-writer': { ok: true, result: 'tests written' },
-        'code-writer': { ok: true, result: 'done' },
-      });
+      const MockAgentClass = createMockAgentClass(complexPassBehaviors());
       const commitWorktreeMock = mock.fn(() => {
         throw new Error('git commit -m failed: hook declined');
       });
@@ -667,13 +692,7 @@ describe('runPipeline cwd-scoped artifacts and orch-owned worktrees', () => {
       fs.mkdirSync(runContext.artifactDir, { recursive: true });
       const worktree = fakeWorktree(tmpCwd);
 
-      const MockAgentClass = createMockAgentClass({
-        triage: COMPLEX_TRIAGE,
-        research: { ok: true, result: 'research-output' },
-        planner: { ok: true, result: 'planner-output' },
-        'test-writer': { ok: true, result: 'tests written' },
-        'code-writer': { ok: true, result: 'done' },
-      });
+      const MockAgentClass = createMockAgentClass(complexPassBehaviors());
       const sha = 'deadbeefcafebabe0000000000000000000000';
       const commitWorktreeMock = mock.fn(() => ({ committed: true, sha, branch: worktree.branch }));
 
@@ -770,5 +789,278 @@ describe('runPipeline cwd-scoped artifacts and orch-owned worktrees', () => {
     assert.deepEqual(order, ['triage']);
     assert.equal(exitSpy.mock.calls.length, 1);
     assert.equal(exitSpy.mock.calls[0].arguments[0], 1);
+  });
+});
+
+describe('runPipeline implementer loops', () => {
+  async function runComplex(behaviors, {
+    maxRounds,
+    commitWorktreeMock,
+    runContext: givenRunContext,
+    worktree: givenWorktree,
+    order,
+  } = {}) {
+    const invocationCwd = process.cwd();
+    const runContext = givenRunContext ?? fakeRunContext(invocationCwd);
+    const worktree = givenWorktree ?? fakeWorktree(invocationCwd);
+    const MockAgentClass = createMockAgentClass(complexPassBehaviors(behaviors), { order });
+    const commitMock = commitWorktreeMock ?? mock.fn(() => fakeCommitResult(worktree.branch));
+
+    const logSpy = mock.method(console, 'log', () => {});
+    const errorSpy = mock.method(console, 'error', () => {});
+    const exitSpy = mock.method(process, 'exit', () => {});
+    try {
+      await runPipeline('do something complex', {
+        agent: 'claude',
+        maxRounds,
+        AgentClass: MockAgentClass,
+        createRunContext: mock.fn(() => runContext),
+        createWorktree: mock.fn(() => worktree),
+        commitWorktree: commitMock,
+      });
+    } finally {
+      logSpy.mock.restore();
+      errorSpy.mock.restore();
+      exitSpy.mock.restore();
+    }
+
+    return { MockAgentClass, commitMock, exitSpy, errorSpy, runContext, worktree };
+  }
+
+  it('defaults maxRounds to 5 when options.maxRounds is omitted', async () => {
+    const order = [];
+    const { MockAgentClass, commitMock, exitSpy } = await runComplex(
+      { 'test-critic': FAIL_CRITIC },
+      { order },
+    );
+
+    const writerCriticPairs = order.filter((n) => n === 'test-writer' || n === 'test-critic');
+    // 5 rounds × (test-writer + test-critic)
+    assert.equal(writerCriticPairs.length, 10);
+    assert.deepEqual(
+      order.filter((n) => n === 'code-writer' || n === 'test-runner'),
+      [],
+    );
+    assert.equal(commitMock.mock.calls.length, 0);
+    assert.equal(exitSpy.mock.calls.length, 1);
+    assert.equal(exitSpy.mock.calls[0].arguments[0], 1);
+    assert.equal(
+      MockAgentClass.instances.filter((i) => agentRole(i.name) === 'test-writer').length,
+      5,
+    );
+  });
+
+  it('stops the test loop after maxRounds critic failures with no code loop and no commit', async () => {
+    const tmpCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-test-loop-exhaust-'));
+    try {
+      const runContext = fakeRunContext(tmpCwd);
+      fs.mkdirSync(runContext.artifactDir, { recursive: true });
+      const worktree = fakeWorktree(tmpCwd);
+      const order = [];
+
+      const { commitMock, exitSpy } = await runComplex(
+        { 'test-critic': FAIL_CRITIC },
+        { maxRounds: 2, order, runContext, worktree },
+      );
+
+      assert.deepEqual(
+        order.filter((n) => !['triage', 'research', 'planner'].includes(n)),
+        ['test-writer', 'test-critic', 'test-writer', 'test-critic'],
+      );
+      assert.equal(commitMock.mock.calls.length, 0);
+      assert.equal(exitSpy.mock.calls.length, 1);
+      assert.equal(exitSpy.mock.calls[0].arguments[0], 1);
+
+      const status = fs.readFileSync(runContext.statusPath, 'utf8');
+      assert.match(status, /## Test loop/);
+      assert.match(status, /Rounds:\s*2\/2/i);
+      assert.match(status, /Result:\s*failed/i);
+      assert.doesNotMatch(status, /## Code loop/);
+      assert.doesNotMatch(status, /## Commit/);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('respawns test-writer with [Test Critic Feedback] after a soft critic failure', async () => {
+    const order = [];
+    const { MockAgentClass, commitMock, exitSpy } = await runComplex(
+      {
+        'test-writer': [
+          { ok: true, result: 'tests v1' },
+          { ok: true, result: 'tests v2' },
+        ],
+        'test-critic': [FAIL_CRITIC, PASS_CRITIC],
+      },
+      { maxRounds: 3, order },
+    );
+
+    assert.deepEqual(
+      order.filter((n) => !['triage', 'research', 'planner'].includes(n)),
+      ['test-writer', 'test-critic', 'test-writer', 'test-critic', 'code-writer', 'test-runner'],
+    );
+    assert.equal(commitMock.mock.calls.length, 1);
+    assert.equal(exitSpy.mock.calls.length, 0);
+
+    const writers = MockAgentClass.instances.filter((i) => agentRole(i.name) === 'test-writer');
+    assert.equal(writers.length, 2);
+    const secondPrompt = `${writers[1].instructions}\n${writers[1].prompt}`;
+    assert.match(secondPrompt, /\[Test Critic Feedback\]/);
+    assert.match(secondPrompt, /missing coverage|no assert for max-rounds/);
+    assert.doesNotMatch(`${writers[0].instructions}\n${writers[0].prompt}`, /\[Test Critic Feedback\]/);
+  });
+
+  it('injects [Accepted Verification] into round-1 code-writer and commits when runner passes', async () => {
+    const tmpCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-code-loop-pass-'));
+    try {
+      const runContext = fakeRunContext(tmpCwd);
+      fs.mkdirSync(runContext.artifactDir, { recursive: true });
+      const worktree = fakeWorktree(tmpCwd);
+
+      const { MockAgentClass, commitMock, exitSpy } = await runComplex(
+        {
+          'test-writer': { ok: true, result: 'npm test\ntest/main.test.js' },
+          'test-critic': {
+            ok: true,
+            result: JSON.stringify({ passed: true, summary: 'verification accepted' }),
+          },
+        },
+        { runContext, worktree },
+      );
+
+      assert.equal(commitMock.mock.calls.length, 1);
+      assert.equal(exitSpy.mock.calls.length, 0);
+
+      const codeWriter = MockAgentClass.instances.find((i) => agentRole(i.name) === 'code-writer');
+      const codePrompt = `${codeWriter.instructions}\n${codeWriter.prompt}`;
+      assert.match(codePrompt, /\[Accepted Verification\]/);
+      assert.doesNotMatch(codePrompt, /\[Test Runner Feedback\]/);
+      // code-writer must not be told to gate on running the suite itself
+      assert.doesNotMatch(codeWriter.instructions, /finish regardless of failure/i);
+
+      const status = fs.readFileSync(runContext.statusPath, 'utf8');
+      assert.match(status, /## Test loop/);
+      assert.match(status, /Result:\s*passed/i);
+      assert.match(status, /## Code loop/);
+      assert.match(status, /Result:\s*passed/i);
+      assert.match(status, /## Commit/);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('respawns code-writer with [Test Runner Feedback] after a soft runner failure, then commits on pass', async () => {
+    const order = [];
+    const { MockAgentClass, commitMock, exitSpy } = await runComplex(
+      {
+        'code-writer': [
+          { ok: true, result: 'impl v1' },
+          { ok: true, result: 'impl v2' },
+        ],
+        'test-runner': [FAIL_RUNNER, PASS_RUNNER],
+      },
+      { maxRounds: 3, order },
+    );
+
+    assert.deepEqual(
+      order.filter((n) => !['triage', 'research', 'planner', 'test-writer', 'test-critic'].includes(n)),
+      ['code-writer', 'test-runner', 'code-writer', 'test-runner'],
+    );
+    assert.equal(commitMock.mock.calls.length, 1);
+    assert.equal(exitSpy.mock.calls.length, 0);
+
+    const writers = MockAgentClass.instances.filter((i) => agentRole(i.name) === 'code-writer');
+    assert.equal(writers.length, 2);
+    assert.match(`${writers[0].instructions}\n${writers[0].prompt}`, /\[Accepted Verification\]/);
+    assert.match(`${writers[1].instructions}\n${writers[1].prompt}`, /\[Test Runner Feedback\]/);
+    assert.match(`${writers[1].instructions}\n${writers[1].prompt}`, /parseVerdict missing|tests failed/);
+  });
+
+  it('exhausts the code loop without committing when the runner never passes', async () => {
+    const tmpCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-code-loop-exhaust-'));
+    try {
+      const runContext = fakeRunContext(tmpCwd);
+      fs.mkdirSync(runContext.artifactDir, { recursive: true });
+      const worktree = fakeWorktree(tmpCwd);
+      const order = [];
+
+      const { commitMock, exitSpy } = await runComplex(
+        { 'test-runner': FAIL_RUNNER },
+        { maxRounds: 2, order, runContext, worktree },
+      );
+
+      assert.deepEqual(
+        order.filter((n) => !['triage', 'research', 'planner', 'test-writer', 'test-critic'].includes(n)),
+        ['code-writer', 'test-runner', 'code-writer', 'test-runner'],
+      );
+      assert.equal(commitMock.mock.calls.length, 0);
+      assert.equal(exitSpy.mock.calls.length, 1);
+      assert.equal(exitSpy.mock.calls[0].arguments[0], 1);
+
+      const status = fs.readFileSync(runContext.statusPath, 'utf8');
+      assert.match(status, /## Test loop/);
+      assert.match(status, /Result:\s*passed/i);
+      assert.match(status, /## Code loop/);
+      assert.match(status, /Rounds:\s*2\/2/i);
+      assert.match(status, /Result:\s*failed/i);
+      assert.doesNotMatch(status, /## Commit/);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('hard-fails immediately when test-critic resolves ok:false (no further rounds)', async () => {
+    const order = [];
+    const { commitMock, exitSpy } = await runComplex(
+      { 'test-critic': { ok: false, result: 'critic crashed' } },
+      { maxRounds: 5, order },
+    );
+
+    assert.deepEqual(
+      order.filter((n) => !['triage', 'research', 'planner'].includes(n)),
+      ['test-writer', 'test-critic'],
+    );
+    assert.equal(commitMock.mock.calls.length, 0);
+    assert.equal(exitSpy.mock.calls.length, 1);
+    assert.equal(exitSpy.mock.calls[0].arguments[0], 1);
+  });
+
+  it('treats an unparseable critic verdict as a soft fail that consumes a round', async () => {
+    const order = [];
+    const { commitMock, exitSpy } = await runComplex(
+      {
+        'test-writer': [
+          { ok: true, result: 'v1' },
+          { ok: true, result: 'v2' },
+        ],
+        'test-critic': [
+          { ok: true, result: 'not a verdict at all' },
+          PASS_CRITIC,
+        ],
+      },
+      { maxRounds: 3, order },
+    );
+
+    assert.ok(order.includes('code-writer'));
+    assert.equal(commitMock.mock.calls.length, 1);
+    assert.equal(exitSpy.mock.calls.length, 0);
+    assert.equal(order.filter((n) => n === 'test-writer').length, 2);
+  });
+
+  it('does not re-enter the test loop after the code loop starts', async () => {
+    const order = [];
+    await runComplex(
+      {
+        'code-writer': [
+          { ok: true, result: 'impl v1' },
+          { ok: true, result: 'impl v2' },
+        ],
+        'test-runner': [FAIL_RUNNER, PASS_RUNNER],
+      },
+      { maxRounds: 3, order },
+    );
+
+    const afterCode = order.slice(order.indexOf('code-writer'));
+    assert.equal(afterCode.filter((n) => n === 'test-writer' || n === 'test-critic').length, 0);
   });
 });
