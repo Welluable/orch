@@ -9,6 +9,7 @@ import { AgentCursor } from './lib/agent-cursor.js';
 import { AgentClaude } from './lib/agent-claude.js';
 import { AgentAgn } from './lib/agent-agn.js';
 import { parseTriageJson } from './lib/parse-triage-json.js';
+import { parseVerdict } from './lib/parse-verdict.js';
 import { createRunContext } from './lib/run-context.js';
 import { createWorktree } from './lib/worktree.js';
 import { commitWorktree } from './lib/commit.js';
@@ -60,8 +61,34 @@ function ensureBinaryOnPath(binary, agentName) {
     }
 }
 
+function formatVerdictFeedback(verdict, rawResult) {
+    const lines = [];
+    if (verdict.summary) lines.push(verdict.summary);
+    if (Array.isArray(verdict.failures)) {
+        for (const failure of verdict.failures) {
+            lines.push(String(failure));
+        }
+    }
+    if (lines.length === 0 && typeof rawResult === 'string') {
+        return rawResult;
+    }
+    return lines.join('\n');
+}
+
+function appendLoopStatus(statusPath, title, { round, maxRounds, passed, summary }) {
+    fs.appendFileSync(
+        statusPath,
+        `\n## ${title}\n\n- Rounds: ${round}/${maxRounds}\n- Result: ${passed ? 'passed' : 'failed'}\n- Summary: ${summary || ''}\n`,
+    );
+}
+
+function roundLabel(role, round, maxRounds) {
+    return `${role} ${round}/${maxRounds}`;
+}
+
 export async function runPipeline(prompt, options) {
     const verbose = Boolean(options.verbose);
+    const maxRounds = options.maxRounds ?? 5;
     const backend = AGENT_BACKENDS[options.agent];
     if (!backend) {
         throw new Error(`Unknown agent backend: ${options.agent}`);
@@ -196,9 +223,26 @@ export async function runPipeline(prompt, options) {
             `# Status\n\n- Slug: \`${runContext.slug}\`\n- Branch: \`${worktree.branch}\`\n- Worktree: \`${worktree.worktreePath}\`\n`,
         );
 
-        const testWriter = new AgentClass(
-            'test-writer',
-            `
+        // --- test loop: test-writer ⇄ test-critic ---
+        let testAccepted = null;
+        let criticFeedback = null;
+        let testRound = 0;
+        let testSummary = '';
+
+        for (let round = 1; round <= maxRounds; round++) {
+            testRound = round;
+
+            const criticBlock = criticFeedback
+                ? `
+                    [Test Critic Feedback]
+                    ${criticFeedback}
+                    [/Test Critic Feedback]
+                `
+                : '';
+
+            const testWriter = new AgentClass(
+                roundLabel('test-writer', round, maxRounds),
+                `
                     You are a Test Writer Agent.
 
                     * You are already running inside the git worktree for this task
@@ -218,19 +262,113 @@ export async function runPipeline(prompt, options) {
                       command. Leave changes unstaged — orch commits after the pipeline finishes.
                     * Your final message must include test file paths / run command, if
                       applicable, so it can be handed to the next stage.
+                    * Later rounds must address critic feedback; do not write production code.
+                    ${criticBlock}
                 `,
-            prompt,
-            { cwd: worktree.worktreePath },
-        );
+                prompt,
+                { cwd: worktree.worktreePath },
+            );
 
-        const testOut = await testWriter.run({ verbose });
-        if (!testOut.ok) {
-            throw new Error('test-writer failed; stopping before code-writer');
+            const testOut = await testWriter.run({ verbose });
+            if (!testOut.ok) {
+                appendLoopStatus(runContext.statusPath, 'Test loop', {
+                    round: testRound,
+                    maxRounds,
+                    passed: false,
+                    summary: 'test-writer failed',
+                });
+                throw new Error('test-writer failed; stopping before code-writer');
+            }
+
+            const testCritic = new AgentClass(
+                roundLabel('test-critic', round, maxRounds),
+                `
+                    You are a Test Critic Agent.
+
+                    * You are already running inside the git worktree for this task
+                      (worktree: ${worktree.worktreePath}, branch: ${worktree.branch}). Do not
+                      create, select, or switch worktrees or branches.
+                    * Read the task checklist at the exact path: ${runContext.taskPath} and the
+                      status at the exact path: ${runContext.statusPath}
+                    * Judge whether the current tests / "## Verification" section are adequate
+                      for the task checklist intent (coverage of requirements, not merely that
+                      files exist).
+                    * Do not edit production code or rewrite tests. Feedback only.
+                    * Your final message MUST include a JSON verdict:
+                      {"passed": true|false, "summary": "short reason", "failures": ["optional"]}
+                    * Set passed: true only when verification is adequate to freeze for implementation.
+
+                    [Test Writer Output]
+                    ${testOut.result}
+                    [/Test Writer Output]
+                `,
+                prompt,
+                { cwd: worktree.worktreePath },
+            );
+
+            const criticOut = await testCritic.run({ verbose });
+            if (!criticOut.ok) {
+                appendLoopStatus(runContext.statusPath, 'Test loop', {
+                    round: testRound,
+                    maxRounds,
+                    passed: false,
+                    summary: 'test-critic failed',
+                });
+                throw new Error('test-critic failed; stopping before code-writer');
+            }
+
+            const verdict = parseVerdict(criticOut.result);
+            testSummary = verdict.summary;
+            if (verdict.passed) {
+                testAccepted = { writerOut: testOut, criticOut, verdict, round };
+                break;
+            }
+            criticFeedback = formatVerdictFeedback(verdict, criticOut.result);
         }
 
-        const codeWriter = new AgentClass(
-            'code-writer',
-            `
+        appendLoopStatus(runContext.statusPath, 'Test loop', {
+            round: testAccepted?.round ?? testRound,
+            maxRounds,
+            passed: Boolean(testAccepted),
+            summary: testAccepted?.verdict.summary ?? testSummary,
+        });
+
+        if (!testAccepted) {
+            throw new Error(`test loop exhausted after ${maxRounds} rounds`);
+        }
+
+        // --- code loop: code-writer ⇄ test-runner ---
+        let codeAccepted = null;
+        let runnerFeedback = null;
+        let codeRound = 0;
+        let codeSummary = '';
+
+        const acceptedVerification = [
+            testAccepted.verdict.summary,
+            testAccepted.writerOut.result,
+        ]
+            .filter(Boolean)
+            .join('\n');
+
+        for (let round = 1; round <= maxRounds; round++) {
+            codeRound = round;
+
+            const feedbackBlock =
+                round === 1
+                    ? `
+                    [Accepted Verification]
+                    ${acceptedVerification}
+                    [/Accepted Verification]
+                `
+                    : `
+                    [Test Runner Feedback]
+                    ${runnerFeedback}
+                    [/Test Runner Feedback]
+                `;
+
+            const codeWriter = new AgentClass(
+                roundLabel('code-writer', round, maxRounds),
+                `
                     You are a Code Writer Agent.
 
                     * You are already running inside the git worktree for this task
@@ -238,30 +376,89 @@ export async function runPipeline(prompt, options) {
                       create, select, or switch worktrees or branches.
                     * Read the task checklist at the exact path: ${runContext.taskPath} and the
                       current status at the exact path: ${runContext.statusPath}
-                    * Implement the steps in the task checklist.
+                    * Implement the steps in the task checklist against the frozen verification
+                      from the test loop.
                     * Keep the exact status file at ${runContext.statusPath} updated as steps
                       complete.
-                    * If tests were added or already exist, run them and record the results (pass or
-                      fail) in the status file. Do not fix failures beyond this stage — finish
-                      regardless of failure.
+                    * Do not run the test suite as a gate — that is the test-runner's job. Do not
+                      delete or weaken tests just to force a green run.
                     * If only verification criteria exist, implement so those criteria are met, and
                       note that in the status file.
-                    * Do not delete or weaken tests just to force a green run.
                     * Do not run \`git add\`, \`git commit\`, or any other git branch/commit
                       command. Leave changes unstaged — orch commits after the pipeline finishes.
                     * Once implementation is done, the task is complete.
-
-                    [Test Writer Output]
-                    ${testOut.result}
-                    [/Test Writer Output]
+                    ${feedbackBlock}
                 `,
-            prompt,
-            { cwd: worktree.worktreePath },
-        );
+                prompt,
+                { cwd: worktree.worktreePath },
+            );
 
-        const codeOut = await codeWriter.run({ verbose });
-        if (!codeOut.ok) {
-            throw new Error('code-writer failed; stopping before commit');
+            const codeOut = await codeWriter.run({ verbose });
+            if (!codeOut.ok) {
+                appendLoopStatus(runContext.statusPath, 'Code loop', {
+                    round: codeRound,
+                    maxRounds,
+                    passed: false,
+                    summary: 'code-writer failed',
+                });
+                throw new Error('code-writer failed; stopping before commit');
+            }
+
+            const testRunner = new AgentClass(
+                roundLabel('test-runner', round, maxRounds),
+                `
+                    You are a Test Runner Agent.
+
+                    * You are already running inside the git worktree for this task
+                      (worktree: ${worktree.worktreePath}, branch: ${worktree.branch}). Do not
+                      create, select, or switch worktrees or branches.
+                    * Read the status at the exact path: ${runContext.statusPath} and prior stage
+                      output for the test command(s) to run.
+                    * If a runnable command is recorded, run it and report the outcome.
+                    * If only a "## Verification" section exists, evaluate the current diff against
+                      those criteria by inspection.
+                    * Do not edit production code or tests. Report only.
+                    * Your final message MUST include a JSON verdict:
+                      {"passed": true|false, "summary": "short reason", "failures": ["optional"]}
+                    * Set passed: true only when the verification gate is green.
+
+                    [Code Writer Output]
+                    ${codeOut.result}
+                    [/Code Writer Output]
+                `,
+                prompt,
+                { cwd: worktree.worktreePath },
+            );
+
+            const runnerOut = await testRunner.run({ verbose });
+            if (!runnerOut.ok) {
+                appendLoopStatus(runContext.statusPath, 'Code loop', {
+                    round: codeRound,
+                    maxRounds,
+                    passed: false,
+                    summary: 'test-runner failed',
+                });
+                throw new Error('test-runner failed; stopping before commit');
+            }
+
+            const verdict = parseVerdict(runnerOut.result);
+            codeSummary = verdict.summary;
+            if (verdict.passed) {
+                codeAccepted = { writerOut: codeOut, runnerOut, verdict, round };
+                break;
+            }
+            runnerFeedback = formatVerdictFeedback(verdict, runnerOut.result);
+        }
+
+        appendLoopStatus(runContext.statusPath, 'Code loop', {
+            round: codeAccepted?.round ?? codeRound,
+            maxRounds,
+            passed: Boolean(codeAccepted),
+            summary: codeAccepted?.verdict.summary ?? codeSummary,
+        });
+
+        if (!codeAccepted) {
+            throw new Error(`code loop exhausted after ${maxRounds} rounds`);
         }
 
         const message = `orch: ${runContext.slug} ${prompt.split('\n')[0]}`;
@@ -300,6 +497,13 @@ program
     .argument('<task...>', 'Task description to use as the prompt (mention a file path and the agent will read it)')
     .option('-v, --verbose', 'Stream agent thinking/output deltas to stderr as the pipeline runs')
     .option('--dry-run', 'Check that the selected agent CLI is on PATH and exit; do not run the pipeline')
+    .option('--max-rounds <n>', 'Max writer⇄critic and writer⇄runner iterations per implementer loop', (value) => {
+        const n = Number.parseInt(value, 10);
+        if (!Number.isFinite(n) || n < 1) {
+            throw new Error('--max-rounds must be a positive integer');
+        }
+        return n;
+    }, 5)
     .addOption(
         new Option('--agent <agent>', 'Agent backend to run the pipeline with: "cursor" (Cursor Agent CLI), "claude" (Claude Code CLI), or "agn" (agn CLI)')
             .choices(['cursor', 'claude', 'agn'])

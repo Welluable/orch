@@ -30,7 +30,7 @@ orch "noop" --dry-run --agent cursor
 ```
 
 ```text
-orch <task...> [--agent cursor|claude|agn] [-v] [--dry-run]
+orch <task...> [--agent cursor|claude|agn] [-v] [--dry-run] [--max-rounds <n>]
 ```
 
 `--dry-run` checks that the selected agent CLI (`agent`, `claude`, or `agn`) is on your `PATH`, prints `cwd` / `agent` / `pass` or `fail`, and exits without running the pipeline.
@@ -61,10 +61,12 @@ orch/<slug>                           # branch
 ```
 
 `research` and `planner` run in your invocation directory and write to the exact
-paths above. `orch` then creates the worktree and runs `test-writer` and
-`code-writer` inside it, passing them the exact artifact paths back in the
-invocation directory. The worktree is left in place after the run so you can
-inspect or continue the work; it is never deleted automatically.
+paths above. `orch` then creates the worktree and runs implementer loops inside
+it — `test-writer` ⇄ `test-critic`, then `code-writer` ⇄ `test-runner` (up to
+`--max-rounds`, default 5) — committing only after the runner passes. Artifact
+paths point back at the invocation directory. The worktree is left in place
+after the run so you can inspect or continue the work; it is never deleted
+automatically.
 
 ## Development
 
