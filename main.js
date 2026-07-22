@@ -128,6 +128,7 @@ export async function runPipeline(prompt, options) {
                 * This is read-only: do not edit files, write orch artifacts under .orch/,
                   or create worktrees.
                 * Put the full answer in your final message.
+                * Your final message should only have the answer, no other text.
             `,
             prompt,
             { cwd: invocationCwd, readOnly: true },
