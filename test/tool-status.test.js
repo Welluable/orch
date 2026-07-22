@@ -5,7 +5,6 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import {
   formatToolStatus,
-  formatToolHistory,
   formatActiveTools,
   normalizeCursorToolEvent,
   normalizeClaudeToolEvent,
@@ -481,104 +480,5 @@ describe('parallel tool lifecycle (fixture-driven)', () => {
     agent.onToolEvent({ name: 'Read', args: {}, phase: 'completed', callId: 'c-4' });
     agent.onToolEvent({ name: 'Read', args: {}, phase: 'completed', callId: 'c-5' });
     assert.equal(statuses[statuses.length - 1], 'working…');
-  });
-});
-
-describe('formatToolHistory', () => {
-  it('never adds a trailing ellipsis', () => {
-    const text = formatToolHistory({ name: 'read', args: { path: 'a.js' } }, { durationMs: 200 });
-    assert.doesNotMatch(text, /…/);
-  });
-
-  it('omits the done-in suffix when durationMs < 1000', () => {
-    const text = formatToolHistory({ name: 'read', args: { path: 'a.js' } }, { durationMs: 999 });
-    assert.match(text, /a\.js/);
-    assert.doesNotMatch(text, /done in/);
-  });
-
-  it('includes done-in {elapsed} when durationMs >= 1000 (boundary inclusive)', () => {
-    const text = formatToolHistory({ name: 'read', args: { path: 'a.js' } }, { durationMs: 1000 });
-    assert.match(text, /a\.js.*done in 1s/);
-  });
-
-  it('formats write/edit/delete with a basename and optional done-in suffix', () => {
-    assert.match(
-      formatToolHistory({ name: 'write', args: { path: 'a.js' } }, { durationMs: 2000 }),
-      /a\.js.*done in 2s/,
-    );
-    assert.match(
-      formatToolHistory({ name: 'edit', args: { path: 'a.js' } }, { durationMs: 500 }),
-      /a\.js/,
-    );
-    assert.match(
-      formatToolHistory({ name: 'delete', args: { path: 'a.js' } }, { durationMs: 500 }),
-      /a\.js/,
-    );
-  });
-
-  it('resolves file_path for write/edit/delete (same bug fix as the live formatter)', () => {
-    assert.match(
-      formatToolHistory({ name: 'write', args: { file_path: 'lib/a.js' } }, { durationMs: 0 }),
-      /a\.js/,
-    );
-    assert.match(
-      formatToolHistory({ name: 'edit', args: { file_path: 'lib/a.js' } }, { durationMs: 0 }),
-      /a\.js/,
-    );
-    assert.match(
-      formatToolHistory({ name: 'delete', args: { file_path: 'lib/a.js' } }, { durationMs: 0 }),
-      /a\.js/,
-    );
-  });
-
-  it('never includes fileText/content/patch bodies, only the path', () => {
-    const text = formatToolHistory(
-      { name: 'write', args: { path: 'a.js', fileText: 'super secret body' } },
-      { durationMs: 2000 },
-    );
-    assert.doesNotMatch(text, /super secret body/);
-  });
-
-  it('shell/bash always shows "Running: {command}", with done-in only when >= 1000ms', () => {
-    const fast = formatToolHistory({ name: 'shell', args: { command: 'ls' } }, { durationMs: 200 });
-    assert.match(fast, /^Running: ls$/);
-    assert.doesNotMatch(fast, /done in/);
-
-    const slow = formatToolHistory({ name: 'shell', args: { command: 'npm test' } }, { durationMs: 4000 });
-    assert.match(slow, /^Running: npm test.*done in 4s$/);
-  });
-
-  it('unknown tool falls back to "Ran {name}({preview})" or "Ran {name}"', () => {
-    const withArgs = formatToolHistory({ name: 'CustomTool', args: { path: 'foo' } }, { durationMs: 200 });
-    assert.equal(withArgs, 'Ran CustomTool(path=foo)');
-
-    const withoutArgs = formatToolHistory({ name: 'CustomTool', args: {} }, { durationMs: 2000 });
-    assert.match(withoutArgs, /^Ran CustomTool.*done in 2s$/);
-    assert.doesNotMatch(withoutArgs, /\(/);
-  });
-
-  it('renders the Claude write fixture (file_path) as a basenamed history line', () => {
-    const [event] = loadFixture('claude-assistant-write.jsonl');
-    const [toolEvent] = normalizeClaudeToolEvent(event);
-    const text = formatToolHistory(toolEvent, { durationMs: 1200 });
-    assert.match(text, /agent\.js.*done in 1s/);
-    assert.doesNotMatch(text, /secret body/);
-  });
-
-  it('renders the Claude MultiEdit fixture as an edit history line, not "Ran MultiEdit"', () => {
-    const [event] = loadFixture('claude-assistant-multiedit.jsonl');
-    const [toolEvent] = normalizeClaudeToolEvent(event);
-    const text = formatToolHistory(toolEvent, { durationMs: 500 });
-    assert.match(text, /tool-status\.js/);
-    assert.doesNotMatch(text, /MultiEdit/);
-  });
-
-  it('renders the Cursor write fixture (path arg) as a basenamed history line', () => {
-    const [started] = loadFixture('cursor-tool-write-started.jsonl');
-    const toolEvent = normalizeCursorToolEvent(started);
-    const text = formatToolHistory(toolEvent, { durationMs: 100 });
-    assert.match(text, /agent\.js/);
-    assert.doesNotMatch(text, /done in/);
-    assert.doesNotMatch(text, /secret body/);
   });
 });

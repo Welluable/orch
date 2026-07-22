@@ -315,12 +315,10 @@ describe('AgentAgn', () => {
 
     agent.handleStreamEvent(started, { verbose: false, finish: mock.fn() });
     assert.equal(agent.activeTools.size, 1);
-    const { name, args, startedAt } = agent.activeTools.get('a-1');
-    assert.deepEqual({ name, args }, {
+    assert.deepEqual(agent.activeTools.get('a-1'), {
       name: 'read',
       args: { path: 'lib/agent.js' },
     });
-    assert.equal(typeof startedAt, 'number');
 
     agent.handleStreamEvent(completed, { verbose: false, finish: mock.fn() });
     assert.equal(agent.activeTools.size, 0);
