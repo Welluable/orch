@@ -14,7 +14,8 @@
   ],
   "scripts": {
     "test": "node --test \"test/**/*.test.js\"",
-    "commit": "agn 'commit with a detailed message and push'"
+    "commit": "agn 'commit with a detailed message and push'",
+    "docs": "orch --quick 'Update README.md and orch --help so they match the current CLI. Only update what changes and add what is missing.' --agent agn"
   },
   "keywords": [],
   "author": "",

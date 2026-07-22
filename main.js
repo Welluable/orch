@@ -146,6 +146,29 @@ export async function runPipeline(prompt, options) {
         return;
     }
 
+    if (options.quick) {
+        const quickFix = quickFixAgentArgs({ prompt, cwd: invocationCwd });
+        const quickFixAgent = new AgentClass(
+            quickFix.name,
+            quickFix.instructions,
+            quickFix.prompt,
+            quickFix.options,
+        );
+
+        try {
+            const quickFixResult = await quickFixAgent.run({ verbose });
+            if (!quickFixResult.ok) {
+                console.error(`Error: quick-fix agent failed`);
+                process.exit(1);
+                return;
+            }
+        } catch (err) {
+            console.error(`Error: ${err.message}`);
+            process.exit(1);
+        }
+        return;
+    }
+
     const triage = triageAgentArgs({ prompt, cwd: invocationCwd });
     const triageAgent = new AgentClass(
         triage.name,
@@ -422,12 +445,13 @@ const program = new Command();
 program
     .name('orch')
     .version(version)
-    .description('The Orchestrator')
+    .description('The Orchestrator: triage → research → plan → implement pipeline against a task')
     .argument('<task...>', 'Task description to use as the prompt (mention a file path and the agent will read it)')
     .option('-v, --verbose', 'Stream agent thinking/output deltas to stderr as the pipeline runs')
     .option('--dry-run', 'Check that the selected agent CLI is on PATH and exit; do not run the pipeline')
     .option('--ask', 'Ask a read-only question about the codebase; print the reply and exit (skips triage and all write pipelines)')
-    .option('--max-rounds <n>', 'Max writer⇄critic and writer⇄runner iterations per implementer loop (ignored with --ask)', (value) => {
+    .option('--quick', 'Skip triage, run quick-fix directly in the current working tree; create no artifacts, worktrees, or commits')
+    .option('--max-rounds <n>', 'Max writer⇄critic and writer⇄runner iterations per implementer loop (ignored with --ask and --quick)', (value) => {
         const n = Number.parseInt(value, 10);
         if (!Number.isFinite(n) || n < 1) {
             throw new Error('--max-rounds must be a positive integer');
@@ -447,6 +471,7 @@ Examples:
   $ orch "fix the bug described in task.md" --agent cursor -v
   $ orch "implement the local spec" --agent agn -v
   $ orch --ask "where is the CLI entrypoint?" --agent claude
+  $ orch --quick "fix the typo in the README" --agent claude
   $ orch "noop" --dry-run --agent cursor
 `,
     )

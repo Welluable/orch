@@ -27,16 +27,26 @@ orch "fix the bug described in task.md" --agent claude
 orch "add a --verbose flag" --agent cursor -v
 orch "implement the local spec" --agent agn -v
 orch --ask "where is the CLI entrypoint?" --agent claude
+orch --quick "fix the typo in the README" --agent claude
 orch "noop" --dry-run --agent cursor
+orch --version
+orch --help
 ```
 
 ```text
-orch <task...> [--agent cursor|claude|agn] [-v] [--dry-run] [--ask] [--max-rounds <n>]
+Usage: orch [options] <task...>
 ```
 
-`--dry-run` checks that the selected agent CLI (`agent`, `claude`, or `agn`) is on your `PATH`, prints `cwd` / `agent` / `pass` or `fail`, and exits without running the pipeline.
+Options:
 
-`--ask` skips triage and every write pipeline. It spawns a single read-only agent in the current directory, prints its reply to stdout, and never creates `.orch/` artifacts, worktrees, or commits. Cursor uses `--mode ask`; Claude uses `--permission-mode plan`. With `--agent agn`, read-only is prompt-only (best-effort — agn has no CLI read-only flag).
+- `-V, --version` outputs the version number.
+- `-v, --verbose` streams agent thinking/output deltas to stderr as the pipeline runs.
+- `--dry-run` checks that the selected agent CLI (`agent`, `claude`, or `agn`) is on your `PATH`, prints `cwd` / `agent` / `pass` or `fail`, and exits without running the pipeline.
+- `--ask` skips triage and every write pipeline. It spawns a single read-only agent in the current directory, prints its reply to stdout, and never creates `.orch/` artifacts, worktrees, or commits. Cursor uses `--mode ask`; Claude uses `--permission-mode plan`. With `--agent agn`, read-only is prompt-only (best-effort — agn has no CLI read-only flag).
+- `--quick` skips triage and runs the `quick-fix` agent directly in the current working tree. No `.orch/` artifacts, worktrees, or commits are created. Unlike triage → quick-fix, there is no fix plan from triage.
+- `--max-rounds <n>` sets the max writer⇄critic and writer⇄runner iterations per implementer loop. It defaults to 5 and is ignored with `--ask` and `--quick`.
+- `--agent <agent>` selects the backend for the whole pipeline: `cursor` (Cursor Agent CLI), `claude` (Claude Code CLI), or `agn` (agn CLI). It defaults to `cursor`.
+- `-h, --help` displays help for the command.
 
 Mention a file path in the task text and the agent will read it with its own tools.
 
@@ -55,9 +65,12 @@ pkill -f 'agn '        # --agent agn
 `--ask` is a separate path: no triage, no quick-fix, no research/plan/implement
 loops. One read-only `ask` agent answers the question and orch prints the reply.
 
-Quick fixes run in place: triage decides the request is a small, safe change and a
-single `quick-fix` agent edits the current working tree directly. No artifacts or
-worktree are created.
+`--quick` is also a separate path: no triage, no research/plan/implement loops.
+One `quick-fix` agent edits the current working tree directly (no fix plan).
+
+Quick fixes otherwise run in place: triage decides the request is a small, safe
+change and a single `quick-fix` agent edits the current working tree directly.
+No artifacts or worktree are created.
 
 Complex tasks get one randomly named run directory under the directory where you
 invoked `orch` (never the orch install directory):

@@ -55,7 +55,7 @@ describe('main.js CLI', () => {
     assert.equal(stdout.trim(), '1.0.0');
   });
 
-  it('help output mentions --agent, --verbose, --dry-run, --max-rounds, and --ask', async () => {
+  it('help output mentions --agent, --verbose, --dry-run, --max-rounds, --ask, and --quick', async () => {
     const { code, stdout } = await runCli(['--help']);
     assert.equal(code, 0);
     assert.match(stdout, /--verbose/);
@@ -63,6 +63,7 @@ describe('main.js CLI', () => {
     assert.match(stdout, /--dry-run/);
     assert.match(stdout, /--max-rounds/);
     assert.match(stdout, /--ask/);
+    assert.match(stdout, /--quick/);
   });
 
   it('--dry-run reports readiness without running the pipeline', async () => {
@@ -1318,6 +1319,163 @@ describe('runPipeline --ask (read-only Q&A)', () => {
       await runPipeline('fix the typo', {
         agent: 'claude',
         ask: false,
+        AgentClass: MockAgentClass,
+        createRunContext: mock.fn(),
+        createWorktree: mock.fn(),
+        commitWorktree: mock.fn(),
+      });
+    } finally {
+      logSpy.mock.restore();
+    }
+
+    assert.deepEqual(order, ['triage', 'quick-fix']);
+  });
+});
+
+describe('runPipeline --quick (skip triage → quick-fix)', () => {
+  it('spawns only a quick-fix agent — never triage, ask, research, or implementers', async () => {
+    const order = [];
+    const MockAgentClass = createMockAgentClass(
+      { 'quick-fix': { ok: true, result: 'fixed' } },
+      { order },
+    );
+    const createRunContextMock = mock.fn(() => fakeRunContext(process.cwd()));
+    const createWorktreeMock = mock.fn(() => fakeWorktree(process.cwd()));
+    const commitWorktreeMock = mock.fn(() => fakeCommitResult('orch/stub-stub-0000'));
+
+    const logSpy = mock.method(console, 'log', () => {});
+    const errorSpy = mock.method(console, 'error', () => {});
+    const exitSpy = mock.method(process, 'exit', () => {});
+    try {
+      await runPipeline('fix the typo in the README', {
+        agent: 'claude',
+        quick: true,
+        AgentClass: MockAgentClass,
+        createRunContext: createRunContextMock,
+        createWorktree: createWorktreeMock,
+        commitWorktree: commitWorktreeMock,
+      });
+    } finally {
+      logSpy.mock.restore();
+      errorSpy.mock.restore();
+      exitSpy.mock.restore();
+    }
+
+    assert.deepEqual(order, ['quick-fix']);
+    assert.equal(createRunContextMock.mock.calls.length, 0);
+    assert.equal(createWorktreeMock.mock.calls.length, 0);
+    assert.equal(commitWorktreeMock.mock.calls.length, 0);
+  });
+
+  it('constructs the quick-fix agent with cwd === invocationCwd and no fix_plan', async () => {
+    const invocationCwd = process.cwd();
+    const MockAgentClass = createMockAgentClass({
+      'quick-fix': { ok: true, result: 'fixed' },
+    });
+
+    const logSpy = mock.method(console, 'log', () => {});
+    const errorSpy = mock.method(console, 'error', () => {});
+    const exitSpy = mock.method(process, 'exit', () => {});
+    try {
+      await runPipeline('fix the typo', {
+        agent: 'cursor',
+        quick: true,
+        AgentClass: MockAgentClass,
+        createRunContext: mock.fn(() => fakeRunContext(invocationCwd)),
+        createWorktree: mock.fn(() => fakeWorktree(invocationCwd)),
+        commitWorktree: mock.fn(() => fakeCommitResult('orch/stub')),
+      });
+    } finally {
+      logSpy.mock.restore();
+      errorSpy.mock.restore();
+      exitSpy.mock.restore();
+    }
+
+    assert.equal(MockAgentClass.instances.length, 1);
+    const quickFixAgent = MockAgentClass.instances[0];
+    assert.equal(quickFixAgent.name, 'quick-fix');
+    assert.equal(quickFixAgent.options?.cwd, invocationCwd);
+    assert.doesNotMatch(quickFixAgent.instructions, /\[Triage Fix Plan\]/);
+  });
+
+  it('exits 1 and creates no artifacts when the quick-fix agent fails', async () => {
+    const order = [];
+    const MockAgentClass = createMockAgentClass(
+      { 'quick-fix': { ok: false, result: 'agent crashed' } },
+      { order },
+    );
+    const createRunContextMock = mock.fn(() => fakeRunContext(process.cwd()));
+    const createWorktreeMock = mock.fn(() => fakeWorktree(process.cwd()));
+    const commitWorktreeMock = mock.fn(() => fakeCommitResult('orch/stub-stub-0000'));
+
+    const logSpy = mock.method(console, 'log', () => {});
+    const errorSpy = mock.method(console, 'error', () => {});
+    const exitSpy = mock.method(process, 'exit', () => {});
+    try {
+      await runPipeline('fix the typo', {
+        agent: 'claude',
+        quick: true,
+        AgentClass: MockAgentClass,
+        createRunContext: createRunContextMock,
+        createWorktree: createWorktreeMock,
+        commitWorktree: commitWorktreeMock,
+      });
+    } finally {
+      logSpy.mock.restore();
+      errorSpy.mock.restore();
+      exitSpy.mock.restore();
+    }
+
+    assert.deepEqual(order, ['quick-fix']);
+    assert.equal(exitSpy.mock.calls.length, 1);
+    assert.equal(exitSpy.mock.calls[0].arguments[0], 1);
+    assert.equal(createRunContextMock.mock.calls.length, 0);
+    assert.equal(createWorktreeMock.mock.calls.length, 0);
+    assert.equal(commitWorktreeMock.mock.calls.length, 0);
+  });
+
+  it('--quick --dry-run only checks PATH and never constructs a quick-fix agent', async () => {
+    const order = [];
+    const MockAgentClass = createMockAgentClass(
+      { 'quick-fix': { ok: true, result: 'should not run' } },
+      { order },
+    );
+
+    const logSpy = mock.method(console, 'log', () => {});
+    const errorSpy = mock.method(console, 'error', () => {});
+    const exitSpy = mock.method(process, 'exit', () => {});
+    try {
+      await runPipeline('noop', {
+        agent: 'claude',
+        quick: true,
+        dryRun: true,
+        AgentClass: MockAgentClass,
+        createRunContext: mock.fn(),
+        createWorktree: mock.fn(),
+        commitWorktree: mock.fn(),
+      });
+    } finally {
+      logSpy.mock.restore();
+      errorSpy.mock.restore();
+      exitSpy.mock.restore();
+    }
+
+    assert.deepEqual(order, []);
+    assert.equal(MockAgentClass.instances.length, 0);
+  });
+
+  it('without --quick, triage still runs before quick-fix (regression)', async () => {
+    const order = [];
+    const MockAgentClass = createMockAgentClass(
+      { triage: SIMPLE_TRIAGE, 'quick-fix': { ok: true, result: 'fixed' } },
+      { order },
+    );
+
+    const logSpy = mock.method(console, 'log', () => {});
+    try {
+      await runPipeline('fix the typo', {
+        agent: 'claude',
+        quick: false,
         AgentClass: MockAgentClass,
         createRunContext: mock.fn(),
         createWorktree: mock.fn(),
