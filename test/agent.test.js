@@ -109,6 +109,22 @@ describe('AgentCursor', () => {
     assert.deepEqual(args, ['-p', '--force', '--output-format', 'stream-json', 'hello']);
   });
 
+  it('ask/read-only mode uses --mode ask and omits --force', () => {
+    const agent = new AgentCursor('ask', 'instr', 'prompt', { readOnly: true });
+    const { command, args } = agent.getSpawnConfig('hello');
+    assert.equal(command, 'agent');
+    assert.ok(args.includes('--mode'));
+    assert.equal(args[args.indexOf('--mode') + 1], 'ask');
+    assert.ok(!args.includes('--force'));
+    assert.deepEqual(args, ['-p', '--mode', 'ask', '--output-format', 'stream-json', 'hello']);
+  });
+
+  it('write/default mode keeps -p --force --output-format stream-json unchanged', () => {
+    const agent = new AgentCursor('research', 'instr', 'prompt', { readOnly: false });
+    const { args } = agent.getSpawnConfig('hello');
+    assert.deepEqual(args, ['-p', '--force', '--output-format', 'stream-json', 'hello']);
+  });
+
   it('defaults spawn cwd to process.cwd() when no cwd option is given', () => {
     const agent = new AgentCursor('research', 'instr', 'prompt');
     const { options } = agent.getSpawnConfig('hello');
@@ -131,6 +147,35 @@ describe('AgentClaude', () => {
     assert.ok(args.includes('--dangerously-skip-permissions'));
     assert.ok(args.includes('stream-json'));
     assert.equal(args[args.length - 1], 'hello');
+  });
+
+  it('ask/read-only mode uses --permission-mode plan and omits --dangerously-skip-permissions', () => {
+    const agent = new AgentClaude('ask', 'instr', 'prompt', { readOnly: true });
+    const { command, args } = agent.getSpawnConfig('hello');
+    assert.equal(command, 'claude');
+    assert.ok(args.includes('--permission-mode'));
+    assert.equal(args[args.indexOf('--permission-mode') + 1], 'plan');
+    assert.ok(!args.includes('--dangerously-skip-permissions'));
+    assert.ok(args.includes('-p'));
+    assert.ok(args.includes('--output-format'));
+    assert.ok(args.includes('stream-json'));
+    assert.ok(args.includes('--verbose'));
+    assert.equal(args[args.length - 1], 'hello');
+  });
+
+  it('write/default mode keeps --dangerously-skip-permissions and omits --permission-mode', () => {
+    const agent = new AgentClaude('research', 'instr', 'prompt', { readOnly: false });
+    const { args } = agent.getSpawnConfig('hello');
+    assert.ok(args.includes('--dangerously-skip-permissions'));
+    assert.ok(!args.includes('--permission-mode'));
+    assert.deepEqual(args, [
+      '-p',
+      '--output-format',
+      'stream-json',
+      '--verbose',
+      '--dangerously-skip-permissions',
+      'hello',
+    ]);
   });
 
   it('defaults spawn cwd to process.cwd() when no cwd option is given', () => {
@@ -185,6 +230,13 @@ describe('AgentClaude', () => {
 describe('AgentAgn', () => {
   it('builds agn spawn config with exact args, prompt last', () => {
     const agent = new AgentAgn('research', 'instr', 'prompt');
+    const { command, args } = agent.getSpawnConfig('hello');
+    assert.equal(command, 'agn');
+    assert.deepEqual(args, ['-p', '--output-format', 'stream-json', 'hello']);
+  });
+
+  it('ask/read-only mode keeps argv unchanged (no CLI read-only flag; prompt-only limitation)', () => {
+    const agent = new AgentAgn('ask', 'instr', 'prompt', { readOnly: true });
     const { command, args } = agent.getSpawnConfig('hello');
     assert.equal(command, 'agn');
     assert.deepEqual(args, ['-p', '--output-format', 'stream-json', 'hello']);

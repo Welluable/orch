@@ -55,13 +55,14 @@ describe('main.js CLI', () => {
     assert.equal(stdout.trim(), '1.0.0');
   });
 
-  it('help output mentions --agent, --verbose, --dry-run, and --max-rounds', async () => {
+  it('help output mentions --agent, --verbose, --dry-run, --max-rounds, and --ask', async () => {
     const { code, stdout } = await runCli(['--help']);
     assert.equal(code, 0);
     assert.match(stdout, /--verbose/);
     assert.match(stdout, /--agent/);
     assert.match(stdout, /--dry-run/);
     assert.match(stdout, /--max-rounds/);
+    assert.match(stdout, /--ask/);
   });
 
   it('--dry-run reports readiness without running the pipeline', async () => {
@@ -1062,5 +1063,225 @@ describe('runPipeline implementer loops', () => {
 
     const afterCode = order.slice(order.indexOf('code-writer'));
     assert.equal(afterCode.filter((n) => n === 'test-writer' || n === 'test-critic').length, 0);
+  });
+});
+
+describe('runPipeline --ask (read-only Q&A)', () => {
+  it('spawns only an ask agent — never triage, quick-fix, research, or implementers', async () => {
+    const order = [];
+    const MockAgentClass = createMockAgentClass(
+      { ask: { ok: true, result: 'The entrypoint is main.js.' } },
+      { order },
+    );
+    const createRunContextMock = mock.fn(() => fakeRunContext(process.cwd()));
+    const createWorktreeMock = mock.fn(() => fakeWorktree(process.cwd()));
+    const commitWorktreeMock = mock.fn(() => fakeCommitResult('orch/stub-stub-0000'));
+
+    const logSpy = mock.method(console, 'log', () => {});
+    const errorSpy = mock.method(console, 'error', () => {});
+    const exitSpy = mock.method(process, 'exit', () => {});
+    try {
+      await runPipeline('where is the CLI entrypoint?', {
+        agent: 'claude',
+        ask: true,
+        AgentClass: MockAgentClass,
+        createRunContext: createRunContextMock,
+        createWorktree: createWorktreeMock,
+        commitWorktree: commitWorktreeMock,
+      });
+    } finally {
+      logSpy.mock.restore();
+      errorSpy.mock.restore();
+      exitSpy.mock.restore();
+    }
+
+    assert.deepEqual(order, ['ask']);
+    assert.equal(createRunContextMock.mock.calls.length, 0);
+    assert.equal(createWorktreeMock.mock.calls.length, 0);
+    assert.equal(commitWorktreeMock.mock.calls.length, 0);
+  });
+
+  it('constructs the ask agent with cwd === invocationCwd and readOnly: true', async () => {
+    const invocationCwd = process.cwd();
+    const MockAgentClass = createMockAgentClass({
+      ask: { ok: true, result: 'answer' },
+    });
+
+    const logSpy = mock.method(console, 'log', () => {});
+    const errorSpy = mock.method(console, 'error', () => {});
+    const exitSpy = mock.method(process, 'exit', () => {});
+    try {
+      await runPipeline('what does Agent.run do?', {
+        agent: 'cursor',
+        ask: true,
+        AgentClass: MockAgentClass,
+        createRunContext: mock.fn(() => fakeRunContext(invocationCwd)),
+        createWorktree: mock.fn(() => fakeWorktree(invocationCwd)),
+        commitWorktree: mock.fn(() => fakeCommitResult('orch/stub')),
+      });
+    } finally {
+      logSpy.mock.restore();
+      errorSpy.mock.restore();
+      exitSpy.mock.restore();
+    }
+
+    assert.equal(MockAgentClass.instances.length, 1);
+    const askAgent = MockAgentClass.instances[0];
+    assert.equal(askAgent.name, 'ask');
+    assert.equal(askAgent.options?.cwd, invocationCwd);
+    assert.equal(askAgent.options?.readOnly, true);
+  });
+
+  it('ask instructions require answering the question and forbid edits, orch artifacts, and worktrees', async () => {
+    const MockAgentClass = createMockAgentClass({
+      ask: { ok: true, result: 'answer' },
+    });
+
+    const logSpy = mock.method(console, 'log', () => {});
+    const errorSpy = mock.method(console, 'error', () => {});
+    const exitSpy = mock.method(process, 'exit', () => {});
+    try {
+      await runPipeline('how does triage work?', {
+        agent: 'claude',
+        ask: true,
+        AgentClass: MockAgentClass,
+        createRunContext: mock.fn(() => fakeRunContext(process.cwd())),
+        createWorktree: mock.fn(() => fakeWorktree(process.cwd())),
+        commitWorktree: mock.fn(() => fakeCommitResult('orch/stub')),
+      });
+    } finally {
+      logSpy.mock.restore();
+      errorSpy.mock.restore();
+      exitSpy.mock.restore();
+    }
+
+    const { instructions } = MockAgentClass.instances[0];
+    assert.match(instructions, /answer/i);
+    assert.match(instructions, /do not edit|not edit|no edits|read-?only/i);
+    assert.match(instructions, /orch|\.orch/i);
+    assert.match(instructions, /worktree/i);
+  });
+
+  it('prints the ask agent result to stdout on success', async () => {
+    const reply = 'The pipeline starts in runPipeline after CLI parse.';
+    const MockAgentClass = createMockAgentClass({
+      ask: { ok: true, result: reply },
+    });
+
+    const logs = [];
+    const logSpy = mock.method(console, 'log', (...args) => {
+      logs.push(args.map(String).join(' '));
+    });
+    const errorSpy = mock.method(console, 'error', () => {});
+    const exitSpy = mock.method(process, 'exit', () => {});
+    try {
+      await runPipeline('how does the pipeline start?', {
+        agent: 'claude',
+        ask: true,
+        AgentClass: MockAgentClass,
+        createRunContext: mock.fn(() => fakeRunContext(process.cwd())),
+        createWorktree: mock.fn(() => fakeWorktree(process.cwd())),
+        commitWorktree: mock.fn(() => fakeCommitResult('orch/stub')),
+      });
+    } finally {
+      logSpy.mock.restore();
+      errorSpy.mock.restore();
+      exitSpy.mock.restore();
+    }
+
+    assert.ok(
+      logs.some((line) => line.includes(reply)),
+      `expected stdout logs to include ask result; got: ${JSON.stringify(logs)}`,
+    );
+  });
+
+  it('exits 1 and creates no artifacts when the ask agent fails', async () => {
+    const order = [];
+    const MockAgentClass = createMockAgentClass(
+      { ask: { ok: false, result: 'agent crashed' } },
+      { order },
+    );
+    const createRunContextMock = mock.fn(() => fakeRunContext(process.cwd()));
+    const createWorktreeMock = mock.fn(() => fakeWorktree(process.cwd()));
+    const commitWorktreeMock = mock.fn(() => fakeCommitResult('orch/stub-stub-0000'));
+
+    const logSpy = mock.method(console, 'log', () => {});
+    const errorSpy = mock.method(console, 'error', () => {});
+    const exitSpy = mock.method(process, 'exit', () => {});
+    try {
+      await runPipeline('explain the slugger', {
+        agent: 'claude',
+        ask: true,
+        AgentClass: MockAgentClass,
+        createRunContext: createRunContextMock,
+        createWorktree: createWorktreeMock,
+        commitWorktree: commitWorktreeMock,
+      });
+    } finally {
+      logSpy.mock.restore();
+      errorSpy.mock.restore();
+      exitSpy.mock.restore();
+    }
+
+    assert.deepEqual(order, ['ask']);
+    assert.equal(exitSpy.mock.calls.length, 1);
+    assert.equal(exitSpy.mock.calls[0].arguments[0], 1);
+    assert.equal(createRunContextMock.mock.calls.length, 0);
+    assert.equal(createWorktreeMock.mock.calls.length, 0);
+    assert.equal(commitWorktreeMock.mock.calls.length, 0);
+  });
+
+  it('--ask --dry-run only checks PATH and never constructs an ask agent', async () => {
+    const order = [];
+    const MockAgentClass = createMockAgentClass(
+      { ask: { ok: true, result: 'should not run' } },
+      { order },
+    );
+
+    const logSpy = mock.method(console, 'log', () => {});
+    const errorSpy = mock.method(console, 'error', () => {});
+    const exitSpy = mock.method(process, 'exit', () => {});
+    try {
+      await runPipeline('noop', {
+        agent: 'claude',
+        ask: true,
+        dryRun: true,
+        AgentClass: MockAgentClass,
+        createRunContext: mock.fn(),
+        createWorktree: mock.fn(),
+        commitWorktree: mock.fn(),
+      });
+    } finally {
+      logSpy.mock.restore();
+      errorSpy.mock.restore();
+      exitSpy.mock.restore();
+    }
+
+    assert.deepEqual(order, []);
+    assert.equal(MockAgentClass.instances.length, 0);
+  });
+
+  it('without ask, triage still runs before quick-fix (regression)', async () => {
+    const order = [];
+    const MockAgentClass = createMockAgentClass(
+      { triage: SIMPLE_TRIAGE, 'quick-fix': { ok: true, result: 'fixed' } },
+      { order },
+    );
+
+    const logSpy = mock.method(console, 'log', () => {});
+    try {
+      await runPipeline('fix the typo', {
+        agent: 'claude',
+        ask: false,
+        AgentClass: MockAgentClass,
+        createRunContext: mock.fn(),
+        createWorktree: mock.fn(),
+        commitWorktree: mock.fn(),
+      });
+    } finally {
+      logSpy.mock.restore();
+    }
+
+    assert.deepEqual(order, ['triage', 'quick-fix']);
   });
 });

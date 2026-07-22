@@ -118,6 +118,36 @@ export async function runPipeline(prompt, options) {
     }
     console.log();
 
+    if (options.ask) {
+        const askAgent = new AgentClass(
+            'ask',
+            `
+                You are an Ask Agent.
+
+                * Answer the user's question about the codebase.
+                * This is read-only: do not edit files, write orch artifacts under .orch/,
+                  or create worktrees.
+                * Put the full answer in your final message.
+            `,
+            prompt,
+            { cwd: invocationCwd, readOnly: true },
+        );
+
+        try {
+            const askResult = await askAgent.run({ verbose });
+            if (!askResult.ok) {
+                console.error(`Error: ask agent failed`);
+                process.exit(1);
+                return;
+            }
+            console.log(askResult.result);
+        } catch (err) {
+            console.error(`Error: ${err.message}`);
+            process.exit(1);
+        }
+        return;
+    }
+
     const triageAgent = new AgentClass(
         'triage',
         `
@@ -497,7 +527,8 @@ program
     .argument('<task...>', 'Task description to use as the prompt (mention a file path and the agent will read it)')
     .option('-v, --verbose', 'Stream agent thinking/output deltas to stderr as the pipeline runs')
     .option('--dry-run', 'Check that the selected agent CLI is on PATH and exit; do not run the pipeline')
-    .option('--max-rounds <n>', 'Max writer⇄critic and writer⇄runner iterations per implementer loop', (value) => {
+    .option('--ask', 'Ask a read-only question about the codebase; print the reply and exit (skips triage and all write pipelines)')
+    .option('--max-rounds <n>', 'Max writer⇄critic and writer⇄runner iterations per implementer loop (ignored with --ask)', (value) => {
         const n = Number.parseInt(value, 10);
         if (!Number.isFinite(n) || n < 1) {
             throw new Error('--max-rounds must be a positive integer');
@@ -516,6 +547,7 @@ Examples:
   $ orch "fix the typo in the README" --agent claude
   $ orch "fix the bug described in task.md" --agent cursor -v
   $ orch "implement the local spec" --agent agn -v
+  $ orch --ask "where is the CLI entrypoint?" --agent claude
   $ orch "noop" --dry-run --agent cursor
 `,
     )
