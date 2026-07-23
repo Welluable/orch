@@ -15,7 +15,8 @@
   "scripts": {
     "test": "node --test \"test/**/*.test.js\"",
     "commit": "agn 'commit with a detailed message and push'",
-    "docs": "orch --quick 'Update README.md and orch --help so they match the current CLI. Only update what changes and add what is missing.' --agent agn"
+    "docs": "orch --quick 'Update README.md and orch --help so they match the current CLI. Only update what changes and add what is missing.' --agent agn",
+    "release": "orch --quick 'Bump the minor version in package.json and package-lock.json, then publish to npm.' --agent agn"
   },
   "keywords": [],
   "author": "",
