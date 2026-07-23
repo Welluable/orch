@@ -197,6 +197,13 @@ function escapeRegex(text) {
   return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+/** Matches the titled/bulleted block printStageSummary emits for a given
+ * label + summary paragraph: a `label` title line followed by a `• summary`
+ * bullet line. */
+function stageSummaryBlockRegex(label, summary) {
+  return new RegExp(` ${escapeRegex(label)} \\n─+\\n {2}• ${escapeRegex(summary)}`);
+}
+
 /** Builds a fake `AgentClass` that records construction order (and, per
  * instance, the options/prompt it was constructed with) and resolves
  * per-name canned results, so `runPipeline`'s branching can be tested without
@@ -1535,7 +1542,7 @@ describe('runPipeline per-stage summary output (<<<SUMMARY>>> paragraphs)', () =
     return { logs, restore: () => restore.mock.restore() };
   }
 
-  it('--ask prints a "[ask] summary: ..." line and the exact stripped answer, never leaking the raw delimiter', async () => {
+  it('--ask prints an "ask" summary block and the exact stripped answer, never leaking the raw delimiter', async () => {
     const answer = 'The entrypoint is main.js.';
     const MockAgentClass = createMockAgentClass({
       ask: { ok: true, result: withSummary(answer, ASK_SUMMARY) },
@@ -1565,10 +1572,10 @@ describe('runPipeline per-stage summary output (<<<SUMMARY>>> paragraphs)', () =
       logs.some((line) => line.trim() === answer),
       `expected the exact stripped answer among logs; got: ${JSON.stringify(logs)}`,
     );
-    assert.match(joined, new RegExp(`\\[ask\\] summary: ${escapeRegex(ASK_SUMMARY)}`));
+    assert.match(joined, stageSummaryBlockRegex('ask', ASK_SUMMARY));
   });
 
-  it('--ask with a canned result that omits the delimiter prints no summary line (backward compat)', async () => {
+  it('--ask with a canned result that omits the delimiter prints no summary block (backward compat)', async () => {
     const answer = 'The entrypoint is main.js.';
     const MockAgentClass = createMockAgentClass({
       ask: { ok: true, result: answer },
@@ -1597,12 +1604,12 @@ describe('runPipeline per-stage summary output (<<<SUMMARY>>> paragraphs)', () =
       `expected the (unchanged) answer among logs; got: ${JSON.stringify(logs)}`,
     );
     assert.ok(
-      !logs.some((line) => /summary:/.test(line)),
-      `expected no summary line when the delimiter is absent; got: ${JSON.stringify(logs)}`,
+      !logs.some((line) => line.includes('•')),
+      `expected no summary block when the delimiter is absent; got: ${JSON.stringify(logs)}`,
     );
   });
 
-  it('quick-fix path prints [triage] and [quick-fix] summary lines and still routes off the stripped JSON', async () => {
+  it('quick-fix path prints [triage] and [quick-fix] summary blocks and still routes off the stripped JSON', async () => {
     const MockAgentClass = createMockAgentClass({
       triage: SIMPLE_TRIAGE,
       'quick-fix': { ok: true, result: withSummary('fixed the typo', QUICK_FIX_SUMMARY) },
@@ -1623,12 +1630,12 @@ describe('runPipeline per-stage summary output (<<<SUMMARY>>> paragraphs)', () =
 
     assert.deepEqual(MockAgentClass.instances.map((i) => agentRole(i.name)), ['triage', 'quick-fix']);
     const joined = logs.join('\n');
-    assert.match(joined, new RegExp(`\\[triage\\] summary: ${escapeRegex(SIMPLE_TRIAGE_SUMMARY)}`));
-    assert.match(joined, new RegExp(`\\[quick-fix\\] summary: ${escapeRegex(QUICK_FIX_SUMMARY)}`));
+    assert.match(joined, stageSummaryBlockRegex('triage', SIMPLE_TRIAGE_SUMMARY));
+    assert.match(joined, stageSummaryBlockRegex('quick-fix', QUICK_FIX_SUMMARY));
     assert.doesNotMatch(joined, /<<<SUMMARY>>>/);
   });
 
-  it('complex path prints a distinct summary line per stage, using roundLabel for looped stages', async () => {
+  it('complex path prints a distinct summary block per stage, using roundLabel for looped stages', async () => {
     const invocationCwd = process.cwd();
     const runContext = fakeRunContext(invocationCwd);
     const worktree = fakeWorktree(invocationCwd);
@@ -1665,8 +1672,8 @@ describe('runPipeline per-stage summary output (<<<SUMMARY>>> paragraphs)', () =
     for (const [label, summary] of expectations) {
       assert.match(
         joined,
-        new RegExp(`\\[${escapeRegex(label)}\\] summary: ${escapeRegex(summary)}`),
-        `expected a summary line for ${label}; got logs: ${JSON.stringify(logs)}`,
+        stageSummaryBlockRegex(label, summary),
+        `expected a summary block for ${label}; got logs: ${JSON.stringify(logs)}`,
       );
     }
     assert.doesNotMatch(joined, /<<<SUMMARY>>>/);
@@ -1768,7 +1775,7 @@ describe('runPipeline per-stage summary output (<<<SUMMARY>>> paragraphs)', () =
     }
   });
 
-  it('a canned result that omits the delimiter mid-pipeline prints no summary line for that stage (backward compat)', async () => {
+  it('a canned result that omits the delimiter mid-pipeline prints no summary block for that stage (backward compat)', async () => {
     const invocationCwd = process.cwd();
     const runContext = fakeRunContext(invocationCwd);
     const worktree = fakeWorktree(invocationCwd);
@@ -1794,10 +1801,10 @@ describe('runPipeline per-stage summary output (<<<SUMMARY>>> paragraphs)', () =
     }
 
     const joined = logs.join('\n');
-    assert.doesNotMatch(joined, /\[research\] summary:/);
-    assert.doesNotMatch(joined, /\[planner\] summary:/);
+    assert.doesNotMatch(joined, /\n─+\n research \n─+\n/);
+    assert.doesNotMatch(joined, /\n─+\n planner \n─+\n/);
     // Other stages, which still include the delimiter, keep printing normally.
-    assert.match(joined, new RegExp(`\\[triage\\] summary: ${escapeRegex(TRIAGE_SUMMARY)}`));
-    assert.match(joined, new RegExp(`\\[test-writer 1/5\\] summary: ${escapeRegex(TEST_WRITER_SUMMARY)}`));
+    assert.match(joined, stageSummaryBlockRegex('triage', TRIAGE_SUMMARY));
+    assert.match(joined, stageSummaryBlockRegex('test-writer 1/5', TEST_WRITER_SUMMARY));
   });
 });

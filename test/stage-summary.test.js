@@ -65,7 +65,7 @@ describe('splitStageSummary', () => {
 });
 
 describe('printStageSummary', () => {
-  it('prints a blank line then "[label] summary: <summary>" when summary is non-empty', () => {
+  it('prints a titled, bulleted block when summary is non-empty', () => {
     const logs = [];
     const restore = mock.method(console, 'log', (...args) => logs.push(args.join(' ')));
     try {
@@ -73,7 +73,26 @@ describe('printStageSummary', () => {
     } finally {
       restore.mock.restore();
     }
-    assert.deepEqual(logs, ['', '[test-writer 1/5] summary: Wrote the tests and updated status.md.']);
+    assert.deepEqual(logs, [
+      '',
+      '─────────────────',
+      ' test-writer 1/5 ',
+      '─────────────────',
+      '  • Wrote the tests and updated status.md.',
+      '',
+    ]);
+  });
+
+  it('splits a multi-sentence summary into one bullet per sentence', () => {
+    const logs = [];
+    const restore = mock.method(console, 'log', (...args) => logs.push(args.join(' ')));
+    try {
+      printStageSummary('triage', 'Read the request. Routed to quick-fix.');
+    } finally {
+      restore.mock.restore();
+    }
+    assert.ok(logs.includes('  • Read the request.'));
+    assert.ok(logs.includes('  • Routed to quick-fix.'));
   });
 
   it('is a no-op when summary is an empty string', () => {
@@ -95,6 +114,7 @@ describe('printStageSummary', () => {
     } finally {
       restore.mock.restore();
     }
-    assert.ok(logs.some((line) => line.includes('[code-writer 2/5] summary: Implemented the checklist.')));
+    assert.ok(logs.some((line) => line.includes('code-writer 2/5')));
+    assert.ok(logs.some((line) => line.includes('• Implemented the checklist.')));
   });
 });
