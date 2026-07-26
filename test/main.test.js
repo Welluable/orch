@@ -1996,7 +1996,7 @@ describe('runPipeline file-change trails (writers + commit rollup)', () => {
     }
   });
 
-  it('does not wire fileTracker on ask or quick-fix paths', async () => {
+  it('does not wire fileTracker on the ask path but does on the quick-fix path', async () => {
     const askMock = createMockAgentClass({
       ask: { ok: true, result: withSummary('answer', ASK_SUMMARY) },
     });
@@ -2036,8 +2036,10 @@ describe('runPipeline file-change trails (writers + commit rollup)', () => {
       exitSpy.mock.restore();
     }
 
-    for (const agent of [...askMock.instances, ...quickMock.instances]) {
+    for (const agent of askMock.instances) {
       assert.equal(agent.options?.fileTracker, undefined);
     }
+    const quickFixInstance = quickMock.instances.find((i) => agentRole(i.name) === 'quick-fix');
+    assert.ok(quickFixInstance.options?.fileTracker, 'quick-fix should receive fileTracker');
   });
 });

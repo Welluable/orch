@@ -241,11 +241,12 @@ export async function runPipeline(prompt, options) {
 
     if (options.quick) {
         const quickFix = quickFixAgentArgs({ prompt, cwd: invocationCwd });
+        const quickFixTracker = new FileTracker({ cwd: invocationCwd });
         const quickFixAgent = new AgentClass(
             quickFix.name,
             quickFix.instructions,
             quickFix.prompt,
-            quickFix.options,
+            { ...quickFix.options, fileTracker: quickFixTracker },
         );
 
         try {
@@ -255,6 +256,8 @@ export async function runPipeline(prompt, options) {
                 process.exit(1);
                 return;
             }
+            const { summary: quickFixSummary } = splitStageSummary(quickFixResult.result);
+            printStageSummary('quick-fix', quickFixSummary, quickFixTracker.getFiles());
         } catch (err) {
             console.error(`Error: ${err.message}`);
             process.exit(1);
@@ -286,17 +289,18 @@ export async function runPipeline(prompt, options) {
                 cwd: invocationCwd,
                 fix_plan: parsed.fix_plan,
             });
+            const quickFixTracker = new FileTracker({ cwd: invocationCwd });
             const quickFixAgent = new AgentClass(
                 quickFix.name,
                 quickFix.instructions,
                 quickFix.prompt,
-                quickFix.options,
+                { ...quickFix.options, fileTracker: quickFixTracker },
             );
 
             const quickFixResult = await quickFixAgent.run({ verbose });
             await jobCheckpoint();
             const { summary: quickFixSummary } = splitStageSummary(quickFixResult.result);
-            printStageSummary('quick-fix', quickFixSummary);
+            printStageSummary('quick-fix', quickFixSummary, quickFixTracker.getFiles());
             jobPatch({ state: 'done', exitCode: 0, finishedAt: new Date().toISOString() });
             return;
         }
