@@ -36,6 +36,16 @@ import { readJob, writeJob, listJobs, patchJob as realPatchJob, checkpointPause 
  *   `finishedAt` set.
  * - `--detach` combined with `--ask`/`--quick`/`--dry-run` is rejected by
  *   the CLI (non-zero exit, no `.orch/<slug>/run.json` created).
+ * - Job records are universal, not just `--detach`: the Commander `.action()`
+ *   callback itself (not just `runPipeline`'s injectable `jobSlug`/`jobCwd`
+ *   seam) allocates a job and threads the slug through for every
+ *   non-detached invocation kind (plain/full pipeline, `--ask`, `--quick`).
+ *   The "Commander action wiring" describe block below proves this against
+ *   a real, unmocked `node main.js ...` subprocess (using a fake `claude`
+ *   binary on `PATH` so no real agent CLI is required) — a regression that
+ *   pre-injecting `jobSlug`/`jobCwd` into direct `runPipeline(...)` calls
+ *   (as the rest of this file and test/main.test.js do) cannot catch, since
+ *   that seam is a no-op if the CLI action never calls the allocator at all.
  */
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -143,6 +153,33 @@ function complexPassBehaviors(overrides = {}) {
  * call `.unref()`, without starting a real process. */
 function fakeSpawn(pid) {
   return mock.fn(() => ({ pid, unref: () => {} }));
+}
+
+/**
+ * Writes a minimal, fake `claude` CLI binary that speaks just enough of the
+ * `-p --output-format stream-json` protocol (lib/agent-claude.js /
+ * lib/agent.js) to let a *real*, unmocked `node main.js ...` subprocess run
+ * an ask/quick-fix/triage stage to completion without a real agent CLI
+ * installed. Each invocation emits one `result` event whose `result` string
+ * is the next entry from `responses` (queue position tracked via a small
+ * counter file so successive stages — e.g. triage then quick-fix — get
+ * different canned answers), then exits 0.
+ */
+function writeFakeAgentBinary(binDir, binName, stateFilePath, responses) {
+  const scriptPath = path.join(binDir, binName);
+  const script = [
+    '#!/usr/bin/env node',
+    'const fs = require("fs");',
+    `const stateFile = ${JSON.stringify(stateFilePath)};`,
+    `const responses = ${JSON.stringify(responses)};`,
+    'let n = 0;',
+    'try { n = parseInt(fs.readFileSync(stateFile, "utf8"), 10) || 0; } catch {}',
+    'const content = responses[Math.min(n, responses.length - 1)];',
+    'fs.writeFileSync(stateFile, String(n + 1));',
+    'process.stdout.write(JSON.stringify({ type: "result", is_error: false, result: content, duration_ms: 1 }) + "\\n");',
+    '',
+  ].join('\n');
+  fs.writeFileSync(scriptPath, script, { mode: 0o755 });
 }
 
 describe('runDetached (detach-parent path)', () => {
@@ -280,6 +317,147 @@ describe('--detach flag guards', () => {
       }
     });
   }
+});
+
+describe('Commander action wiring: job records are universal, not just --detach (real CLI subprocess, no injected test options)', () => {
+  /**
+   * These three tests spawn the *real* CLI (`node main.js ...`) with a fake
+   * `claude` binary on PATH — no `jobSlug`/`jobCwd`/`patchJob` is ever
+   * injected. They exist specifically because every other job-record test in
+   * this file and test/main.test.js pre-injects `options.jobSlug`/`jobCwd`
+   * into a direct `runPipeline(...)` call, which only proves runPipeline's
+   * own patching seam works — it says nothing about whether the Commander
+   * `.action()` callback (main.js's `.action(async (task, options) => {...})`)
+   * actually calls the shared job-allocation helper and sets
+   * `options.jobSlug` before invoking `runPipeline` for non-detached runs. An
+   * implementation that wires `jobPatch` calls into --ask/--quick/the plain
+   * pipeline correctly, but never allocates/threads the slug from the CLI
+   * action itself, would leave every pre-injected test green while this one
+   * fails (no `.orch/<slug>/run.json` ever appears on disk).
+   */
+  it('--ask: a real, unmocked CLI run creates and patches a real run.json (phase:"ask" → terminal state:"done")', async () => {
+    const tmpCwd = makeTmpCwd('orch-action-ask-');
+    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-fake-bin-'));
+    try {
+      writeFakeAgentBinary(binDir, 'claude', path.join(tmpCwd, '.fake-calls'), ['the entrypoint is main.js']);
+
+      const { code, stdout } = await runCli(
+        ['where is the CLI entrypoint?', '--agent', 'claude', '--ask'],
+        { cwd: tmpCwd, env: { ...process.env, PATH: `${binDir}:${process.env.PATH}` } },
+      );
+
+      assert.equal(code, 0);
+      assert.match(stdout, /the entrypoint is main\.js/);
+
+      const orchDir = path.join(tmpCwd, '.orch');
+      assert.equal(fs.existsSync(orchDir), true, 'the Commander action must allocate a job for --ask too, not just --detach');
+      const slugs = fs.readdirSync(orchDir);
+      assert.equal(slugs.length, 1);
+      const [slug] = slugs;
+
+      const record = readJob(tmpCwd, slug);
+      assert.ok(record, 'expected a real run.json readable via readJob');
+      assert.equal(record.task, 'where is the CLI entrypoint?');
+      assert.equal(record.agent, 'claude');
+      assert.equal(record.phase, 'ask');
+      assert.equal(record.state, 'done');
+      assert.equal(record.exitCode, 0);
+      assert.ok(record.finishedAt);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+      fs.rmSync(binDir, { recursive: true, force: true });
+    }
+  });
+
+  it('--quick: a real, unmocked CLI run creates and patches a real run.json (phase:"quick-fix" → terminal state:"done"), with no run context/worktree', async () => {
+    const tmpCwd = makeTmpCwd('orch-action-quick-');
+    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-fake-bin-'));
+    try {
+      writeFakeAgentBinary(binDir, 'claude', path.join(tmpCwd, '.fake-calls'), ['fixed the typo']);
+
+      const { code } = await runCli(
+        ['fix the typo', '--agent', 'claude', '--quick'],
+        { cwd: tmpCwd, env: { ...process.env, PATH: `${binDir}:${process.env.PATH}` } },
+      );
+
+      assert.equal(code, 0);
+
+      const orchDir = path.join(tmpCwd, '.orch');
+      assert.equal(fs.existsSync(orchDir), true, 'the Commander action must allocate a job for --quick too, not just --detach');
+      const [slug] = fs.readdirSync(orchDir);
+
+      const record = readJob(tmpCwd, slug);
+      assert.equal(record.task, 'fix the typo');
+      assert.equal(record.phase, 'quick-fix');
+      assert.equal(record.state, 'done');
+      assert.equal(record.exitCode, 0);
+      assert.ok(record.finishedAt);
+      assert.equal(record.branch, null);
+      assert.equal(record.worktree, null);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+      fs.rmSync(binDir, { recursive: true, force: true });
+    }
+  });
+
+  it('plain invocation (no flags), triage-routed to quick-fix: a real, unmocked CLI run still creates and patches a real run.json', async () => {
+    const tmpCwd = makeTmpCwd('orch-action-plain-');
+    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-fake-bin-'));
+    try {
+      writeFakeAgentBinary(binDir, 'claude', path.join(tmpCwd, '.fake-calls'), [
+        JSON.stringify({ simple: true, fix_plan: 'apply the trivial fix' }),
+        'fixed it',
+      ]);
+
+      const { code } = await runCli(
+        ['fix the typo', '--agent', 'claude'],
+        { cwd: tmpCwd, env: { ...process.env, PATH: `${binDir}:${process.env.PATH}` } },
+      );
+
+      assert.equal(code, 0);
+
+      const orchDir = path.join(tmpCwd, '.orch');
+      assert.equal(fs.existsSync(orchDir), true, 'the Commander action must allocate a job for plain invocations too, not just --detach');
+      const [slug] = fs.readdirSync(orchDir);
+
+      const record = readJob(tmpCwd, slug);
+      assert.equal(record.task, 'fix the typo');
+      assert.equal(record.phase, 'quick-fix');
+      assert.equal(record.state, 'done');
+      assert.equal(record.exitCode, 0);
+      assert.ok(record.finishedAt);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+      fs.rmSync(binDir, { recursive: true, force: true });
+    }
+  });
+
+  it('a real CLI run started foreground (no --detach) writes run.json with state:"running" immediately, before the agent binary even resolves', async () => {
+    const tmpCwd = makeTmpCwd('orch-action-running-');
+    try {
+      const { code, stderr } = await runCli(
+        ['a trivial task', '--agent', 'claude'],
+        { cwd: tmpCwd, env: { ...process.env, PATH: '/nonexistent-empty-path-for-tests' } },
+      );
+
+      assert.equal(code, 1);
+      assert.match(stderr, /claude not found/i);
+
+      const orchDir = path.join(tmpCwd, '.orch');
+      assert.equal(fs.existsSync(orchDir), true, 'the Commander action must allocate a job before the binary-on-PATH check runs');
+      const [slug] = fs.readdirSync(orchDir);
+
+      const record = readJob(tmpCwd, slug);
+      assert.equal(record.task, 'a trivial task');
+      assert.equal(record.agent, 'claude');
+      // Foreground (non-detached) runs have no separate child process to
+      // wait on, so allocation starts them straight in "running" — unlike
+      // runDetached's detach-parent, which starts in "starting".
+      assert.equal(record.state, 'running');
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('--help reflects the headless surface', () => {

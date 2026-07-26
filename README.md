@@ -123,8 +123,8 @@ you invoked `orch`, plus a persistent sibling git worktree and branch:
   research.md
   task.md
   status.md
-  run.json                            # --detach only: job state (state, phase, pid, ...)
-  orch.log                            # --detach only: full stdout/stderr of the run
+  run.json                            # job state (state, phase, pid, ...); written for every run
+  orch.log                            # full stdout/stderr of the run; --detach only
 
 <parent-of-repo>/<repo-name>-<slug>   # worktree
 orch/<slug>                           # branch
@@ -136,8 +136,10 @@ test-runner) run inside the worktree instead. The worktree is never deleted
 automatically — it's left in place after the run so you can inspect,
 continue, or merge the work whenever you're ready.
 
-`run.json` and `orch.log` are only written for `--detach` runs — see
-[Headless runs](#headless-runs).
+`run.json` is written for every invocation — default, `--quick`, `--ask`, and
+`--detach` alike — so `orch list`/`status` always have something to show; see
+[Headless runs](#headless-runs). `orch.log` is only written for `--detach`
+runs, since foreground runs already stream their output to your terminal.
 
 ## Architecture
 
@@ -171,9 +173,12 @@ agent CLI does all the actual reading and writing of files.
 For `--ask`, Cursor uses `--mode ask`, Claude uses `--permission-mode plan`,
 and `agn` is prompt-only best-effort (it has no dedicated read-only flag).
 
-`--detach` is task-only: it's rejected (non-zero exit, no job created) when
-combined with `--ask`, `--quick`, or `--dry-run`. Multiple `--detach` runs
-can execute concurrently in the same directory, each with its own slug.
+`--detach` only controls backgrounding, not whether a job record exists —
+every non-`--dry-run` invocation gets one. Combining `--detach` with
+`--ask`, `--quick`, or `--dry-run` is rejected outright (non-zero exit)
+because there's no way to background those modes, not because they'd lack a
+job record. Multiple `--detach` runs can execute concurrently in the same
+directory, each with its own slug.
 
 ## CLI Reference
 
@@ -257,9 +262,12 @@ agent finishes. This means pause is not atomic across a writer⇄critic or
 writer⇄runner pair: e.g. pausing during `test-writer` still lets
 `test-writer` finish before the run actually pauses, ahead of `test-critic`.
 
-`--detach` is task-only — it's rejected outright when combined with
-`--ask`, `--quick`, or `--dry-run` — and multiple `--detach` runs can execute
-concurrently against the same directory, each tracked under its own slug.
+`--detach` is rejected outright when combined with `--ask`, `--quick`, or
+`--dry-run` — those modes have nothing to background — but that's a
+restriction on backgrounding, not on job records: every non-`--dry-run`
+invocation gets a `run.json`, `--detach` or not. Multiple `--detach` runs can
+execute concurrently against the same directory, each tracked under its own
+slug.
 
 ## Project structure
 
@@ -271,15 +279,16 @@ layout shown in [Artifacts and worktrees](#artifacts-and-worktrees):
   research.md
   task.md
   status.md
-  run.json                            # --detach only
+  run.json                            # written for every run
   orch.log                            # --detach only
 
 <parent-of-repo>/<repo-name>-<slug>   # worktree
 orch/<slug>                           # branch
 ```
 
-Default quick fixes, `--quick`, and `--ask` runs create none of this — no
-`.orch/` directory, no worktree, and no commits.
+Default quick-fixes, `--quick`, and `--ask` runs still get a `.orch/<slug>/`
+directory with a `run.json` job record (so `orch list`/`status` can see them),
+but no `research.md`/`task.md`/`status.md`, no worktree, and no commits.
 
 ## Interrupts
 

@@ -17,10 +17,10 @@ import { createRunContext } from './lib/run-context.js';
 import { createWorktree } from './lib/worktree.js';
 import { commitWorktree, collectWorktreeChanges, printFilesChanged } from './lib/commit.js';
 import { FileTracker } from './lib/file-tracker.js';
-import { generateSlug } from './lib/slug.js';
+import { allocateJob } from './lib/job-lifecycle.js';
+import { setJobSlug } from './lib/agent.js';
 import {
     jobPaths,
-    writeJob,
     readJob,
     patchJob,
     listJobs,
@@ -219,6 +219,7 @@ export async function runPipeline(prompt, options) {
     console.log();
 
     if (options.ask) {
+        jobPatch({ phase: 'ask' });
         const ask = askAgentArgs({ prompt, cwd: invocationCwd });
         const askAgent = new AgentClass(ask.name, ask.instructions, ask.prompt, ask.options);
 
@@ -226,20 +227,24 @@ export async function runPipeline(prompt, options) {
             const askResult = await askAgent.run({ verbose });
             if (!askResult.ok) {
                 console.error(`Error: ask agent failed`);
+                jobPatch({ state: 'failed', exitCode: 1, finishedAt: new Date().toISOString() });
                 process.exit(1);
                 return;
             }
             const { content, summary } = splitStageSummary(askResult.result);
             printStageSummary('ask', summary);
             console.log(content);
+            jobPatch({ state: 'done', exitCode: 0, finishedAt: new Date().toISOString() });
         } catch (err) {
             console.error(`Error: ${err.message}`);
+            jobPatch({ state: 'failed', exitCode: 1, finishedAt: new Date().toISOString() });
             process.exit(1);
         }
         return;
     }
 
     if (options.quick) {
+        jobPatch({ phase: 'quick-fix' });
         const quickFix = quickFixAgentArgs({ prompt, cwd: invocationCwd });
         const quickFixTracker = new FileTracker({ cwd: invocationCwd });
         const quickFixAgent = new AgentClass(
@@ -253,13 +258,16 @@ export async function runPipeline(prompt, options) {
             const quickFixResult = await quickFixAgent.run({ verbose });
             if (!quickFixResult.ok) {
                 console.error(`Error: quick-fix agent failed`);
+                jobPatch({ state: 'failed', exitCode: 1, finishedAt: new Date().toISOString() });
                 process.exit(1);
                 return;
             }
             const { summary: quickFixSummary } = splitStageSummary(quickFixResult.result);
             printStageSummary('quick-fix', quickFixSummary, quickFixTracker.getFiles());
+            jobPatch({ state: 'done', exitCode: 0, finishedAt: new Date().toISOString() });
         } catch (err) {
             console.error(`Error: ${err.message}`);
+            jobPatch({ state: 'failed', exitCode: 1, finishedAt: new Date().toISOString() });
             process.exit(1);
         }
         return;
@@ -632,30 +640,15 @@ export async function runDetached(prompt, options = {}) {
         return;
     }
 
-    const slug = generateSlug();
-    createRunContextFn({ cwd, slug });
-    const { logPath } = jobPaths(cwd, slug);
-    const startedAt = new Date().toISOString();
-
-    writeJob(cwd, slug, {
-        slug,
-        task: prompt,
+    const { slug } = allocateJob({
+        cwd,
+        prompt,
         agent,
         maxRounds,
-        cwd,
-        pauseRequested: false,
-        branch: null,
-        worktree: null,
-        startedAt,
-        finishedAt: null,
-        exitCode: null,
-        logPath,
-        pid: null,
         state: 'starting',
-        phase: null,
-        stage: null,
-        round: null,
+        createRunContext: createRunContextFn,
     });
+    const { logPath } = jobPaths(cwd, slug);
 
     const logFd = fs.openSync(logPath, 'a');
 
@@ -740,6 +733,19 @@ Headless runs:
             }
             await runDetached(prompt, options);
             return;
+        }
+
+        if (!options.dryRun) {
+            const { slug } = allocateJob({
+                cwd: process.cwd(),
+                prompt,
+                agent: options.agent,
+                maxRounds: options.ask || options.quick ? null : options.maxRounds,
+                state: 'running',
+                pid: process.pid,
+            });
+            options.jobSlug = slug;
+            setJobSlug(slug);
         }
 
         await runPipeline(prompt, options);

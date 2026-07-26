@@ -6,9 +6,54 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runPipeline } from '../main.js';
+import { jobPaths, readJob, writeJob, patchJob as realPatchJob } from '../lib/jobs.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const mainPath = path.join(__dirname, '..', 'main.js');
+
+/** A fresh, isolated `.orch`-owning directory for real-disk job-record
+ * assertions (mirrors test/headless.test.js's makeTmpCwd). */
+function makeTmpCwd(prefix) {
+  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+}
+
+/** Wraps a captured-calls patchJob mock so it *also* writes through to the
+ * real lib/jobs.js patchJob against a real tmp `.orch` dir — giving both the
+ * precise ordered-call assertions the existing tests rely on, and a real
+ * run.json on disk to read back afterward (the stronger, established pattern
+ * from test/headless.test.js's runPipeline job-phase-tracking tests). */
+function realDiskPatchJobSpy(patchCalls) {
+  return mock.fn((cwd, slug, fields) => {
+    patchCalls.push({ cwd, slug, fields });
+    realPatchJob(cwd, slug, fields);
+  });
+}
+
+/** Seeds a real run.json on disk in the "foreground/non-detached, already
+ * running" shape allocateJob is expected to write (state:"running", a real
+ * pid, no branch/worktree/rounds concept yet) — the exact starting point the
+ * Commander action's non-detached branch would hand off to runPipeline. */
+function seedForegroundJob(tmpCwd, slug, task) {
+  writeJob(tmpCwd, slug, {
+    slug,
+    task,
+    agent: 'claude',
+    maxRounds: null,
+    cwd: tmpCwd,
+    pauseRequested: false,
+    branch: null,
+    worktree: null,
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+    exitCode: null,
+    logPath: jobPaths(tmpCwd, slug).logPath,
+    pid: process.pid,
+    state: 'running',
+    phase: null,
+    stage: null,
+    round: null,
+  });
+}
 
 function runCli(args, { env = process.env } = {}) {
   return new Promise((resolve, reject) => {
@@ -1398,6 +1443,123 @@ describe('runPipeline --ask (read-only Q&A)', () => {
 
     assert.deepEqual(order, ['triage', 'quick-fix']);
   });
+
+  it('patches phase:"ask" before running and terminal state:"done"/exitCode:0/finishedAt on success, when a job is active — verified via a real run.json on disk', async () => {
+    const tmpCwd = makeTmpCwd('orch-ask-job-');
+    try {
+      const slug = 'ask-job-0000';
+      seedForegroundJob(tmpCwd, slug, 'where is the CLI entrypoint?');
+      const MockAgentClass = createMockAgentClass({ ask: { ok: true, result: 'answer' } });
+      const patchCalls = [];
+      const patchJobMock = realDiskPatchJobSpy(patchCalls);
+
+      const logSpy = mock.method(console, 'log', () => {});
+      const errorSpy = mock.method(console, 'error', () => {});
+      const exitSpy = mock.method(process, 'exit', () => {});
+      try {
+        await runPipeline('where is the CLI entrypoint?', {
+          agent: 'claude',
+          ask: true,
+          AgentClass: MockAgentClass,
+          createRunContext: mock.fn(() => fakeRunContext(tmpCwd)),
+          createWorktree: mock.fn(() => fakeWorktree(tmpCwd)),
+          commitWorktree: mock.fn(() => fakeCommitResult('orch/stub')),
+          jobSlug: slug,
+          jobCwd: tmpCwd,
+          patchJob: patchJobMock,
+        });
+      } finally {
+        logSpy.mock.restore();
+        errorSpy.mock.restore();
+        exitSpy.mock.restore();
+      }
+
+      assert.ok(
+        patchCalls.some((c) => c.fields.phase === 'ask'),
+        `expected a phase:"ask" patch; got ${JSON.stringify(patchCalls)}`,
+      );
+      for (const call of patchCalls) {
+        assert.equal(call.cwd, tmpCwd);
+        assert.equal(call.slug, slug);
+      }
+
+      const record = readJob(tmpCwd, slug);
+      assert.equal(record.phase, 'ask');
+      assert.equal(record.state, 'done');
+      assert.equal(record.exitCode, 0);
+      assert.ok(record.finishedAt);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('patches state:"failed"/exitCode:1/finishedAt when the ask agent fails, when a job is active — verified via a real run.json on disk', async () => {
+    const tmpCwd = makeTmpCwd('orch-ask-job-fail-');
+    try {
+      const slug = 'ask-job-fail-0000';
+      seedForegroundJob(tmpCwd, slug, 'explain the slugger');
+      const MockAgentClass = createMockAgentClass({ ask: { ok: false, result: 'agent crashed' } });
+      const patchCalls = [];
+      const patchJobMock = realDiskPatchJobSpy(patchCalls);
+
+      const logSpy = mock.method(console, 'log', () => {});
+      const errorSpy = mock.method(console, 'error', () => {});
+      const exitSpy = mock.method(process, 'exit', () => {});
+      try {
+        await runPipeline('explain the slugger', {
+          agent: 'claude',
+          ask: true,
+          AgentClass: MockAgentClass,
+          createRunContext: mock.fn(() => fakeRunContext(tmpCwd)),
+          createWorktree: mock.fn(() => fakeWorktree(tmpCwd)),
+          commitWorktree: mock.fn(() => fakeCommitResult('orch/stub')),
+          jobSlug: slug,
+          jobCwd: tmpCwd,
+          patchJob: patchJobMock,
+        });
+      } finally {
+        logSpy.mock.restore();
+        errorSpy.mock.restore();
+        exitSpy.mock.restore();
+      }
+
+      assert.ok(patchCalls.some((c) => c.fields.phase === 'ask'));
+
+      const record = readJob(tmpCwd, slug);
+      assert.equal(record.phase, 'ask');
+      assert.equal(record.state, 'failed');
+      assert.equal(record.exitCode, 1);
+      assert.ok(record.finishedAt);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('never calls patchJob for --ask when no job is active (jobSlug unset) — existing no-job behavior is unchanged', async () => {
+    const MockAgentClass = createMockAgentClass({ ask: { ok: true, result: 'answer' } });
+    const patchJobMock = mock.fn();
+
+    const logSpy = mock.method(console, 'log', () => {});
+    const errorSpy = mock.method(console, 'error', () => {});
+    const exitSpy = mock.method(process, 'exit', () => {});
+    try {
+      await runPipeline('where is the CLI entrypoint?', {
+        agent: 'claude',
+        ask: true,
+        AgentClass: MockAgentClass,
+        createRunContext: mock.fn(() => fakeRunContext(process.cwd())),
+        createWorktree: mock.fn(() => fakeWorktree(process.cwd())),
+        commitWorktree: mock.fn(() => fakeCommitResult('orch/stub')),
+        patchJob: patchJobMock,
+      });
+    } finally {
+      logSpy.mock.restore();
+      errorSpy.mock.restore();
+      exitSpy.mock.restore();
+    }
+
+    assert.equal(patchJobMock.mock.calls.length, 0);
+  });
 });
 describe('runPipeline --quick (skip triage → quick-fix)', () => {
   it('spawns only a quick-fix agent — never triage, ask, research, or implementers', async () => {
@@ -1553,6 +1715,140 @@ describe('runPipeline --quick (skip triage → quick-fix)', () => {
     }
 
     assert.deepEqual(order, ['triage', 'quick-fix']);
+  });
+
+  it('patches phase:"quick-fix" before running and terminal state:"done"/exitCode:0/finishedAt on success, when a job is active — and still creates no run context/worktree/commit — verified via a real run.json on disk', async () => {
+    const tmpCwd = makeTmpCwd('orch-quick-job-');
+    try {
+      const slug = 'quick-job-0000';
+      seedForegroundJob(tmpCwd, slug, 'fix the typo in the README');
+      const createRunContextMock = mock.fn(() => fakeRunContext(tmpCwd));
+      const createWorktreeMock = mock.fn(() => fakeWorktree(tmpCwd));
+      const commitWorktreeMock = mock.fn(() => fakeCommitResult('orch/stub-stub-0000'));
+      const MockAgentClass = createMockAgentClass({ 'quick-fix': { ok: true, result: 'fixed' } });
+      const patchCalls = [];
+      const patchJobMock = realDiskPatchJobSpy(patchCalls);
+
+      const logSpy = mock.method(console, 'log', () => {});
+      const errorSpy = mock.method(console, 'error', () => {});
+      const exitSpy = mock.method(process, 'exit', () => {});
+      try {
+        await runPipeline('fix the typo in the README', {
+          agent: 'claude',
+          quick: true,
+          AgentClass: MockAgentClass,
+          createRunContext: createRunContextMock,
+          createWorktree: createWorktreeMock,
+          commitWorktree: commitWorktreeMock,
+          jobSlug: slug,
+          jobCwd: tmpCwd,
+          patchJob: patchJobMock,
+        });
+      } finally {
+        logSpy.mock.restore();
+        errorSpy.mock.restore();
+        exitSpy.mock.restore();
+      }
+
+      // Job-record writes are additive — quick-fix still gets no run context,
+      // worktree, or commit of its own.
+      assert.equal(createRunContextMock.mock.calls.length, 0);
+      assert.equal(createWorktreeMock.mock.calls.length, 0);
+      assert.equal(commitWorktreeMock.mock.calls.length, 0);
+
+      assert.ok(
+        patchCalls.some((c) => c.fields.phase === 'quick-fix'),
+        `expected a phase:"quick-fix" patch; got ${JSON.stringify(patchCalls)}`,
+      );
+      for (const call of patchCalls) {
+        assert.equal(call.cwd, tmpCwd);
+        assert.equal(call.slug, slug);
+      }
+
+      const record = readJob(tmpCwd, slug);
+      assert.equal(record.phase, 'quick-fix');
+      assert.equal(record.state, 'done');
+      assert.equal(record.exitCode, 0);
+      assert.ok(record.finishedAt);
+      assert.equal(record.branch, null);
+      assert.equal(record.worktree, null);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('patches state:"failed"/exitCode:1/finishedAt when the quick-fix agent fails, when a job is active — verified via a real run.json on disk', async () => {
+    const tmpCwd = makeTmpCwd('orch-quick-job-fail-');
+    try {
+      const slug = 'quick-job-fail-0000';
+      seedForegroundJob(tmpCwd, slug, 'fix the typo');
+      const MockAgentClass = createMockAgentClass({ 'quick-fix': { ok: false, result: 'agent crashed' } });
+      const patchCalls = [];
+      const patchJobMock = realDiskPatchJobSpy(patchCalls);
+
+      const logSpy = mock.method(console, 'log', () => {});
+      const errorSpy = mock.method(console, 'error', () => {});
+      const exitSpy = mock.method(process, 'exit', () => {});
+      try {
+        await runPipeline('fix the typo', {
+          agent: 'claude',
+          quick: true,
+          AgentClass: MockAgentClass,
+          createRunContext: mock.fn(() => fakeRunContext(tmpCwd)),
+          createWorktree: mock.fn(() => fakeWorktree(tmpCwd)),
+          commitWorktree: mock.fn(() => fakeCommitResult('orch/stub-stub-0000')),
+          jobSlug: slug,
+          jobCwd: tmpCwd,
+          patchJob: patchJobMock,
+        });
+      } finally {
+        logSpy.mock.restore();
+        errorSpy.mock.restore();
+        exitSpy.mock.restore();
+      }
+
+      assert.ok(patchCalls.some((c) => c.fields.phase === 'quick-fix'));
+
+      const record = readJob(tmpCwd, slug);
+      assert.equal(record.phase, 'quick-fix');
+      assert.equal(record.state, 'failed');
+      assert.equal(record.exitCode, 1);
+      assert.ok(record.finishedAt);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('never calls patchJob for --quick when no job is active (jobSlug unset)', async () => {
+    const createRunContextMock = mock.fn(() => fakeRunContext(process.cwd()));
+    const createWorktreeMock = mock.fn(() => fakeWorktree(process.cwd()));
+    const commitWorktreeMock = mock.fn(() => fakeCommitResult('orch/stub-stub-0000'));
+    const MockAgentClass = createMockAgentClass({ 'quick-fix': { ok: true, result: 'fixed' } });
+    const patchJobMock = mock.fn();
+
+    const logSpy = mock.method(console, 'log', () => {});
+    const errorSpy = mock.method(console, 'error', () => {});
+    const exitSpy = mock.method(process, 'exit', () => {});
+    try {
+      await runPipeline('fix the typo in the README', {
+        agent: 'claude',
+        quick: true,
+        AgentClass: MockAgentClass,
+        createRunContext: createRunContextMock,
+        createWorktree: createWorktreeMock,
+        commitWorktree: commitWorktreeMock,
+        patchJob: patchJobMock,
+      });
+    } finally {
+      logSpy.mock.restore();
+      errorSpy.mock.restore();
+      exitSpy.mock.restore();
+    }
+
+    assert.equal(patchJobMock.mock.calls.length, 0);
+    assert.equal(createRunContextMock.mock.calls.length, 0);
+    assert.equal(createWorktreeMock.mock.calls.length, 0);
+    assert.equal(commitWorktreeMock.mock.calls.length, 0);
   });
 });
 
@@ -2041,5 +2337,178 @@ describe('runPipeline file-change trails (writers + commit rollup)', () => {
     }
     const quickFixInstance = quickMock.instances.find((i) => agentRole(i.name) === 'quick-fix');
     assert.ok(quickFixInstance.options?.fileTracker, 'quick-fix should receive fileTracker');
+  });
+});
+
+/**
+ * Contract this section pins down: job records are now universal, not just
+ * for `--detach`. Once `main.js`'s Commander action allocates a job (via the
+ * shared `allocateJob` helper) for every non-detached invocation — plain
+ * pipeline included — and passes the slug through as `options.jobSlug`,
+ * `runPipeline`'s existing `jobPatch` (already exercised for the detached
+ * child in test/headless.test.js) stops being a no-op for foreground runs
+ * too. These tests exercise that same `jobSlug`/`jobCwd`/`patchJob` seam
+ * directly against the plain/full pipeline, mirroring the --ask/--quick
+ * coverage above.
+ */
+describe('runPipeline job-record patching for the plain/full pipeline (universal job records, not just --detach)', () => {
+  it('patches phase through triage → research → plan → worktree → test-loop → code-loop → commit, then terminal state:"done", when a job is active — verified via a real run.json on disk', async () => {
+    const tmpCwd = makeTmpCwd('orch-full-pipeline-job-');
+    try {
+      const slug = 'full-pipeline-job-0000';
+      seedForegroundJob(tmpCwd, slug, 'do something complex');
+      const runContext = fakeRunContext(tmpCwd);
+      const worktree = fakeWorktree(tmpCwd);
+      const MockAgentClass = createMockAgentClass(complexPassBehaviors());
+      const patchCalls = [];
+      const patchJobMock = realDiskPatchJobSpy(patchCalls);
+
+      const logSpy = mock.method(console, 'log', () => {});
+      try {
+        await runPipeline('do something complex', {
+          agent: 'claude',
+          AgentClass: MockAgentClass,
+          createRunContext: mock.fn(() => runContext),
+          createWorktree: mock.fn(() => worktree),
+          commitWorktree: mock.fn(() => fakeCommitResult(worktree.branch)),
+          jobSlug: slug,
+          jobCwd: tmpCwd,
+          patchJob: patchJobMock,
+        });
+      } finally {
+        logSpy.mock.restore();
+      }
+
+      const phases = patchCalls.filter((c) => c.fields.phase).map((c) => c.fields.phase);
+      assert.deepEqual(
+        phases,
+        ['triage', 'research', 'plan', 'worktree', 'test-loop', 'test-loop', 'code-loop', 'code-loop', 'commit'],
+      );
+
+      const worktreePatch = patchCalls.find((c) => c.fields.branch);
+      assert.equal(worktreePatch.fields.branch, worktree.branch);
+      assert.equal(worktreePatch.fields.worktree, worktree.worktreePath);
+
+      for (const call of patchCalls) {
+        assert.equal(call.cwd, tmpCwd);
+        assert.equal(call.slug, slug);
+      }
+
+      const record = readJob(tmpCwd, slug);
+      assert.equal(record.state, 'done');
+      assert.equal(record.exitCode, 0);
+      assert.ok(record.finishedAt);
+      assert.equal(record.branch, worktree.branch);
+      assert.equal(record.worktree, worktree.worktreePath);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('routes to quick-fix and still patches phase:"quick-fix"/terminal state through the full-pipeline entrypoint when triage judges the task simple — verified via a real run.json on disk', async () => {
+    const tmpCwd = makeTmpCwd('orch-full-pipeline-quickfix-');
+    try {
+      const slug = 'full-pipeline-quickfix-0000';
+      seedForegroundJob(tmpCwd, slug, 'fix the typo');
+      const MockAgentClass = createMockAgentClass({
+        triage: SIMPLE_TRIAGE,
+        'quick-fix': { ok: true, result: 'fixed' },
+      });
+      const patchCalls = [];
+      const patchJobMock = realDiskPatchJobSpy(patchCalls);
+
+      const logSpy = mock.method(console, 'log', () => {});
+      try {
+        await runPipeline('fix the typo', {
+          agent: 'claude',
+          AgentClass: MockAgentClass,
+          createRunContext: mock.fn(() => { throw new Error('createRunContext must not be called on the quick-fix route'); }),
+          createWorktree: mock.fn(() => { throw new Error('createWorktree must not be called on the quick-fix route'); }),
+          commitWorktree: mock.fn(() => { throw new Error('commitWorktree must not be called on the quick-fix route'); }),
+          jobSlug: slug,
+          jobCwd: tmpCwd,
+          patchJob: patchJobMock,
+        });
+      } finally {
+        logSpy.mock.restore();
+      }
+
+      assert.ok(patchCalls.some((c) => c.fields.phase === 'triage'));
+      assert.ok(patchCalls.some((c) => c.fields.phase === 'quick-fix'));
+
+      const record = readJob(tmpCwd, slug);
+      assert.equal(record.phase, 'quick-fix');
+      assert.equal(record.state, 'done');
+      assert.equal(record.exitCode, 0);
+      assert.ok(record.finishedAt);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('patches state:"failed"/exitCode:1/finishedAt when a stage throws, when a job is active — verified via a real run.json on disk', async () => {
+    const tmpCwd = makeTmpCwd('orch-full-pipeline-fail-');
+    try {
+      const slug = 'full-pipeline-fail-0000';
+      seedForegroundJob(tmpCwd, slug, 'do something complex');
+      const runContext = fakeRunContext(tmpCwd);
+      const worktree = fakeWorktree(tmpCwd);
+      const MockAgentClass = createMockAgentClass(complexPassBehaviors({
+        'code-writer': { ok: false, result: 'implementation failed' },
+      }));
+      const patchCalls = [];
+      const patchJobMock = realDiskPatchJobSpy(patchCalls);
+
+      const logSpy = mock.method(console, 'log', () => {});
+      const errorSpy = mock.method(console, 'error', () => {});
+      const exitSpy = mock.method(process, 'exit', () => {});
+      try {
+        await runPipeline('do something complex', {
+          agent: 'claude',
+          AgentClass: MockAgentClass,
+          createRunContext: mock.fn(() => runContext),
+          createWorktree: mock.fn(() => worktree),
+          commitWorktree: mock.fn(() => fakeCommitResult(worktree.branch)),
+          jobSlug: slug,
+          jobCwd: tmpCwd,
+          patchJob: patchJobMock,
+        });
+      } finally {
+        logSpy.mock.restore();
+        errorSpy.mock.restore();
+        exitSpy.mock.restore();
+      }
+
+      const record = readJob(tmpCwd, slug);
+      assert.equal(record.state, 'failed');
+      assert.equal(record.exitCode, 1);
+      assert.ok(record.finishedAt);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('never calls patchJob for the plain pipeline when no job is active (jobSlug unset) — regression guard', async () => {
+    const invocationCwd = process.cwd();
+    const runContext = fakeRunContext(invocationCwd);
+    const worktree = fakeWorktree(invocationCwd);
+    const MockAgentClass = createMockAgentClass(complexPassBehaviors());
+    const patchJobMock = mock.fn();
+
+    const logSpy = mock.method(console, 'log', () => {});
+    try {
+      await runPipeline('do something complex', {
+        agent: 'claude',
+        AgentClass: MockAgentClass,
+        createRunContext: mock.fn(() => runContext),
+        createWorktree: mock.fn(() => worktree),
+        commitWorktree: mock.fn(() => fakeCommitResult(worktree.branch)),
+        patchJob: patchJobMock,
+      });
+    } finally {
+      logSpy.mock.restore();
+    }
+
+    assert.equal(patchJobMock.mock.calls.length, 0);
   });
 });
