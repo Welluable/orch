@@ -71,6 +71,36 @@ describe('createWorktree (injected execFile, argument-level)', () => {
     });
   });
 
+  it('appends base as a trailing argv element when provided, without changing the no-base form', () => {
+    const { execFile, calls } = makeFakeExecFile([
+      { match: isShowToplevel, stdout: '/repo/root\n' },
+      { match: isWorktreeAdd, stdout: '' },
+    ]);
+
+    const result = createWorktree({
+      cwd: '/repo/root',
+      slug: 'calm-otter-7f3a',
+      base: 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678',
+      execFile,
+    });
+
+    assert.deepEqual(result, {
+      repoRoot: '/repo/root',
+      worktreePath: '/repo/root-calm-otter-7f3a',
+      branch: 'orch/calm-otter-7f3a',
+    });
+    assert.deepEqual(calls[1].args, [
+      '-C',
+      '/repo/root',
+      'worktree',
+      'add',
+      '-b',
+      'orch/calm-otter-7f3a',
+      '/repo/root-calm-otter-7f3a',
+      'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678',
+    ]);
+  });
+
   it('rejects a non-git cwd by propagating the rev-parse failure', () => {
     const gitError = Object.assign(new Error('git failed'), {
       stderr: 'fatal: not a git repository (or any of the parent directories): .git',
