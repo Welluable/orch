@@ -42,6 +42,10 @@ export function testWriterAgentArgs({
                       characters, with no spaces), followed by one paragraph in natural,
                       human-readable language explaining what you did in this step and
                       what happened — no lists, no headers, just prose.
+                    * If you changed any files, after that paragraph add a line reading
+                      exactly "Files:" followed by one line per changed file formatted
+                      as "<path>: <one-line description>" (e.g. "test/agent.test.js:
+                      added the dedupe case"). Omit this section if you changed nothing.
                     ${criticBlock}
                 `,
         prompt,

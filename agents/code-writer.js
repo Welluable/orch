@@ -47,6 +47,11 @@ export function codeWriterAgentArgs({
                       characters, with no spaces), followed by one paragraph in natural,
                       human-readable language explaining what you did in this step and
                       what happened — no lists, no headers, just prose.
+                    * If you changed any files, after that paragraph add a line reading
+                      exactly "Files:" followed by one line per changed file formatted
+                      as "<path>: <one-line description>" (e.g. "lib/agent.js: wired the
+                      file tracker into onToolEvent"). Omit this section if you changed
+                      nothing.
                     ${feedbackBlock}
                 `,
         prompt,

@@ -182,6 +182,62 @@ describe('printStageSummary', () => {
     assert.equal(logs.some((line) => /Files \(/.test(line)), false);
   });
 
+  it('appends a per-file note parsed from a trailing "Files:" block', () => {
+    const logs = [];
+    const restore = mock.method(console, 'log', (...args) => logs.push(args.join(' ')));
+    try {
+      printStageSummary(
+        'code-writer 1/5',
+        'Implemented the checklist.\nFiles:\nlib/agent.js: wired the tracker\nlib/file-tracker.js: added the collector',
+        [
+          { marker: '~', path: 'lib/agent.js' },
+          { marker: '+', path: 'lib/file-tracker.js' },
+        ],
+      );
+    } finally {
+      restore.mock.restore();
+    }
+    assert.deepEqual(logs, [
+      '',
+      '─────────────────',
+      ' code-writer 1/5 ',
+      '─────────────────',
+      '  • Implemented the checklist.',
+      '  Files (2)',
+      '    ~ lib/agent.js - wired the tracker',
+      '    + lib/file-tracker.js - added the collector',
+      '',
+    ]);
+  });
+
+  it('prints a file with no matching note as before (marker + path only)', () => {
+    const logs = [];
+    const restore = mock.method(console, 'log', (...args) => logs.push(args.join(' ')));
+    try {
+      printStageSummary(
+        'code-writer 1/5',
+        'Implemented the checklist.\nFiles:\nlib/agent.js: wired the tracker',
+        [
+          { marker: '~', path: 'lib/agent.js' },
+          { marker: '+', path: 'lib/file-tracker.js' },
+        ],
+      );
+    } finally {
+      restore.mock.restore();
+    }
+    assert.deepEqual(logs, [
+      '',
+      '─────────────────',
+      ' code-writer 1/5 ',
+      '─────────────────',
+      '  • Implemented the checklist.',
+      '  Files (2)',
+      '    ~ lib/agent.js - wired the tracker',
+      '    + lib/file-tracker.js',
+      '',
+    ]);
+  });
+
   it('is a no-op when both summary and files are empty', () => {
     const logs = [];
     const restore = mock.method(console, 'log', (...args) => logs.push(args.join(' ')));

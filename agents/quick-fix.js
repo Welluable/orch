@@ -22,6 +22,10 @@ export function quickFixAgentArgs({ prompt, cwd, fix_plan }) {
                           characters, with no spaces), followed by one paragraph in
                           natural, human-readable language explaining what you did in this
                           step and what happened — no lists, no headers, just prose.
+                        * If you changed any files, after that paragraph add a line reading
+                          exactly "Files:" followed by one line per changed file formatted
+                          as "<path>: <one-line description>" (e.g. "README.md: documented
+                          the new --files flag"). Omit this section if you changed nothing.
                         ${fixPlan}
                     `,
         prompt,
