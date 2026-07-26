@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { Command, Option } from 'commander';
-import { execFileSync } from 'child_process';
+import { execFileSync, spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
@@ -14,6 +14,19 @@ import { splitStageSummary, printStageSummary } from './lib/stage-summary.js';
 import { createRunContext } from './lib/run-context.js';
 import { createWorktree } from './lib/worktree.js';
 import { commitWorktree } from './lib/commit.js';
+import { generateSlug } from './lib/slug.js';
+import {
+    jobPaths,
+    writeJob,
+    readJob,
+    patchJob,
+    listJobs,
+    reconcileJob,
+    checkpointPause,
+    requestPause,
+    requestResume,
+    stopJob,
+} from './lib/jobs.js';
 import { askAgentArgs } from './agents/ask.js';
 import { triageAgentArgs } from './agents/triage.js';
 import { quickFixAgentArgs } from './agents/quick-fix.js';
@@ -71,6 +84,63 @@ function ensureBinaryOnPath(binary, agentName) {
     }
 }
 
+const TERMINAL_JOB_STATES = ['done', 'failed', 'stopped', 'crashed'];
+
+function formatRelativeTime(iso) {
+    if (!iso) return '-';
+    const sec = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000));
+    if (sec < 60) return `${sec}s ago`;
+    const min = Math.floor(sec / 60);
+    if (min < 60) return `${min}m ago`;
+    const hr = Math.floor(min / 60);
+    if (hr < 24) return `${hr}h ago`;
+    return `${Math.floor(hr / 24)}d ago`;
+}
+
+function formatJobsTable(jobs) {
+    const header = ['SLUG', 'STATE', 'PHASE', 'AGENT', 'STARTED', 'PID'];
+    const rows = jobs.map((job) => [
+        job.slug,
+        job.state,
+        job.phase ?? '-',
+        job.agent ?? '-',
+        formatRelativeTime(job.startedAt),
+        TERMINAL_JOB_STATES.includes(job.state) ? '-' : (job.pid ?? '-'),
+    ]);
+    const widths = header.map((h, i) => Math.max(h.length, ...rows.map((row) => String(row[i]).length)));
+    const formatRow = (cols) => cols.map((c, i) => String(c).padEnd(widths[i])).join('  ').trimEnd();
+    return [formatRow(header), ...rows.map(formatRow)].join('\n');
+}
+
+function lastNonEmptyLine(content) {
+    const lines = content.split('\n').map((line) => line.trim()).filter(Boolean);
+    return lines[lines.length - 1];
+}
+
+function formatStatus(cwd, record) {
+    const lines = [
+        `slug:     ${record.slug}`,
+        `state:    ${record.state}`,
+        `phase:    ${record.phase ?? '-'}`,
+        `stage:    ${record.stage ?? '-'}`,
+        `agent:    ${record.agent ?? '-'}`,
+        `started:  ${record.startedAt} (${formatRelativeTime(record.startedAt)})`,
+        `finished: ${record.finishedAt ?? '-'}`,
+        `branch:   ${record.branch ?? '-'}`,
+        `worktree: ${record.worktree ?? '-'}`,
+        `exitCode: ${record.exitCode ?? '-'}`,
+        `log:      ${record.logPath ?? '-'}`,
+    ];
+
+    const statusPath = path.join(jobPaths(cwd, record.slug).dir, 'status.md');
+    if (fs.existsSync(statusPath)) {
+        const last = lastNonEmptyLine(fs.readFileSync(statusPath, 'utf8'));
+        if (last) lines.push(`status:   ${last}`);
+    }
+
+    return lines.join('\n');
+}
+
 function formatVerdictFeedback(verdict, rawResult) {
     const lines = [];
     if (verdict.summary) lines.push(verdict.summary);
@@ -109,6 +179,21 @@ export async function runPipeline(prompt, options) {
     const createWorktreeFn = options.createWorktree ?? createWorktree;
     const commitWorktreeFn = options.commitWorktree ?? commitWorktree;
     const invocationCwd = process.cwd();
+
+    const jobSlug = options.jobSlug ?? process.env.ORCH_JOB_SLUG;
+    const jobCwd = options.jobCwd ?? invocationCwd;
+    const patchJobFn = options.patchJob ?? patchJob;
+    const checkpointPauseFn = options.checkpointPause ?? checkpointPause;
+    const pausePollIntervalMs = options.pausePollIntervalMs ?? 500;
+
+    const jobPatch = (fields) => {
+        if (!jobSlug) return;
+        patchJobFn(jobCwd, jobSlug, fields);
+    };
+    const jobCheckpoint = async () => {
+        if (!jobSlug) return;
+        await checkpointPauseFn(jobCwd, jobSlug, { pollIntervalMs: pausePollIntervalMs });
+    };
 
     console.log(`cwd:   ${invocationCwd}`);
     console.log(`agent: ${options.agent}`);
@@ -181,12 +266,16 @@ export async function runPipeline(prompt, options) {
     );
 
     try {
+        jobPatch({ phase: 'triage', stage: 'triage', round: null });
+        await jobCheckpoint();
         const triageResult = await triageAgent.run({ verbose });
+        await jobCheckpoint();
         const { content: triageContent, summary: triageSummary } = splitStageSummary(triageResult.result);
         printStageSummary('triage', triageSummary);
         const parsed = parseTriageJson(triageContent);
 
         if (parsed?.simple === true) {
+            jobPatch({ phase: 'quick-fix', stage: 'quick-fix', round: null });
             const quickFix = quickFixAgentArgs({
                 prompt,
                 cwd: invocationCwd,
@@ -200,14 +289,19 @@ export async function runPipeline(prompt, options) {
             );
 
             const quickFixResult = await quickFixAgent.run({ verbose });
+            await jobCheckpoint();
             const { summary: quickFixSummary } = splitStageSummary(quickFixResult.result);
             printStageSummary('quick-fix', quickFixSummary);
+            jobPatch({ state: 'done', exitCode: 0, finishedAt: new Date().toISOString() });
             return;
         }
 
-        const runContext = createRunContextFn({ cwd: invocationCwd });
+        const runContext = createRunContextFn(
+            jobSlug ? { cwd: invocationCwd, slug: jobSlug } : { cwd: invocationCwd },
+        );
         console.log(`task ${runContext.slug} is started`);
 
+        jobPatch({ phase: 'research', stage: 'research', round: null });
         const research = researchAgentArgs({
             prompt,
             cwd: invocationCwd,
@@ -221,9 +315,11 @@ export async function runPipeline(prompt, options) {
         );
 
         const result = await researchAgent.run({ verbose });
+        await jobCheckpoint();
         const { content: researchContent, summary: researchSummary } = splitStageSummary(result.result);
         printStageSummary('research', researchSummary);
 
+        jobPatch({ phase: 'plan', stage: 'planner', round: null });
         const planner = plannerAgentArgs({
             prompt,
             cwd: invocationCwd,
@@ -239,10 +335,13 @@ export async function runPipeline(prompt, options) {
         );
 
         const plannerResult = await plannerAgent.run({ verbose });
+        await jobCheckpoint();
         const { summary: plannerSummary } = splitStageSummary(plannerResult.result);
         printStageSummary('planner', plannerSummary);
 
+        jobPatch({ phase: 'worktree', stage: 'worktree', round: null });
         const worktree = createWorktreeFn({ cwd: invocationCwd, slug: runContext.slug });
+        jobPatch({ branch: worktree.branch, worktree: worktree.worktreePath });
 
         fs.mkdirSync(path.dirname(runContext.statusPath), { recursive: true });
         fs.writeFileSync(
@@ -259,6 +358,7 @@ export async function runPipeline(prompt, options) {
         for (let round = 1; round <= maxRounds; round++) {
             testRound = round;
 
+            jobPatch({ phase: 'test-loop', stage: 'test-writer', round });
             const testWriterArgs = testWriterAgentArgs({
                 prompt,
                 cwd: worktree.worktreePath,
@@ -276,6 +376,7 @@ export async function runPipeline(prompt, options) {
             );
 
             const testOut = await testWriter.run({ verbose });
+            await jobCheckpoint();
             const { content: testWriterContent, summary: testWriterSummary } = splitStageSummary(testOut.result);
             printStageSummary(roundLabel('test-writer', round, maxRounds), testWriterSummary);
             if (!testOut.ok) {
@@ -288,6 +389,7 @@ export async function runPipeline(prompt, options) {
                 throw new Error('test-writer failed; stopping before code-writer');
             }
 
+            jobPatch({ phase: 'test-loop', stage: 'test-critic', round });
             const testCriticArgs = testCriticAgentArgs({
                 prompt,
                 cwd: worktree.worktreePath,
@@ -305,6 +407,7 @@ export async function runPipeline(prompt, options) {
             );
 
             const criticOut = await testCritic.run({ verbose });
+            await jobCheckpoint();
             const { content: testCriticContent, summary: testCriticSummary } = splitStageSummary(criticOut.result);
             printStageSummary(roundLabel('test-critic', round, maxRounds), testCriticSummary);
             if (!criticOut.ok) {
@@ -353,6 +456,7 @@ export async function runPipeline(prompt, options) {
         for (let round = 1; round <= maxRounds; round++) {
             codeRound = round;
 
+            jobPatch({ phase: 'code-loop', stage: 'code-writer', round });
             const codeWriterArgs = codeWriterAgentArgs({
                 prompt,
                 cwd: worktree.worktreePath,
@@ -372,6 +476,7 @@ export async function runPipeline(prompt, options) {
             );
 
             const codeOut = await codeWriter.run({ verbose });
+            await jobCheckpoint();
             const { content: codeWriterContent, summary: codeWriterSummary } = splitStageSummary(codeOut.result);
             printStageSummary(roundLabel('code-writer', round, maxRounds), codeWriterSummary);
             if (!codeOut.ok) {
@@ -384,6 +489,7 @@ export async function runPipeline(prompt, options) {
                 throw new Error('code-writer failed; stopping before commit');
             }
 
+            jobPatch({ phase: 'code-loop', stage: 'test-runner', round });
             const testRunnerArgs = testRunnerAgentArgs({
                 prompt,
                 cwd: worktree.worktreePath,
@@ -400,6 +506,7 @@ export async function runPipeline(prompt, options) {
             );
 
             const runnerOut = await testRunner.run({ verbose });
+            await jobCheckpoint();
             const { content: testRunnerContent, summary: testRunnerSummary } = splitStageSummary(runnerOut.result);
             printStageSummary(roundLabel('test-runner', round, maxRounds), testRunnerSummary);
             if (!runnerOut.ok) {
@@ -432,6 +539,7 @@ export async function runPipeline(prompt, options) {
             throw new Error(`code loop exhausted after ${maxRounds} rounds`);
         }
 
+        jobPatch({ phase: 'commit', stage: 'commit', round: null });
         const message = `orch: ${runContext.slug} ${prompt.split('\n')[0]}`;
         const commitResult = commitWorktreeFn({
             worktreePath: worktree.worktreePath,
@@ -453,10 +561,96 @@ export async function runPipeline(prompt, options) {
             );
             console.log(`commit: no changes on ${commitResult.branch}`);
         }
+
+        jobPatch({ state: 'done', exitCode: 0, finishedAt: new Date().toISOString() });
     } catch (err) {
         console.error(`Error: ${err.message}`);
+        if (jobSlug) {
+            try {
+                patchJobFn(jobCwd, jobSlug, {
+                    state: 'failed',
+                    exitCode: 1,
+                    finishedAt: new Date().toISOString(),
+                });
+            } catch {
+                // Best-effort: don't let a job-state write failure mask the real error.
+            }
+        }
         process.exit(1);
     }
+}
+
+/**
+ * The detach-PARENT path: allocates a run directory, writes an initial
+ * `run.json`, spawns a `--detach`-stripped re-invocation of this CLI with
+ * `ORCH_JOB_SLUG`/`ORCH_DETACHED` set, patches in the child's pid, and
+ * returns immediately. `runPipeline` (the child/pipeline-running path) never
+ * runs in this process.
+ */
+export async function runDetached(prompt, options = {}) {
+    const {
+        agent,
+        maxRounds = 5,
+        verbose,
+        cwd = process.cwd(),
+        createRunContext: createRunContextFn = createRunContext,
+        spawn: spawnFn = spawn,
+        exit = (code) => process.exit(code),
+    } = options;
+
+    const backend = AGENT_BACKENDS[agent];
+    if (!backend) {
+        throw new Error(`Unknown agent backend: ${agent}`);
+    }
+
+    if (!isBinaryOnPath(backend.binary)) {
+        console.error(binaryMissingHint(agent));
+        exit(1);
+        return;
+    }
+
+    const slug = generateSlug();
+    createRunContextFn({ cwd, slug });
+    const { logPath } = jobPaths(cwd, slug);
+    const startedAt = new Date().toISOString();
+
+    writeJob(cwd, slug, {
+        slug,
+        task: prompt,
+        agent,
+        maxRounds,
+        cwd,
+        pauseRequested: false,
+        branch: null,
+        worktree: null,
+        startedAt,
+        finishedAt: null,
+        exitCode: null,
+        logPath,
+        pid: null,
+        state: 'starting',
+        phase: null,
+        stage: null,
+        round: null,
+    });
+
+    const logFd = fs.openSync(logPath, 'a');
+
+    const childArgs = [__filename, prompt, '--agent', agent, '--max-rounds', String(maxRounds)];
+    if (verbose) childArgs.push('--verbose');
+
+    const child = spawnFn(process.execPath, childArgs, {
+        cwd,
+        env: { ...process.env, ORCH_JOB_SLUG: slug, ORCH_DETACHED: '1' },
+        detached: true,
+        stdio: ['ignore', logFd, logFd],
+    });
+    child.unref();
+
+    patchJob(cwd, slug, { pid: child.pid, state: 'running' });
+
+    console.log(`started ${slug} (pid ${child.pid})`);
+    exit(0);
 }
 
 const program = new Command();
@@ -470,6 +664,7 @@ program
     .option('--dry-run', 'Check that the selected agent CLI is on PATH and exit; do not run the pipeline')
     .option('--ask', 'Ask a read-only question about the codebase; print the reply and exit (skips triage and all write pipelines)')
     .option('--quick', 'Skip triage, run quick-fix directly in the current working tree; create no artifacts, worktrees, or commits')
+    .option('--detach', 'Run the pipeline in the background and return immediately; manage it with orch list/status/pause/resume/stop/logs. Cannot be combined with --ask, --quick, or --dry-run')
     .option('--max-rounds <n>', 'Max writer⇄critic and writer⇄runner iterations per implementer loop (ignored with --ask and --quick)', (value) => {
         const n = Number.parseInt(value, 10);
         if (!Number.isFinite(n) || n < 1) {
@@ -492,6 +687,15 @@ Examples:
   $ orch --ask "where is the CLI entrypoint?" --agent claude
   $ orch --quick "fix the typo in the README" --agent claude
   $ orch "noop" --dry-run --agent cursor
+
+Headless runs:
+  $ orch "long-running task" --detach --agent claude   # start in the background, prints the run slug
+  $ orch list                                          # show all tracked runs
+  $ orch status [slug]                                 # show full status (defaults to most recent)
+  $ orch pause <slug>                                  # request a pause at the next stage boundary
+  $ orch resume <slug>                                 # resume a paused/pausing run
+  $ orch stop <slug>                                   # send SIGTERM to a running job
+  $ orch logs <slug> [-f]                              # print (or follow) a run's log file
 `,
     )
     .action(async (task, options) => {
@@ -499,8 +703,163 @@ Examples:
         if (!prompt) {
             console.error('Error: task cannot be empty');
             process.exit(1);
+            return;
         }
+
+        if (options.detach) {
+            const conflicts = ['ask', 'quick', 'dryRun']
+                .filter((key) => options[key])
+                .map((key) => `--${key === 'dryRun' ? 'dry-run' : key}`);
+            if (conflicts.length > 0) {
+                console.error(`Error: --detach cannot be combined with ${conflicts.join(', ')}`);
+                process.exit(1);
+                return;
+            }
+            await runDetached(prompt, options);
+            return;
+        }
+
         await runPipeline(prompt, options);
+    });
+
+program
+    .command('list')
+    .description('List all runs (active and finished) tracked under .orch/ in this directory')
+    .action(() => {
+        const jobs = listJobs(process.cwd());
+        if (jobs.length === 0) {
+            console.log('no runs');
+            return;
+        }
+        console.log(formatJobsTable(jobs));
+    });
+
+program
+    .command('status')
+    .argument('[slug]', 'Run slug to show; defaults to the most recently started run in this directory')
+    .description('Show full status for a run')
+    .action((slug) => {
+        const cwd = process.cwd();
+        let record;
+        if (slug) {
+            record = readJob(cwd, slug);
+            if (!record) {
+                console.error(`Error: unknown run ${slug}`);
+                process.exit(1);
+                return;
+            }
+            record = reconcileJob(cwd, slug, record);
+        } else {
+            const jobs = listJobs(cwd);
+            if (jobs.length === 0) {
+                console.error('Error: no runs found in this directory');
+                process.exit(1);
+                return;
+            }
+            [record] = jobs;
+        }
+        console.log(formatStatus(cwd, record));
+    });
+
+program
+    .command('pause')
+    .argument('<slug>', 'Run slug to pause')
+    .description('Request a running job to pause at its next stage-boundary checkpoint')
+    .action((slug) => {
+        try {
+            requestPause(process.cwd(), slug);
+            console.log(`pause requested for ${slug}`);
+        } catch (err) {
+            console.error(`Error: ${err.message}`);
+            process.exit(1);
+        }
+    });
+
+program
+    .command('resume')
+    .argument('<slug>', 'Run slug to resume')
+    .description('Resume a paused (or pausing) job')
+    .action((slug) => {
+        try {
+            requestResume(process.cwd(), slug);
+            console.log(`resumed ${slug}`);
+        } catch (err) {
+            console.error(`Error: ${err.message}`);
+            process.exit(1);
+        }
+    });
+
+program
+    .command('stop')
+    .argument('<slug>', 'Run slug to stop')
+    .description('Send SIGTERM to a running job (or reconcile a dead one to crashed)')
+    .action((slug) => {
+        try {
+            const result = stopJob(process.cwd(), slug);
+            if (result.action === 'signaled') {
+                console.log(`stop signal sent to ${slug} (pid ${result.record.pid})`);
+            } else if (result.action === 'crashed') {
+                console.log(`${slug} process was already gone; marked crashed`);
+            } else {
+                console.log(`${slug} is already ${result.record.state}`);
+            }
+        } catch (err) {
+            console.error(`Error: ${err.message}`);
+            process.exit(1);
+        }
+    });
+
+program
+    .command('logs')
+    .argument('<slug>', 'Run slug to show logs for')
+    .option('-f, --follow', 'Follow the log file until the job reaches a terminal state (Ctrl+C to stop)')
+    .description("Print a run's orch.log")
+    .action((slug, options) => {
+        const cwd = process.cwd();
+        const record = readJob(cwd, slug);
+        if (!record) {
+            console.error(`Error: unknown run ${slug}`);
+            process.exit(1);
+            return;
+        }
+        const { logPath } = jobPaths(cwd, slug);
+        if (!fs.existsSync(logPath)) {
+            console.error(`Error: no log file for ${slug}`);
+            process.exit(1);
+            return;
+        }
+
+        if (!options.follow) {
+            process.stdout.write(fs.readFileSync(logPath));
+            return;
+        }
+
+        const fd = fs.openSync(logPath, 'r');
+        let position = 0;
+        const pump = () => {
+            const { size } = fs.fstatSync(fd);
+            if (size > position) {
+                const buf = Buffer.alloc(size - position);
+                fs.readSync(fd, buf, 0, buf.length, position);
+                process.stdout.write(buf);
+                position = size;
+            }
+        };
+        pump();
+
+        const stop = () => {
+            clearInterval(interval);
+            fs.closeSync(fd);
+            process.exit(0);
+        };
+
+        const interval = setInterval(() => {
+            pump();
+            const current = reconcileJob(cwd, slug, readJob(cwd, slug));
+            if (TERMINAL_JOB_STATES.includes(current.state)) stop();
+        }, 500);
+
+        process.once('SIGINT', stop);
     });
 
 const invokedPath = process.argv[1] ? fs.realpathSync(process.argv[1]) : '';

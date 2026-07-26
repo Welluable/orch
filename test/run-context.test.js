@@ -85,6 +85,51 @@ describe('createRunContext', () => {
     assert.ok(fs.existsSync(path.join(tmpCwd, '.orch', 'stub-stub-0000')));
   });
 
+  it('reuses an externally chosen slug, skipping generation/collision-retry entirely', () => {
+    const tmpCwd = makeTmpCwd();
+    const spySlug = () => {
+      throw new Error('generateSlug must not be called when an explicit slug is given');
+    };
+
+    const ctx = createRunContext({ cwd: tmpCwd, slug: 'swift-lagoon-49ea', generateSlug: spySlug });
+
+    assert.equal(ctx.slug, 'swift-lagoon-49ea');
+    assert.equal(ctx.artifactDir, path.join(tmpCwd, '.orch', 'swift-lagoon-49ea'));
+    assert.equal(ctx.researchPath, path.join(ctx.artifactDir, 'research.md'));
+    assert.equal(ctx.taskPath, path.join(ctx.artifactDir, 'task.md'));
+    assert.equal(ctx.statusPath, path.join(ctx.artifactDir, 'status.md'));
+  });
+
+  it('does not throw when reopening a slug directory eagerly pre-created by the detach parent', () => {
+    const tmpCwd = makeTmpCwd();
+    // Mirrors the eager `mkdirSync` the detach parent performs before the
+    // child re-invokes the CLI with ORCH_JOB_SLUG=<this slug>.
+    fs.mkdirSync(path.join(tmpCwd, '.orch', 'reused-slug-0000'), { recursive: true });
+
+    const ctx = createRunContext({ cwd: tmpCwd, slug: 'reused-slug-0000' });
+
+    assert.equal(ctx.slug, 'reused-slug-0000');
+    assert.ok(fs.statSync(ctx.artifactDir).isDirectory());
+  });
+
+  it('still creates the directory when given a slug that does not exist yet (no eager pre-creation)', () => {
+    const tmpCwd = makeTmpCwd();
+
+    const ctx = createRunContext({ cwd: tmpCwd, slug: 'fresh-slug-0000' });
+
+    assert.ok(fs.existsSync(ctx.artifactDir));
+    assert.ok(fs.statSync(ctx.artifactDir).isDirectory());
+  });
+
+  it('returns the identical shape whether or not a slug was supplied', () => {
+    const tmpCwd = makeTmpCwd();
+
+    const generated = createRunContext({ cwd: tmpCwd });
+    const reused = createRunContext({ cwd: tmpCwd, slug: 'explicit-slug-0000' });
+
+    assert.deepEqual(Object.keys(generated).sort(), Object.keys(reused).sort());
+  });
+
   it('does not create .orch merely by being imported', async () => {
     const tmpCwd = makeTmpCwd();
     const runContextPath = path.join(repoRoot, 'lib', 'run-context.js').replace(/\\/g, '/');

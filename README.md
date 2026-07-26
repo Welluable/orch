@@ -123,6 +123,8 @@ you invoked `orch`, plus a persistent sibling git worktree and branch:
   research.md
   task.md
   status.md
+  run.json                            # --detach only: job state (state, phase, pid, ...)
+  orch.log                            # --detach only: full stdout/stderr of the run
 
 <parent-of-repo>/<repo-name>-<slug>   # worktree
 orch/<slug>                           # branch
@@ -133,6 +135,9 @@ paths above. Implementer stages (test-writer, test-critic, code-writer,
 test-runner) run inside the worktree instead. The worktree is never deleted
 automatically — it's left in place after the run so you can inspect,
 continue, or merge the work whenever you're ready.
+
+`run.json` and `orch.log` are only written for `--detach` runs — see
+[Headless runs](#headless-runs).
 
 ## Architecture
 
@@ -161,14 +166,19 @@ agent CLI does all the actual reading and writing of files.
 | `--quick` | Skips triage, runs `quick-fix` directly in the current tree; no artifacts, worktree, or commits. | You already know it's a small, direct edit. |
 | `--ask` | Skips triage and all write pipelines; one read-only agent answers and orch prints the reply. | You want an answer about the codebase, not a change. |
 | `--dry-run` | Checks the selected agent CLI is on `PATH` and exits without running the pipeline. | You want to sanity-check your setup before a real run. |
+| `--detach` | Runs the pipeline in a background process and returns immediately, printing the run slug. Manage it with `orch list/status/pause/resume/stop/logs`. | You want to kick off a run and keep using your shell, or run several tasks concurrently. |
 
 For `--ask`, Cursor uses `--mode ask`, Claude uses `--permission-mode plan`,
 and `agn` is prompt-only best-effort (it has no dedicated read-only flag).
 
+`--detach` is task-only: it's rejected (non-zero exit, no job created) when
+combined with `--ask`, `--quick`, or `--dry-run`. Multiple `--detach` runs
+can execute concurrently in the same directory, each with its own slug.
+
 ## CLI Reference
 
 ```text
-Usage: orch [options] <task...>
+Usage: orch [options] [command] <task...>
 ```
 
 - `<task...>` — task description to use as the prompt (mention a file path
@@ -182,11 +192,26 @@ Usage: orch [options] <task...>
   and exits (skips triage and all write pipelines).
 - `--quick` — skips triage, runs `quick-fix` directly in the current working
   tree; creates no artifacts, worktrees, or commits.
+- `--detach` — runs the pipeline in the background and returns immediately,
+  printing `started <slug> (pid <pid>)`; rejects `--ask`/`--quick`/`--dry-run`.
 - `--max-rounds <n>` — max writer⇄critic and writer⇄runner iterations per
   implementer loop; defaults to `5`, ignored with `--ask` and `--quick`.
 - `--agent <cursor|claude|agn>` — selects the backend for the whole pipeline;
   defaults to `cursor`.
 - `-h, --help` — displays help for the command.
+
+Job-control subcommands (see [Headless runs](#headless-runs)):
+
+- `orch list` — lists all runs tracked under `.orch/` in the current directory.
+- `orch status [slug]` — shows full status for a run; defaults to the most
+  recently started run.
+- `orch pause <slug>` — requests a pause at the run's next stage-boundary
+  checkpoint.
+- `orch resume <slug>` — resumes a paused (or pausing) run.
+- `orch stop <slug>` — sends `SIGTERM` to a running job (or reconciles a dead
+  one to `crashed`).
+- `orch logs <slug> [-f]` — prints a run's `orch.log`; `-f` follows it until
+  the job reaches a terminal state.
 
 Examples:
 
@@ -199,6 +224,43 @@ orch --quick "fix the typo in the README" --agent claude
 orch "noop" --dry-run --agent cursor
 ```
 
+## Headless runs
+
+`--detach` starts the full pipeline in a background process and returns your
+shell immediately:
+
+```bash
+orch "implement the local spec" --agent claude --detach
+# started swift-lagoon-49ea (pid 12345)
+```
+
+The parent process validates the agent binary and flag combination, eagerly
+allocates `.orch/<slug>/`, writes an initial `run.json`, then re-invokes
+itself (without `--detach`) as a detached child with `ORCH_JOB_SLUG` set; the
+child runs the actual pipeline and keeps `run.json` up to date as it
+progresses. Manage it with the subcommands below, all scoped to the current
+directory's `.orch/`:
+
+```bash
+orch list                     # SLUG  STATE  PHASE  AGENT  STARTED  PID
+orch status swift-lagoon-49ea # full record: state, phase, branch, worktree, exit code, ...
+orch pause swift-lagoon-49ea  # request a pause at the next stage-boundary checkpoint
+orch resume swift-lagoon-49ea # resume a paused/pausing run
+orch logs swift-lagoon-49ea -f # follow orch.log until the run finishes
+orch stop swift-lagoon-49ea   # SIGTERM the run
+```
+
+Pausing is cooperative and happens at stage boundaries (before the first
+agent stage, and after each individual agent invocation) — it is not an OS
+suspend, and a pause requested mid-stage takes effect only once that stage's
+agent finishes. This means pause is not atomic across a writer⇄critic or
+writer⇄runner pair: e.g. pausing during `test-writer` still lets
+`test-writer` finish before the run actually pauses, ahead of `test-critic`.
+
+`--detach` is task-only — it's rejected outright when combined with
+`--ask`, `--quick`, or `--dry-run` — and multiple `--detach` runs can execute
+concurrently against the same directory, each tracked under its own slug.
+
 ## Project structure
 
 Complex runs create a run directory and a sibling worktree, reusing the
@@ -209,6 +271,8 @@ layout shown in [Artifacts and worktrees](#artifacts-and-worktrees):
   research.md
   task.md
   status.md
+  run.json                            # --detach only
+  orch.log                            # --detach only
 
 <parent-of-repo>/<repo-name>-<slug>   # worktree
 orch/<slug>                           # branch
