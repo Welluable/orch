@@ -16,6 +16,7 @@ import {
   requestPause,
   requestResume,
   stopJob,
+  cleanJobs,
 } from '../lib/jobs.js';
 
 /**
@@ -50,6 +51,8 @@ import {
  *   states, throw on unknown slug or terminal state.
  * - stopJob(cwd, slug, { kill }) -> the pure operation behind `orch stop`:
  *   signals a live pid, or reconciles+reports a dead one to crashed.
+ * - cleanJobs(cwd) -> removes every entry under `.orch/` and returns the
+ *   deleted names (empty when `.orch` is missing or already empty).
  */
 
 function makeTmpCwd() {
@@ -566,5 +569,32 @@ describe('stopJob', () => {
     assert.deepEqual(killCalls, []);
     assert.equal(result.action, 'already-terminal');
     assert.equal(readJob(tmpCwd, record.slug).state, 'done');
+  });
+});
+
+describe('cleanJobs', () => {
+  it('returns an empty array when .orch does not exist', () => {
+    const tmpCwd = makeTmpCwd();
+    assert.deepEqual(cleanJobs(tmpCwd), []);
+  });
+
+  it('deletes every entry under .orch and returns the removed names', () => {
+    const tmpCwd = makeTmpCwd();
+    writeJob(tmpCwd, 'alpha-job-0001', baseRecord({ slug: 'alpha-job-0001', state: 'done', finishedAt: new Date().toISOString(), exitCode: 0 }));
+    writeJob(tmpCwd, 'beta-job-0002', baseRecord({ slug: 'beta-job-0002', state: 'done', finishedAt: new Date().toISOString(), exitCode: 0 }));
+    fs.mkdirSync(path.join(tmpCwd, '.orch', 'legacy-dir-0003'), { recursive: true });
+    fs.writeFileSync(path.join(tmpCwd, '.orch', 'legacy-dir-0003', 'status.md'), '# Status\n');
+
+    const removed = cleanJobs(tmpCwd).sort();
+
+    assert.deepEqual(removed, ['alpha-job-0001', 'beta-job-0002', 'legacy-dir-0003']);
+    assert.deepEqual(fs.readdirSync(path.join(tmpCwd, '.orch')), []);
+    assert.equal(readJob(tmpCwd, 'alpha-job-0001'), null);
+  });
+
+  it('is a no-op success when .orch is already empty', () => {
+    const tmpCwd = makeTmpCwd();
+    fs.mkdirSync(path.join(tmpCwd, '.orch'), { recursive: true });
+    assert.deepEqual(cleanJobs(tmpCwd), []);
   });
 });

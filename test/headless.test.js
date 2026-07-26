@@ -45,13 +45,21 @@ function makeTmpCwd(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
-function runCli(args, { cwd = process.cwd(), env = process.env } = {}) {
+function runCli(args, { cwd = process.cwd(), env = process.env, stdin = null } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [mainPath, ...args], { cwd, env });
+    const child = spawn(process.execPath, [mainPath, ...args], {
+      cwd,
+      env,
+      stdio: [stdin != null ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+    });
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (chunk) => { stdout += chunk; });
     child.stderr.on('data', (chunk) => { stderr += chunk; });
+    if (stdin != null) {
+      child.stdin.write(stdin);
+      child.stdin.end();
+    }
     child.on('error', reject);
     child.on('close', (code) => resolve({ code, stdout, stderr }));
   });
@@ -285,6 +293,83 @@ describe('--help reflects the headless surface', () => {
     assert.match(stdout, /\bresume\b/);
     assert.match(stdout, /\bstop\b/);
     assert.match(stdout, /\blogs\b/);
+  });
+
+  it('lists the jobs clean subcommand', async () => {
+    const { code, stdout } = await runCli(['jobs', '--help']);
+    assert.equal(code, 0);
+    assert.match(stdout, /\bclean\b/);
+  });
+});
+
+describe('orch jobs clean', () => {
+  it('reports no jobs when .orch is empty and does not prompt', async () => {
+    const tmpCwd = makeTmpCwd('orch-jobs-clean-empty-');
+    try {
+      const { code, stdout } = await runCli(['jobs', 'clean'], { cwd: tmpCwd });
+      assert.equal(code, 0);
+      assert.match(stdout, /no jobs to clean/);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('aborts without deleting when the answer is N / empty', async () => {
+    const tmpCwd = makeTmpCwd('orch-jobs-clean-abort-');
+    try {
+      writeJob(tmpCwd, 'keep-me-0000', {
+        slug: 'keep-me-0000',
+        task: 'keep',
+        agent: 'claude',
+        state: 'done',
+        startedAt: new Date().toISOString(),
+        finishedAt: new Date().toISOString(),
+        exitCode: 0,
+        pid: process.pid,
+      });
+
+      const { code, stdout } = await runCli(['jobs', 'clean'], { cwd: tmpCwd, stdin: '\n' });
+      assert.equal(code, 0);
+      assert.match(stdout, /Are you sure\? \[y\/N\]/);
+      assert.match(stdout, /aborted/);
+      assert.equal(fs.existsSync(path.join(tmpCwd, '.orch', 'keep-me-0000', 'run.json')), true);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('deletes all .orch entries when confirmed with y', async () => {
+    const tmpCwd = makeTmpCwd('orch-jobs-clean-yes-');
+    try {
+      writeJob(tmpCwd, 'wipe-me-0000', {
+        slug: 'wipe-me-0000',
+        task: 'wipe',
+        agent: 'claude',
+        state: 'done',
+        startedAt: new Date().toISOString(),
+        finishedAt: new Date().toISOString(),
+        exitCode: 0,
+        pid: process.pid,
+      });
+      writeJob(tmpCwd, 'wipe-me-0001', {
+        slug: 'wipe-me-0001',
+        task: 'wipe too',
+        agent: 'claude',
+        state: 'done',
+        startedAt: new Date().toISOString(),
+        finishedAt: new Date().toISOString(),
+        exitCode: 0,
+        pid: process.pid,
+      });
+
+      const { code, stdout } = await runCli(['jobs', 'clean'], { cwd: tmpCwd, stdin: 'y\n' });
+      assert.equal(code, 0);
+      assert.match(stdout, /Are you sure\? \[y\/N\]/);
+      assert.match(stdout, /deleted 2 jobs from \.orch\//);
+      assert.deepEqual(fs.readdirSync(path.join(tmpCwd, '.orch')), []);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
   });
 });
 

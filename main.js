@@ -3,6 +3,8 @@ import { Command, Option } from 'commander';
 import { execFileSync, spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import readline from 'node:readline/promises';
+import { stdin as input, stdout as output } from 'node:process';
 
 import { fileURLToPath } from 'url';
 import { AgentCursor } from './lib/agent-cursor.js';
@@ -26,6 +28,7 @@ import {
     requestPause,
     requestResume,
     stopJob,
+    cleanJobs,
 } from './lib/jobs.js';
 import { askAgentArgs } from './agents/ask.js';
 import { triageAgentArgs } from './agents/triage.js';
@@ -807,6 +810,38 @@ program
             console.error(`Error: ${err.message}`);
             process.exit(1);
         }
+    });
+
+const jobsCmd = program
+    .command('jobs')
+    .description('Manage orch job artifacts under .orch/');
+
+jobsCmd
+    .command('clean')
+    .description('Delete all orch jobs from the .orch folder')
+    .action(async () => {
+        const cwd = process.cwd();
+        const orchDir = path.join(cwd, '.orch');
+        if (!fs.existsSync(orchDir) || fs.readdirSync(orchDir).length === 0) {
+            console.log('no jobs to clean');
+            return;
+        }
+
+        const rl = readline.createInterface({ input, output });
+        let answer;
+        try {
+            answer = await rl.question('Are you sure? [y/N] ');
+        } finally {
+            rl.close();
+        }
+
+        if (!/^y(es)?$/i.test(answer.trim())) {
+            console.log('aborted');
+            return;
+        }
+
+        const removed = cleanJobs(cwd);
+        console.log(`deleted ${removed.length} job${removed.length === 1 ? '' : 's'} from .orch/`);
     });
 
 program
