@@ -365,12 +365,28 @@ it is pure orchestration: spawn, poll, report. Exit code is `0` only when
 every worker succeeded and integration committed; any worker failure forces a
 non-zero exit even if integration still commits on the green subset.
 
-`orch list`/`status` show the coordinator, its workers, and the integration
-session as ordinary jobs linked by `parent`/`role` (indented tree rendering is
-a later phase). `SIGINT`/`SIGHUP`/`SIGTERM` on the coordinator cascade a
-`SIGTERM` to every live child it recorded — a parent stop cascades to its
-children — the same as [Headless runs](#headless-runs)'s interrupt handling,
-just extended to the whole fan-out tree; worktrees and branches are never
+`orch list` renders an indented job tree: top-level rows are jobs with no
+`parent` (coordinators and ordinary runs), children indent two spaces under
+their coordinator with a `ROLE` column (`coordinator` / `worker` /
+`integrate` / `-`). `orch status <parent>` expands each child's
+state/phase/branch in the same tree order; `orch status <child>` shows a
+`parent:` line and does not list siblings. Default `orch status` (no slug)
+still picks the most recent job and uses the parent-vs-child view as
+appropriate. `orch logs <parent>` tails the coordinator log only.
+
+Cascade control is parent → children only: `orch pause|resume|stop <parent>`
+applies to the coordinator and every live child (pause reports how many
+children were signaled). `orch pause|resume|stop <child>` is leaf-only — no
+upward cascade. While a parent is paused, the coordinator stops spawning at
+its schedule checkpoints and does not kill live children; on resume it
+re-attaches to still-live workers and spawns only still-pending ones (never
+re-decomposing or duplicating finished/live work). A paused leaf is waited
+on without failing it or starting dependents; a stopped/crashed/failed leaf
+is marked `failed` in `fanout.json`, its dependents are skipped, and the
+schedule continues. `SIGINT`/`SIGHUP`/`SIGTERM` on the coordinator (and
+`orch stop <parent>`) cascade a `SIGTERM` to every live child it recorded —
+the same as [Headless runs](#headless-runs)'s interrupt handling, just
+extended to the whole fan-out tree; worktrees and branches are never
 removed automatically.
 
 Depth is capped at 1: every worker and the integration session run with

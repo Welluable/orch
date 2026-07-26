@@ -634,7 +634,12 @@ describe('runFanoutPipeline — fanout.json bootstrap on successful validation',
     const MockAgentClass = createMockAgentClass({
       triage: TRIAGE_COMPLEX,
       boundaries: BOUNDARIES_OK,
-      decomposer: decomposeReply(threeWorkerScaffoldSet()),
+      // Non-scaffold set so fanout.json.base stays the bootstrap git HEAD
+      // (a scaffold success rewrites base — covered by the scaffold-first suite).
+      decomposer: decomposeReply([
+        { id: '02-invoices', title: 'invoice endpoints', subtask: 'Implement invoice endpoints.', area: 'src/billing/invoices/', owns: ['src/billing/invoices/'], dependsOn: [], scaffold: false },
+        { id: '03-charges', title: 'charge endpoints', subtask: 'Implement charge endpoints.', area: 'src/billing/charges/', owns: ['src/billing/charges/'], dependsOn: [], scaffold: false },
+      ]),
     });
     const { spawnFn } = fakeChildSpawn({ cwd, parentSlug: jobSlug, outcomes: {}, integrationOutcome: 'done' });
     const createWorktreeMock = mock.fn();
@@ -668,7 +673,7 @@ describe('runFanoutPipeline — fanout.json bootstrap on successful validation',
     assert.equal(doc.maxWorkers, 4);
     assert.equal(doc.maxConcurrency, 2);
     assert.equal(typeof doc.concurrency, 'number');
-    assert.equal(doc.workers.length, 3);
+    assert.equal(doc.workers.length, 2);
     assert.deepEqual(Object.keys(doc).sort(), [
       'base', 'concurrency', 'finishedAt', 'integration', 'maxConcurrency',
       'maxWorkers', 'parentSlug', 'startedAt', 'state', 'task', 'workers',
