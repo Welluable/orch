@@ -28,6 +28,8 @@ import {
     checkpointPause,
     requestPause,
     requestResume,
+    cascadePause,
+    cascadeResume,
     stopJob,
     cleanJobs,
     isPidAlive,
@@ -135,10 +137,44 @@ function jobDuration(job) {
     return formatElapsed(Math.max(0, end - start));
 }
 
-function formatJobsTable(jobs) {
-    const header = ['SLUG', 'STATE', 'PHASE', 'AGENT', 'STARTED', 'DURATION', 'PID'];
-    const rows = jobs.map((job) => [
-        job.slug,
+function displayJobRole(role) {
+    if (role === 'integration') return 'integrate';
+    if (role == null) return '-';
+    return role;
+}
+
+/** Workers first (startedAt ascending), then the integration child last. */
+function compareFanoutChildren(a, b) {
+    const aIntegrate = a.role === 'integration' ? 1 : 0;
+    const bIntegrate = b.role === 'integration' ? 1 : 0;
+    if (aIntegrate !== bIntegrate) return aIntegrate - bIntegrate;
+    return new Date(a.startedAt).getTime() - new Date(b.startedAt).getTime();
+}
+
+export function formatJobsTable(jobs) {
+    const header = ['SLUG', 'ROLE', 'STATE', 'PHASE', 'AGENT', 'STARTED', 'DURATION', 'PID'];
+    const childrenByParent = new Map();
+    const topLevel = [];
+    for (const job of jobs) {
+        if (job.parent) {
+            if (!childrenByParent.has(job.parent)) childrenByParent.set(job.parent, []);
+            childrenByParent.get(job.parent).push(job);
+        } else {
+            topLevel.push(job);
+        }
+    }
+    topLevel.sort((a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime());
+
+    const ordered = [];
+    for (const parent of topLevel) {
+        ordered.push({ job: parent, indent: '' });
+        const children = (childrenByParent.get(parent.slug) || []).slice().sort(compareFanoutChildren);
+        for (const child of children) ordered.push({ job: child, indent: '  ' });
+    }
+
+    const rows = ordered.map(({ job, indent }) => [
+        `${indent}${job.slug}`,
+        displayJobRole(job.role),
         job.state,
         job.phase ?? '-',
         job.agent ?? '-',
@@ -156,7 +192,7 @@ function lastNonEmptyLine(content) {
     return lines[lines.length - 1];
 }
 
-function formatStatus(cwd, record) {
+export function formatStatus(cwd, record) {
     const lines = [
         `slug:     ${record.slug}`,
         `state:    ${record.state}`,
@@ -171,13 +207,43 @@ function formatStatus(cwd, record) {
         `log:      ${record.logPath ?? '-'}`,
     ];
 
+    if (record.parent) {
+        lines.splice(1, 0, `parent:   ${record.parent}`);
+    }
+
     const statusPath = path.join(jobPaths(cwd, record.slug).dir, 'status.md');
     if (fs.existsSync(statusPath)) {
         const last = lastNonEmptyLine(fs.readFileSync(statusPath, 'utf8'));
         if (last) lines.push(`status:   ${last}`);
     }
 
+    // Child view: parent line only — do not expand siblings.
+    // Read children from disk without reconcile so status reflects recorded
+    // state/phase/branch (listJobs would rewrite dead-pid live states to crashed).
+    if (!record.parent) {
+        const orchDir = path.join(path.resolve(cwd), '.orch');
+        const children = [];
+        if (fs.existsSync(orchDir)) {
+            for (const name of fs.readdirSync(orchDir)) {
+                const child = readJob(cwd, name);
+                if (child?.parent === record.slug) children.push(child);
+            }
+        }
+        children.sort(compareFanoutChildren);
+        if (record.role === 'coordinator' || children.length > 0) {
+            for (const child of children) {
+                lines.push(`  ${child.slug}  ${child.state}  ${child.phase ?? '-'}  ${child.branch ?? '-'}`);
+            }
+        }
+    }
+
     return lines.join('\n');
+}
+
+/** True when pause/resume/stop should cascade to children. */
+function isCascadeParent(cwd, record) {
+    if (record?.role === 'coordinator') return true;
+    return listJobs(cwd).some((job) => job.parent === record.slug);
 }
 
 function formatVerdictFeedback(verdict, rawResult) {
@@ -1247,6 +1313,19 @@ export function cascadeStopFanoutChildren(cwd, parentSlug, { kill = (pid, signal
 }
 
 /**
+ * CLI / management cascade stop: SIGTERM the parent pid if alive, then every
+ * live child pid (via `cascadeStopFanoutChildren`). The coordinator signal
+ * handler keeps calling the child-only helper so it does not re-signal itself.
+ */
+export function cascadeStop(cwd, parentSlug, { kill = (pid, signal) => process.kill(pid, signal), isPidAlive: isPidAliveFn = isPidAlive } = {}) {
+    const parent = readJob(cwd, parentSlug);
+    if (parent && isPidAliveFn(parent.pid)) {
+        kill(parent.pid, 'SIGTERM');
+    }
+    cascadeStopFanoutChildren(cwd, parentSlug, { kill, isPidAlive: isPidAliveFn });
+}
+
+/**
  * The `--fan-out` coordinator: triage → boundaries → decompose → schedule workers →
  * overlap detection → spawn integrate → report. Never creates its own worktree or runs
  * implementer stages itself — those only happen on the decline path (today's
@@ -1611,7 +1690,10 @@ export async function runFanoutPipeline(prompt, options = {}) {
             return true;
         };
 
-        /** Spawns up to `concurrency` of `workerIds` at a time, polling to terminal state. */
+        /** Spawns up to `concurrency` of `workerIds` at a time, polling to terminal state.
+         * Honors `jobCheckpoint` before each spawn and on each poll tick; while paused does
+         * not spawn or advance. Re-attaches to still-live children instead of re-spawning;
+         * skips workers already `done`/`failed`/`skipped`. */
         const runWorkerGroup = async (workerIds, concurrency) => {
             const byId = new Map(workers.map((w) => [w.id, w]));
             const pending = [...workerIds];
@@ -1619,7 +1701,32 @@ export async function runFanoutPipeline(prompt, options = {}) {
 
             while (pending.length > 0 || active.size > 0) {
                 while (active.size < concurrency && pending.length > 0) {
+                    await jobCheckpoint();
+                    if (interrupted) throw new FanoutInterrupted();
+
                     const id = pending.shift();
+                    const fanoutWorker = readFanoutFn(invocationCwd, jobSlug).workers.find((w) => w.id === id);
+
+                    if (fanoutWorker && ['done', 'failed', 'skipped'].includes(fanoutWorker.state)) {
+                        continue;
+                    }
+
+                    if (fanoutWorker?.slug) {
+                        const existing = readJob(invocationCwd, fanoutWorker.slug);
+                        if (existing && !TERMINAL_JOB_STATES.includes(existing.state)) {
+                            // Re-attach to a still-live child — do not spawn a duplicate.
+                            active.set(id, { workerSlug: fanoutWorker.slug, spawnedAt: Date.now() });
+                            continue;
+                        }
+                        if (existing && TERMINAL_JOB_STATES.includes(existing.state)) {
+                            if (fanoutWorker.state !== 'done' && fanoutWorker.state !== 'failed') {
+                                patchWorkerFn(invocationCwd, jobSlug, id, { state: 'failed' });
+                            }
+                            continue;
+                        }
+                    }
+
+                    // Spawn only still-pending workers (no slug / not live or terminal).
                     const workerSlug = spawnWorkerChild(byId.get(id));
                     active.set(id, { workerSlug, spawnedAt: Date.now() });
                 }
@@ -1627,6 +1734,7 @@ export async function runFanoutPipeline(prompt, options = {}) {
 
                 await sleep(pollIntervalMs);
                 if (interrupted) throw new FanoutInterrupted();
+                await jobCheckpoint();
 
                 for (const [id, { workerSlug, spawnedAt }] of [...active]) {
                     if (settleWorker(id, workerSlug, spawnedAt)) active.delete(id);
@@ -1691,6 +1799,7 @@ export async function runFanoutPipeline(prompt, options = {}) {
         }
 
         // --- overlap detection + integration candidates ---
+        await jobCheckpoint();
         const settledDoc = readFanoutFn(invocationCwd, jobSlug);
         const overlapUnion = detectOverlaps(settledDoc.workers);
         for (const worker of settledDoc.workers) {
@@ -1708,14 +1817,57 @@ export async function runFanoutPipeline(prompt, options = {}) {
         });
 
         let integrationDone = false;
-        if (doneWorkers.length > 0) {
+        await jobCheckpoint();
+        const integrationGate = readFanoutFn(invocationCwd, jobSlug).integration;
+        const integrationAlreadyDone = integrationGate?.state === 'done';
+        let integrationSlug = integrationGate?.slug ?? null;
+        let integrationLive = false;
+        if (integrationSlug && !integrationAlreadyDone) {
+            const existingIntegrate = readJob(invocationCwd, integrationSlug);
+            integrationLive = Boolean(existingIntegrate && !TERMINAL_JOB_STATES.includes(existingIntegrate.state));
+        }
+
+        if (integrationAlreadyDone) {
+            integrationDone = true;
+            console.log(`[integrate ${integrationSlug ?? 'done'}] already done — skipping spawn`);
+        } else if (integrationLive) {
+            // Re-attach to an already-live integrate child; do not spawn a duplicate.
+            console.log(`[integrate ${integrationSlug}] re-attached`);
+            const integrateSpawnedAt = Date.now();
+            for (;;) {
+                await sleep(pollIntervalMs);
+                if (interrupted) throw new FanoutInterrupted();
+                await jobCheckpoint();
+
+                const integrationState = readFanoutFn(invocationCwd, jobSlug).integration.state;
+                if (integrationState === 'done') { integrationDone = true; break; }
+                if (integrationState === 'failed') break;
+
+                if (Date.now() - integrateSpawnedAt < CRASH_CHECK_GRACE_MS) continue;
+                const record = reconcileJobFn(invocationCwd, integrationSlug, readJob(invocationCwd, integrationSlug));
+                if (TERMINAL_JOB_STATES.includes(record.state)) {
+                    if (record.state === 'done') integrationDone = true;
+                    else patchIntegrationFn(invocationCwd, jobSlug, (current) => (current.state === 'done' ? {} : { state: 'failed' }));
+                    break;
+                }
+            }
+
+            const finalIntegration = readFanoutFn(invocationCwd, jobSlug).integration;
+            if (finalIntegration.state === 'done' && finalIntegration.sha) {
+                console.log(`[integrate ${integrationSlug}] merged ${doneWorkers.length} branch${doneWorkers.length === 1 ? '' : 'es'}`);
+                console.log(`commit: ${finalIntegration.sha.slice(0, 7)} on ${finalIntegration.branch ?? `orch/${jobSlug}`}`);
+                console.log(`merge:  git merge ${finalIntegration.branch ?? `orch/${jobSlug}`}`);
+            } else {
+                console.log(`[integrate ${integrationSlug}] failed`);
+            }
+        } else if (doneWorkers.length > 0) {
             const envelope = buildIntegrationEnvelope({
                 task: prompt,
                 branches: doneWorkers.map((w) => w.branch),
                 overlappingFiles: overlapUnion,
             });
 
-            const { slug: integrationSlug } = allocateJobFn({
+            const allocated = allocateJobFn({
                 cwd: invocationCwd,
                 prompt: envelope,
                 agent: options.agent,
@@ -1724,6 +1876,7 @@ export async function runFanoutPipeline(prompt, options = {}) {
                 parent: jobSlug,
                 role: 'integration',
             });
+            integrationSlug = allocated.slug;
             patchIntegrationFn(invocationCwd, jobSlug, { slug: integrationSlug });
 
             const { logPath } = jobPaths(invocationCwd, integrationSlug);
@@ -1749,6 +1902,7 @@ export async function runFanoutPipeline(prompt, options = {}) {
             for (;;) {
                 await sleep(pollIntervalMs);
                 if (interrupted) throw new FanoutInterrupted();
+                await jobCheckpoint();
 
                 const integrationState = readFanoutFn(invocationCwd, jobSlug).integration.state;
                 if (integrationState === 'done') { integrationDone = true; break; }
@@ -2125,9 +2279,17 @@ program
     .argument('<slug>', 'Run slug to pause')
     .description('Request a running job to pause at its next stage-boundary checkpoint')
     .action((slug) => {
+        const cwd = process.cwd();
         try {
-            requestPause(process.cwd(), slug);
-            console.log(`pause requested for ${slug}`);
+            const record = readJob(cwd, slug);
+            if (!record) throw new Error(`requestPause: unknown job ${slug}`);
+            if (isCascadeParent(cwd, record)) {
+                const { childrenSignaled } = cascadePause(cwd, slug);
+                console.log(`pause requested for ${slug} (${childrenSignaled} children signaled)`);
+            } else {
+                requestPause(cwd, slug);
+                console.log(`pause requested for ${slug}`);
+            }
         } catch (err) {
             console.error(`Error: ${err.message}`);
             process.exit(1);
@@ -2139,9 +2301,17 @@ program
     .argument('<slug>', 'Run slug to resume')
     .description('Resume a paused (or pausing) job')
     .action((slug) => {
+        const cwd = process.cwd();
         try {
-            requestResume(process.cwd(), slug);
-            console.log(`resumed ${slug}`);
+            const record = readJob(cwd, slug);
+            if (!record) throw new Error(`requestResume: unknown job ${slug}`);
+            if (isCascadeParent(cwd, record)) {
+                cascadeResume(cwd, slug);
+                console.log(`resumed ${slug}`);
+            } else {
+                requestResume(cwd, slug);
+                console.log(`resumed ${slug}`);
+            }
         } catch (err) {
             console.error(`Error: ${err.message}`);
             process.exit(1);
@@ -2153,14 +2323,22 @@ program
     .argument('<slug>', 'Run slug to stop')
     .description('Send SIGTERM to a running job (or reconcile a dead one to crashed)')
     .action((slug) => {
+        const cwd = process.cwd();
         try {
-            const result = stopJob(process.cwd(), slug);
-            if (result.action === 'signaled') {
-                console.log(`stop signal sent to ${slug} (pid ${result.record.pid})`);
-            } else if (result.action === 'crashed') {
-                console.log(`${slug} process was already gone; marked crashed`);
+            const record = readJob(cwd, slug);
+            if (!record) throw new Error(`stopJob: unknown job ${slug}`);
+            if (isCascadeParent(cwd, record)) {
+                cascadeStop(cwd, slug);
+                console.log(`stop signal sent to ${slug} and its children`);
             } else {
-                console.log(`${slug} is already ${result.record.state}`);
+                const result = stopJob(cwd, slug);
+                if (result.action === 'signaled') {
+                    console.log(`stop signal sent to ${slug} (pid ${result.record.pid})`);
+                } else if (result.action === 'crashed') {
+                    console.log(`${slug} process was already gone; marked crashed`);
+                } else {
+                    console.log(`${slug} is already ${result.record.state}`);
+                }
             }
         } catch (err) {
             console.error(`Error: ${err.message}`);
