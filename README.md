@@ -201,6 +201,14 @@ Usage: orch [options] [command] <task...>
   printing `started <slug> (pid <pid>)`; rejects `--ask`/`--quick`/`--dry-run`.
 - `--max-rounds <n>` — max writer⇄critic and writer⇄runner iterations per
   implementer loop; defaults to `5`, ignored with `--ask` and `--quick`.
+- `--fan-out` — decomposes the task into parallel workers coordinated by this
+  process instead of running the single-worktree pipeline (see
+  [Fan-out](#fan-out)); rejects `--ask`/`--quick`/`--dry-run`.
+- `--max-workers <n>` — max number of parallel fan-out workers; defaults to
+  `4`; only meaningful with `--fan-out`.
+- `--max-concurrency <n>` — optional hard ceiling on in-flight fan-out workers
+  at once; omit to let the coordinator choose (typically the current layer's
+  size); only meaningful with `--fan-out`.
 - `--agent <cursor|claude|agn>` — selects the backend for the whole pipeline;
   defaults to `cursor`.
 - `-h, --help` — displays help for the command.
@@ -271,6 +279,104 @@ restriction on backgrounding, not on job records: every non-`--dry-run`
 invocation gets a `run.json`, `--detach` or not. Multiple `--detach` runs can
 execute concurrently against the same directory, each tracked under its own
 slug.
+
+## Fan-out
+
+`--fan-out` decomposes a complex task into independent workers that each run
+the full pipeline (minus triage) in their own worktree, then hands the green
+branches to a dedicated integration session:
+
+```bash
+orch "implement the billing module" --fan-out --agent claude
+```
+
+```text
+triage: complex — fan-out requested
+boundaries: partitionable into billing scaffold + 3 endpoint workers
+decomposer: split into 4 workers (1 scaffold, 3 parallel)
+schedule: concurrency 3
+
+[01-scaffold rapid-fox-x7q2] done — commit b2c3d4e
+[02-invoices merry-elk-r4b1] running
+[03-charges  wise-owl-k1a8] running
+[02-invoices merry-elk-r4b1] done — commit c3d4e5f
+[04-webhooks quirky-cedar-p8w3] done — commit d4e5f60
+
+overlaps: none
+[integrate tidy-heron-m2p9] merged 3 branches, full suite passed
+commit: e5f6071 on orch/wise-pine-e904
+merge:  git merge orch/wise-pine-e904
+```
+
+The flow, in order:
+
+1. **Triage** runs once, same as any run. If it routes to quick-fix, fan-out
+   is skipped entirely — triage never opts into fan-out on its own.
+2. **`boundaries`** (new agent) researches only how the work can be split —
+   what can run in parallel, where the coarse boundaries are, whether shared
+   scaffolding (types, registries, barrels) needs to land first — and writes
+   `boundaries.md`. It never plans implementation steps.
+3. **`decomposer`** (new agent) reads `boundaries.md` and the task and emits
+   a worker list (or declines with a reason). orch validates the decomposition
+   itself — worker count, ownership, dependency graph, layer overlap, at most
+   one `scaffold` worker — and feeds validation failures back to the
+   decomposer for up to two repair attempts before giving up.
+4. **Decline path.** If the decomposer declines, or validation still fails
+   after repairs, orch falls through to today's single-worktree pipeline
+   (research → plan → worktree → test loop → code loop → commit) — no
+   `fanout.json`, no workers scheduled.
+5. **Scaffold first.** If one worker is marked `scaffold`, it runs alone to
+   completion before anything else starts; its commit becomes the base SHA
+   every other worker (and the integration session) branches from. A failed
+   scaffold aborts the whole fan-out before any parallel worker spawns.
+6. **Parallel workers.** Each remaining worker is a full, cold orch pipeline
+   (research → plan → worktree → test loop → code loop → commit) running as
+   its own detached process in its own `.orch/<worker-slug>/` directory and
+   worktree — a sibling `orch` invocation, not in-process work. The
+   coordinator chooses how many run at once (capped by `--max-concurrency`
+   when set) based on the dependency layer currently in flight; a worker
+   whose dependency failed is recorded `skipped` and never started.
+7. **Integration.** Once every worker has settled, the coordinator detects
+   file overlaps between the `done` workers and spawns a specialized
+   integration session (`--integrate`, a hidden flag) that merges their
+   branches in order, resolves any conflicts with a dedicated `integrator`
+   agent, then runs a runner-first verify loop (test-runner first,
+   code-writer only on failure) before committing to `orch/<parent-slug>`. If
+   no worker reached `done`, integration is skipped and the run exits
+   non-zero.
+
+Artifacts, in addition to the coordinator's own `run.json`/`orch.log`:
+
+```text
+<invocation-cwd>/.orch/<parent-slug>/
+  boundaries.md    # partitionability research only
+  fanout.json      # decomposition + scheduling state
+
+<invocation-cwd>/.orch/<worker-slug>/
+  research.md, task.md, status.md, run.json, orch.log   # a normal run, per worker
+
+<invocation-cwd>/.orch/<integration-slug>/
+  integration.md   # merge log, overlaps, conflict repairs, final verdict
+```
+
+The coordinator never creates its own worktree and never runs the
+implementer stages itself outside of the decline path — after decomposition
+it is pure orchestration: spawn, poll, report. Exit code is `0` only when
+every worker succeeded and integration committed; any worker failure forces a
+non-zero exit even if integration still commits on the green subset.
+
+`orch list`/`status` show the coordinator, its workers, and the integration
+session as ordinary jobs linked by `parent`/`role` (indented tree rendering is
+a later phase). `SIGINT`/`SIGHUP`/`SIGTERM` on the coordinator cascade a
+`SIGTERM` to every live child it recorded — a parent stop cascades to its
+children — the same as [Headless runs](#headless-runs)'s interrupt handling,
+just extended to the whole fan-out tree; worktrees and branches are never
+removed automatically.
+
+Depth is capped at 1: every worker and the integration session run with
+`ORCH_FANOUT_DEPTH=1` set, and `--fan-out` is rejected outright when that
+variable is already present — a worker or integration session never fans out
+again.
 
 ## Project structure
 

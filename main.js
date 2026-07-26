@@ -18,7 +18,7 @@ import { createWorktree } from './lib/worktree.js';
 import { commitWorktree, collectWorktreeChanges, printFilesChanged } from './lib/commit.js';
 import { FileTracker } from './lib/file-tracker.js';
 import { allocateJob } from './lib/job-lifecycle.js';
-import { setJobSlug } from './lib/agent.js';
+import { setJobSlug, exitCodeForSignal } from './lib/agent.js';
 import {
     jobPaths,
     readJob,
@@ -30,6 +30,7 @@ import {
     requestResume,
     stopJob,
     cleanJobs,
+    isPidAlive,
 } from './lib/jobs.js';
 import { askAgentArgs } from './agents/ask.js';
 import { triageAgentArgs } from './agents/triage.js';
@@ -41,13 +42,23 @@ import { testCriticAgentArgs } from './agents/test-critic.js';
 import { codeWriterAgentArgs } from './agents/code-writer.js';
 import { testRunnerAgentArgs } from './agents/test-runner.js';
 import { integratorAgentArgs } from './agents/integrator.js';
+import { boundariesAgentArgs } from './agents/boundaries.js';
+import { decomposerAgentArgs } from './agents/decomposer.js';
 import {
     readFanout,
+    writeFanout,
     patchWorker,
     patchIntegration,
     recordChangedFiles,
     buildWorkerEnvelope,
+    buildIntegrationEnvelope,
+    validateDecomposition,
+    planLayers,
+    chooseConcurrency,
+    detectOverlaps,
+    ensureScaffoldSubtask,
 } from './lib/fanout.js';
+import { parseDecomposition } from './lib/parse-decomposition.js';
 import {
     mergeBranches,
     abortMerge,
@@ -1194,6 +1205,599 @@ export async function runIntegratePipeline(options = {}) {
     }
 }
 
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Sentinel thrown by the coordinator's scheduling loop when a SIGINT/SIGTERM/SIGHUP
+ * cascade fires mid-flight, so the pending awaits unwind without a second exit call. */
+class FanoutInterrupted extends Error {}
+
+/**
+ * SIGINT/SIGHUP/SIGTERM cascade: reads `fanout.json`, resolves every worker's and the
+ * integration session's own pid via its `run.json`, filters through `isPidAlive`, and
+ * SIGTERMs each live one. Never touches worktrees. Composes with (does not replace)
+ * `lib/agent.js`'s existing `shutdown()` — the coordinator's own signal handling calls
+ * both this and the normal in-process agent-CLI reaping.
+ */
+export function cascadeStopFanoutChildren(cwd, parentSlug, { kill = (pid, signal) => process.kill(pid, signal), isPidAlive: isPidAliveFn = isPidAlive } = {}) {
+    const fanout = readFanout(cwd, parentSlug);
+    if (!fanout) return;
+
+    const slugs = fanout.workers.filter((worker) => worker.slug).map((worker) => worker.slug);
+    if (fanout.integration?.slug) slugs.push(fanout.integration.slug);
+
+    for (const slug of slugs) {
+        const record = readJob(cwd, slug);
+        if (!record) continue;
+        if (isPidAliveFn(record.pid)) {
+            kill(record.pid, 'SIGTERM');
+        }
+    }
+}
+
+/**
+ * The `--fan-out` coordinator: triage → boundaries → decompose → schedule workers →
+ * overlap detection → spawn integrate → report. Never creates its own worktree or runs
+ * implementer stages itself — those only happen on the decline path (today's
+ * single-worktree pipeline, reusing `runTestLoop`/`runCodeLoop`) or inside spawned
+ * children. See `.spec/fanout-3-coordinator.md` and `.spec/fanout.md`.
+ */
+export async function runFanoutPipeline(prompt, options = {}) {
+    const verbose = Boolean(options.verbose);
+    const maxRounds = options.maxRounds ?? 5;
+    const maxWorkers = options.maxWorkers ?? 4;
+    const maxConcurrency = options.maxConcurrency ?? null;
+    const backend = AGENT_BACKENDS[options.agent];
+    if (!backend) {
+        throw new Error(`Unknown agent backend: ${options.agent}`);
+    }
+    const AgentClass = options.AgentClass ?? backend.AgentClass;
+    const invocationCwd = options.cwd ?? process.cwd();
+
+    const createRunContextFn = options.createRunContext ?? createRunContext;
+    const createWorktreeFn = options.createWorktree ?? createWorktree;
+    const commitWorktreeFn = options.commitWorktree ?? commitWorktree;
+    const collectWorktreeChangesFn = options.collectWorktreeChanges ?? collectWorktreeChanges;
+    const spawnFn = options.spawn ?? spawn;
+    const execFileFn = options.execFile ?? defaultExecFile;
+    const allocateJobFn = options.allocateJob ?? allocateJob;
+    const reconcileJobFn = options.reconcileJob ?? reconcileJob;
+    const readFanoutFn = options.readFanout ?? readFanout;
+    const writeFanoutFn = options.writeFanout ?? writeFanout;
+    const patchWorkerFn = options.patchWorker ?? patchWorker;
+    const patchIntegrationFn = options.patchIntegration ?? patchIntegration;
+    const exitFn = options.exit ?? ((code) => process.exit(code));
+    const pollIntervalMs = options.pollIntervalMs ?? 500;
+
+    const jobSlug = options.jobSlug ?? process.env.ORCH_JOB_SLUG;
+    const jobCwd = options.jobCwd ?? invocationCwd;
+    const patchJobFn = options.patchJob ?? patchJob;
+    const checkpointPauseFn = options.checkpointPause ?? checkpointPause;
+    const pausePollIntervalMs = options.pausePollIntervalMs ?? 500;
+
+    const jobPatch = (fields) => {
+        if (!jobSlug) return;
+        patchJobFn(jobCwd, jobSlug, fields);
+    };
+    const jobCheckpoint = async () => {
+        if (!jobSlug) return;
+        await checkpointPauseFn(jobCwd, jobSlug, { pollIntervalMs: pausePollIntervalMs });
+    };
+
+    if (!options.AgentClass) {
+        ensureBinaryOnPath(backend.binary, options.agent);
+    }
+
+    console.log(`cwd:   ${invocationCwd}`);
+    console.log(`agent: ${options.agent}`);
+    console.log();
+
+    let interrupted = false;
+    const onSignal = (signal) => {
+        interrupted = true;
+        try {
+            cascadeStopFanoutChildren(invocationCwd, jobSlug);
+        } catch {
+            // Best-effort: never let the cascade itself block shutdown.
+        }
+        if (jobSlug) {
+            try {
+                patchJobFn(jobCwd, jobSlug, {
+                    state: 'stopped',
+                    exitCode: exitCodeForSignal(signal),
+                    finishedAt: new Date().toISOString(),
+                });
+            } catch {
+                // Best-effort: don't let a job-state write failure block shutdown.
+            }
+        }
+        exitFn(exitCodeForSignal(signal));
+    };
+    process.on('SIGINT', () => onSignal('SIGINT'));
+    process.on('SIGTERM', () => onSignal('SIGTERM'));
+    process.on('SIGHUP', () => onSignal('SIGHUP'));
+
+    try {
+        jobPatch({ phase: 'triage', stage: 'triage', round: null });
+        const triage = triageAgentArgs({ prompt, cwd: invocationCwd });
+        const triageAgent = new AgentClass(triage.name, triage.instructions, triage.prompt, triage.options);
+        const triageResult = await triageAgent.run({ verbose });
+        await jobCheckpoint();
+        const { content: triageContent, summary: triageSummary } = splitStageSummary(triageResult.result);
+        printStageSummary('triage', triageSummary);
+        const parsed = parseTriageJson(triageContent);
+
+        if (parsed?.simple === true) {
+            console.log('triage: simple — fan-out skipped (quick-fix)');
+            jobPatch({ phase: 'quick-fix', stage: 'quick-fix', round: null });
+            const quickFix = quickFixAgentArgs({ prompt, cwd: invocationCwd, fix_plan: parsed.fix_plan });
+            const quickFixTracker = new FileTracker({ cwd: invocationCwd });
+            const quickFixAgent = new AgentClass(
+                quickFix.name,
+                quickFix.instructions,
+                quickFix.prompt,
+                { ...quickFix.options, fileTracker: quickFixTracker },
+            );
+            const quickFixResult = await quickFixAgent.run({ verbose });
+            await jobCheckpoint();
+            const { summary: quickFixSummary } = splitStageSummary(quickFixResult.result);
+            printStageSummary('quick-fix', quickFixSummary, quickFixTracker.getFiles());
+            jobPatch({ state: 'done', exitCode: 0, finishedAt: new Date().toISOString() });
+            exitFn(0);
+            return;
+        }
+
+        console.log('triage: complex — fan-out requested');
+
+        // --- boundaries: partitionability research only, runs exactly once ---
+        const boundariesPath = path.join(jobCwd, '.orch', jobSlug, 'boundaries.md');
+        jobPatch({ phase: 'boundaries', stage: 'boundaries', round: null });
+        const boundaries = boundariesAgentArgs({ prompt, cwd: invocationCwd, boundariesPath });
+        const boundariesAgent = new AgentClass(boundaries.name, boundaries.instructions, boundaries.prompt, boundaries.options);
+        const boundariesResult = await boundariesAgent.run({ verbose });
+        await jobCheckpoint();
+        const { content: boundariesOutput, summary: boundariesSummary } = splitStageSummary(boundariesResult.result);
+        printStageSummary('boundaries', boundariesSummary);
+        console.log(`boundaries: ${boundariesSummary || 'done'}`);
+
+        // --- decomposer: up to two repair round-trips on validation failure ---
+        let feedback;
+        let decision = null;
+        for (let attempt = 1; attempt <= 3; attempt += 1) {
+            jobPatch({ phase: 'decompose', stage: 'decomposer', round: attempt });
+            const decomposer = decomposerAgentArgs({
+                prompt, cwd: invocationCwd, boundariesOutput, maxWorkers, feedback,
+            });
+            const decomposerAgent = new AgentClass(decomposer.name, decomposer.instructions, decomposer.prompt, decomposer.options);
+            const decomposerResult = await decomposerAgent.run({ verbose });
+            await jobCheckpoint();
+            const { content: decomposerContent, summary: decomposerSummary } = splitStageSummary(decomposerResult.result);
+            printStageSummary('decomposer', decomposerSummary);
+
+            const parsedDecomposition = parseDecomposition(decomposerContent);
+            if (!parsedDecomposition) {
+                feedback = ['decomposer output was not valid JSON'];
+                if (attempt === 3) decision = { decline: true, why: 'decomposer did not return valid JSON after repair attempts' };
+                continue;
+            }
+            if (parsedDecomposition.decomposable === false) {
+                decision = { decline: true, why: parsedDecomposition.why };
+                break;
+            }
+
+            const violations = validateDecomposition(parsedDecomposition, { maxWorkers });
+            if (violations.length === 0) {
+                decision = { decline: false, decomposition: parsedDecomposition };
+                break;
+            }
+            feedback = violations;
+            if (attempt === 3) {
+                decision = { decline: true, why: `decomposition still invalid after repairs: ${violations.join('; ')}` };
+            }
+        }
+
+        if (decision.decline) {
+            console.log(`decomposer: declined — ${decision.why}`);
+            console.log('falling through to the single-worktree pipeline');
+
+            const runContext = createRunContextFn(jobSlug ? { cwd: invocationCwd, slug: jobSlug } : { cwd: invocationCwd });
+
+            jobPatch({ phase: 'research', stage: 'research', round: null });
+            const research = researchAgentArgs({ prompt, cwd: invocationCwd, researchPath: runContext.researchPath });
+            const researchAgent = new AgentClass(research.name, research.instructions, research.prompt, research.options);
+            const researchResult = await researchAgent.run({ verbose });
+            await jobCheckpoint();
+            const { content: researchContent, summary: researchSummary } = splitStageSummary(researchResult.result);
+            printStageSummary('research', researchSummary);
+
+            jobPatch({ phase: 'plan', stage: 'planner', round: null });
+            const planner = plannerAgentArgs({
+                prompt, cwd: invocationCwd, researchPath: runContext.researchPath, taskPath: runContext.taskPath, researchOutput: researchContent,
+            });
+            const plannerAgent = new AgentClass(planner.name, planner.instructions, planner.prompt, planner.options);
+            const plannerResult = await plannerAgent.run({ verbose });
+            await jobCheckpoint();
+            const { summary: plannerSummary } = splitStageSummary(plannerResult.result);
+            printStageSummary('planner', plannerSummary);
+
+            jobPatch({ phase: 'worktree', stage: 'worktree', round: null });
+            const worktree = createWorktreeFn({ cwd: invocationCwd, slug: runContext.slug });
+            jobPatch({ branch: worktree.branch, worktree: worktree.worktreePath });
+
+            fs.mkdirSync(path.dirname(runContext.statusPath), { recursive: true });
+            fs.writeFileSync(
+                runContext.statusPath,
+                `# Status\n\n- Slug: \`${runContext.slug}\`\n- Branch: \`${worktree.branch}\`\n- Worktree: \`${worktree.worktreePath}\`\n`,
+            );
+
+            const testAccepted = await runTestLoop({
+                prompt,
+                worktreePath: worktree.worktreePath,
+                branch: worktree.branch,
+                taskPath: runContext.taskPath,
+                statusPath: runContext.statusPath,
+                maxRounds,
+                AgentClass,
+                verbose,
+                jobPatch,
+                jobCheckpoint,
+            });
+
+            const acceptedVerification = [testAccepted.verdict.summary, testAccepted.writerContent].filter(Boolean).join('\n');
+
+            await runCodeLoop({
+                prompt,
+                worktreePath: worktree.worktreePath,
+                branch: worktree.branch,
+                taskPath: runContext.taskPath,
+                statusPath: runContext.statusPath,
+                maxRounds,
+                AgentClass,
+                verbose,
+                jobPatch,
+                jobCheckpoint,
+                acceptedVerification,
+            });
+
+            jobPatch({ phase: 'commit', stage: 'commit', round: null });
+            const message = `orch: ${runContext.slug} ${prompt.split('\n')[0]}`;
+            const worktreeChanges = collectWorktreeChangesFn({ worktreePath: worktree.worktreePath });
+            printFilesChanged(worktreeChanges);
+            const commitResult = commitWorktreeFn({ worktreePath: worktree.worktreePath, branch: worktree.branch, message });
+
+            if (commitResult.committed) {
+                fs.appendFileSync(
+                    runContext.statusPath,
+                    `\n## Commit\n\n- SHA: \`${commitResult.sha}\`\n- Branch: \`${commitResult.branch}\`\n`,
+                );
+                console.log(`commit: ${commitResult.sha.slice(0, 7)} on ${commitResult.branch}`);
+                console.log(`merge:  git merge ${commitResult.branch}`);
+            } else {
+                fs.appendFileSync(
+                    runContext.statusPath,
+                    `\n## Commit\n\n- No changes to commit on \`${commitResult.branch}\`.\n`,
+                );
+                console.log(`commit: no changes on ${commitResult.branch}`);
+            }
+
+            jobPatch({ state: 'done', exitCode: 0, finishedAt: new Date().toISOString() });
+            exitFn(0);
+            return;
+        }
+
+        // --- validated: bootstrap fanout.json, never give the coordinator a worktree ---
+        const { decomposition } = decision;
+        const base = execFileFn('git', ['-C', invocationCwd, 'rev-parse', 'HEAD']).trim();
+
+        const workers = decomposition.workers.map((worker) => ({
+            id: worker.id,
+            title: worker.title,
+            subtask: worker.scaffold ? ensureScaffoldSubtask(worker.subtask) : worker.subtask,
+            area: worker.area,
+            owns: worker.owns ?? [],
+            dependsOn: worker.dependsOn ?? [],
+            scaffold: Boolean(worker.scaffold),
+            slug: null,
+            branch: null,
+            state: 'pending',
+            sha: null,
+            changedFiles: [],
+            overlaps: [],
+        }));
+
+        writeFanoutFn(invocationCwd, jobSlug, {
+            parentSlug: jobSlug,
+            task: prompt,
+            base,
+            maxWorkers,
+            maxConcurrency,
+            concurrency: workers.length,
+            state: 'running',
+            workers,
+            integration: {
+                slug: null,
+                pid: null,
+                branch: null,
+                worktree: null,
+                candidates: [],
+                merged: [],
+                skipped: [],
+                overlappingFiles: [],
+                state: 'pending',
+                sha: null,
+            },
+            startedAt: new Date().toISOString(),
+            finishedAt: null,
+        });
+
+        console.log(`decomposer: split into ${workers.length} worker${workers.length === 1 ? '' : 's'}`);
+
+        const spawnWorkerChild = (worker) => {
+            const siblingTitles = workers.filter((w) => w.id !== worker.id).map((w) => w.title).filter(Boolean);
+            const envelope = buildWorkerEnvelope({
+                subtask: worker.subtask, area: worker.area, scaffold: worker.scaffold, siblingTitles,
+            });
+            const workerPrompt = `${worker.subtask}\n\n${envelope}`;
+
+            const { slug: workerSlug } = allocateJobFn({
+                cwd: invocationCwd,
+                prompt: workerPrompt,
+                agent: options.agent,
+                maxRounds,
+                state: 'starting',
+                parent: jobSlug,
+                role: 'worker',
+                workerId: worker.id,
+            });
+            patchWorkerFn(invocationCwd, jobSlug, worker.id, {
+                slug: workerSlug,
+                branch: `orch/${workerSlug}`,
+                state: 'running',
+            });
+
+            const { logPath } = jobPaths(invocationCwd, workerSlug);
+            const logFd = fs.openSync(logPath, 'a');
+            const childArgs = [
+                __filename, workerPrompt,
+                '--agent', options.agent,
+                '--max-rounds', String(maxRounds),
+                '--worker', `${jobSlug}:${worker.id}`,
+            ];
+            const child = spawnFn(process.execPath, childArgs, {
+                cwd: invocationCwd,
+                env: { ...process.env, ORCH_JOB_SLUG: workerSlug, ORCH_DETACHED: '1', ORCH_FANOUT_DEPTH: '1' },
+                detached: true,
+                stdio: ['ignore', logFd, logFd],
+            });
+            child.unref();
+            patchJobFn(invocationCwd, workerSlug, { pid: child.pid, state: 'running' });
+            console.log(`[${worker.id} ${workerSlug}] running`);
+            return workerSlug;
+        };
+
+        // A worker child self-patches its fanout.json entry to 'done'/'failed' the moment it
+        // finishes (see runWorkerPipeline) — that is the primary settlement signal. reconcileJob
+        // (dead-pid detection) is only consulted once a worker has been in-flight past a grace
+        // period, so a worker that simply hasn't self-reported yet is never mistaken for a crash.
+        const CRASH_CHECK_GRACE_MS = Math.max(pollIntervalMs * 10, 200);
+
+        const settleWorker = (workerId, workerSlug, spawnedAt) => {
+            const fanoutWorker = readFanoutFn(invocationCwd, jobSlug).workers.find((w) => w.id === workerId);
+            if (fanoutWorker.state === 'done' || fanoutWorker.state === 'failed') {
+                console.log(`[${workerId} ${workerSlug}] ${fanoutWorker.state}`);
+                return true;
+            }
+
+            if (Date.now() - spawnedAt < CRASH_CHECK_GRACE_MS) return false;
+
+            const record = reconcileJobFn(invocationCwd, workerSlug, readJob(invocationCwd, workerSlug));
+            if (!TERMINAL_JOB_STATES.includes(record.state)) return false;
+
+            if (fanoutWorker.state !== 'done' && fanoutWorker.state !== 'failed') {
+                patchWorkerFn(invocationCwd, jobSlug, workerId, { state: 'failed' });
+            }
+            console.log(`[${workerId} ${workerSlug}] failed`);
+            return true;
+        };
+
+        /** Spawns up to `concurrency` of `workerIds` at a time, polling to terminal state. */
+        const runWorkerGroup = async (workerIds, concurrency) => {
+            const byId = new Map(workers.map((w) => [w.id, w]));
+            const pending = [...workerIds];
+            const active = new Map();
+
+            while (pending.length > 0 || active.size > 0) {
+                while (active.size < concurrency && pending.length > 0) {
+                    const id = pending.shift();
+                    const workerSlug = spawnWorkerChild(byId.get(id));
+                    active.set(id, { workerSlug, spawnedAt: Date.now() });
+                }
+                if (active.size === 0) break;
+
+                await sleep(pollIntervalMs);
+                if (interrupted) throw new FanoutInterrupted();
+
+                for (const [id, { workerSlug, spawnedAt }] of [...active]) {
+                    if (settleWorker(id, workerSlug, spawnedAt)) active.delete(id);
+                }
+            }
+        };
+
+        const scaffoldWorker = workers.find((w) => w.scaffold);
+        let aborted = false;
+
+        if (scaffoldWorker) {
+            await runWorkerGroup([scaffoldWorker.id], 1);
+            const scaffoldEntry = readFanoutFn(invocationCwd, jobSlug).workers.find((w) => w.id === scaffoldWorker.id);
+            if (scaffoldEntry.state === 'done') {
+                const current = readFanoutFn(invocationCwd, jobSlug);
+                writeFanoutFn(invocationCwd, jobSlug, { ...current, base: scaffoldEntry.sha });
+                console.log(`[${scaffoldWorker.id}] done — base updated to ${scaffoldEntry.sha.slice(0, 7)}`);
+            } else {
+                aborted = true;
+                for (const worker of workers) {
+                    if (worker.id === scaffoldWorker.id) continue;
+                    patchWorkerFn(invocationCwd, jobSlug, worker.id, { state: 'skipped' });
+                }
+                console.log('scaffold worker failed; aborting fan-out before any parallel worker spawns');
+            }
+        }
+
+        if (!aborted) {
+            const remaining = workers.filter((w) => !scaffoldWorker || w.id !== scaffoldWorker.id);
+            const forLayering = remaining.map((w) => ({
+                ...w,
+                dependsOn: (w.dependsOn || []).filter((dep) => !scaffoldWorker || dep !== scaffoldWorker.id),
+            }));
+            const layers = planLayers(forLayering);
+
+            for (const layerIds of layers) {
+                if (interrupted) throw new FanoutInterrupted();
+                const currentDoc = readFanoutFn(invocationCwd, jobSlug);
+                const byId = new Map(workers.map((w) => [w.id, w]));
+                const toRun = [];
+                for (const id of layerIds) {
+                    const worker = byId.get(id);
+                    const depFailed = (worker.dependsOn || []).some(
+                        (dep) => currentDoc.workers.find((w) => w.id === dep)?.state === 'failed',
+                    );
+                    if (depFailed) {
+                        patchWorkerFn(invocationCwd, jobSlug, id, { state: 'skipped' });
+                        console.log(`[${id}] skipped — dependency failed`);
+                    } else {
+                        toRun.push(id);
+                    }
+                }
+                if (toRun.length === 0) continue;
+
+                const concurrency = chooseConcurrency({ layerSize: toRun.length, maxConcurrency });
+                const currentForConcurrency = readFanoutFn(invocationCwd, jobSlug);
+                writeFanoutFn(invocationCwd, jobSlug, { ...currentForConcurrency, concurrency });
+                console.log(`schedule: concurrency ${concurrency}`);
+
+                await runWorkerGroup(toRun, concurrency);
+            }
+        }
+
+        // --- overlap detection + integration candidates ---
+        const settledDoc = readFanoutFn(invocationCwd, jobSlug);
+        const overlapUnion = detectOverlaps(settledDoc.workers);
+        for (const worker of settledDoc.workers) {
+            if (worker.overlaps && worker.overlaps.length > 0) {
+                patchWorkerFn(invocationCwd, jobSlug, worker.id, { overlaps: worker.overlaps });
+            }
+        }
+        console.log(`overlaps: ${overlapUnion.length > 0 ? overlapUnion.join(', ') : 'none'}`);
+
+        const doneWorkers = settledDoc.workers.filter((w) => w.state === 'done');
+        const failedWorkers = settledDoc.workers.filter((w) => w.state === 'failed');
+        patchIntegrationFn(invocationCwd, jobSlug, {
+            candidates: doneWorkers.map((w) => w.branch),
+            overlappingFiles: overlapUnion,
+        });
+
+        let integrationDone = false;
+        if (doneWorkers.length > 0) {
+            const envelope = buildIntegrationEnvelope({
+                task: prompt,
+                branches: doneWorkers.map((w) => w.branch),
+                overlappingFiles: overlapUnion,
+            });
+
+            const { slug: integrationSlug } = allocateJobFn({
+                cwd: invocationCwd,
+                prompt: envelope,
+                agent: options.agent,
+                maxRounds,
+                state: 'starting',
+                parent: jobSlug,
+                role: 'integration',
+            });
+            patchIntegrationFn(invocationCwd, jobSlug, { slug: integrationSlug });
+
+            const { logPath } = jobPaths(invocationCwd, integrationSlug);
+            const logFd = fs.openSync(logPath, 'a');
+            const childArgs = [
+                __filename, envelope,
+                '--agent', options.agent,
+                '--max-rounds', String(maxRounds),
+                '--integrate', jobSlug,
+            ];
+            const child = spawnFn(process.execPath, childArgs, {
+                cwd: invocationCwd,
+                env: { ...process.env, ORCH_JOB_SLUG: integrationSlug, ORCH_DETACHED: '1', ORCH_FANOUT_DEPTH: '1' },
+                detached: true,
+                stdio: ['ignore', logFd, logFd],
+            });
+            child.unref();
+            patchJobFn(invocationCwd, integrationSlug, { pid: child.pid, state: 'running' });
+            patchIntegrationFn(invocationCwd, jobSlug, { pid: child.pid });
+            console.log(`[integrate ${integrationSlug}] running`);
+
+            const integrateSpawnedAt = Date.now();
+            for (;;) {
+                await sleep(pollIntervalMs);
+                if (interrupted) throw new FanoutInterrupted();
+
+                const integrationState = readFanoutFn(invocationCwd, jobSlug).integration.state;
+                if (integrationState === 'done') { integrationDone = true; break; }
+                if (integrationState === 'failed') break;
+
+                if (Date.now() - integrateSpawnedAt < CRASH_CHECK_GRACE_MS) continue;
+                const record = reconcileJobFn(invocationCwd, integrationSlug, readJob(invocationCwd, integrationSlug));
+                if (TERMINAL_JOB_STATES.includes(record.state)) {
+                    if (record.state === 'done') integrationDone = true;
+                    else patchIntegrationFn(invocationCwd, jobSlug, (current) => (current.state === 'done' ? {} : { state: 'failed' }));
+                    break;
+                }
+            }
+
+            const finalIntegration = readFanoutFn(invocationCwd, jobSlug).integration;
+            if (finalIntegration.state === 'done' && finalIntegration.sha) {
+                console.log(`[integrate ${integrationSlug}] merged ${doneWorkers.length} branch${doneWorkers.length === 1 ? '' : 'es'}`);
+                console.log(`commit: ${finalIntegration.sha.slice(0, 7)} on ${finalIntegration.branch ?? `orch/${jobSlug}`}`);
+                console.log(`merge:  git merge ${finalIntegration.branch ?? `orch/${jobSlug}`}`);
+            } else {
+                console.log(`[integrate ${integrationSlug}] failed`);
+            }
+        } else {
+            console.log('no worker reached done; skipping integration');
+        }
+
+        const finalDoc = readFanoutFn(invocationCwd, jobSlug);
+        const success = failedWorkers.length === 0 && integrationDone && Boolean(finalDoc.integration.sha);
+        writeFanoutFn(invocationCwd, jobSlug, {
+            ...finalDoc,
+            state: success ? 'done' : 'failed',
+            finishedAt: new Date().toISOString(),
+        });
+
+        if (failedWorkers.length > 0) {
+            console.log(`${failedWorkers.length} worker${failedWorkers.length === 1 ? '' : 's'} failed: ${failedWorkers.map((w) => w.id).join(', ')}`);
+            console.log(`retry integration after fixing it: orch --integrate ${jobSlug}`);
+        }
+
+        jobPatch({ state: success ? 'done' : 'failed', exitCode: success ? 0 : 1, finishedAt: new Date().toISOString() });
+        exitFn(success ? 0 : 1);
+    } catch (err) {
+        if (err instanceof FanoutInterrupted) return;
+        console.error(`Error: ${err.message}`);
+        if (jobSlug) {
+            try {
+                patchJobFn(jobCwd, jobSlug, {
+                    state: 'failed',
+                    exitCode: 1,
+                    finishedAt: new Date().toISOString(),
+                });
+            } catch {
+                // Best-effort: don't let a job-state write failure mask the real error.
+            }
+        }
+        exitFn(1);
+    }
+}
+
 /** Splits `--worker`'s `<parent-slug>:<worker-id>` value on the first colon. */
 function splitParentWorker(value) {
     const idx = value.indexOf(':');
@@ -1314,6 +1918,17 @@ async function runIntegrateFromCli(options) {
     });
 }
 
+/** Commander option parser shared by `--max-rounds`, `--max-workers`, and `--max-concurrency`. */
+function positiveIntParser(flagName) {
+    return (value) => {
+        const n = Number.parseInt(value, 10);
+        if (!Number.isFinite(n) || n < 1) {
+            throw new Error(`${flagName} must be a positive integer`);
+        }
+        return n;
+    };
+}
+
 const program = new Command();
 
 program
@@ -1326,13 +1941,10 @@ program
     .option('--ask', 'Ask a read-only question about the codebase; print the reply and exit (skips triage and all write pipelines)')
     .option('--quick', 'Skip triage, run quick-fix directly in the current working tree; create no artifacts, worktrees, or commits')
     .option('--detach', 'Run the pipeline in the background and return immediately; manage it with orch list/status/pause/resume/stop/logs. Cannot be combined with --ask, --quick, or --dry-run')
-    .option('--max-rounds <n>', 'Max writer⇄critic and writer⇄runner iterations per implementer loop (ignored with --ask and --quick)', (value) => {
-        const n = Number.parseInt(value, 10);
-        if (!Number.isFinite(n) || n < 1) {
-            throw new Error('--max-rounds must be a positive integer');
-        }
-        return n;
-    }, 5)
+    .option('--max-rounds <n>', 'Max writer⇄critic and writer⇄runner iterations per implementer loop (ignored with --ask and --quick)', positiveIntParser('--max-rounds'), 5)
+    .option('--fan-out', 'Decompose the task into parallel workers coordinated by this process (see README Fan-out section). Cannot be combined with --ask, --quick, or --dry-run')
+    .option('--max-workers <n>', 'Max number of parallel fan-out workers (only meaningful with --fan-out)', positiveIntParser('--max-workers'), 4)
+    .option('--max-concurrency <n>', 'Optional hard ceiling on in-flight fan-out workers at once (only meaningful with --fan-out; default: coordinator chooses)', positiveIntParser('--max-concurrency'))
     .addOption(
         new Option('--agent <agent>', 'Agent backend to run the pipeline with: "cursor" (Cursor Agent CLI), "claude" (Claude Code CLI), or "agn" (agn CLI)')
             .choices(['cursor', 'claude', 'agn'])
@@ -1359,6 +1971,10 @@ Headless runs:
   $ orch resume <slug>                                 # resume a paused/pausing run
   $ orch stop <slug>                                   # send SIGTERM to a running job
   $ orch logs <slug> [-f]                              # print (or follow) a run's log file
+
+Fan-out:
+  $ orch "implement the billing module" --fan-out --agent claude   # triage, decompose, run parallel workers, integrate
+  $ orch "implement X" --fan-out --max-workers 6 --max-concurrency 3
 `,
     )
     .action(async (task, options) => {
@@ -1366,6 +1982,44 @@ Headless runs:
         if (!prompt) {
             console.error('Error: task cannot be empty');
             process.exit(1);
+            return;
+        }
+
+        if (options.fanOut) {
+            const conflicts = ['ask', 'quick', 'dryRun']
+                .filter((key) => options[key])
+                .map((key) => `--${key === 'dryRun' ? 'dry-run' : key}`);
+            if (conflicts.length > 0) {
+                console.error(`Error: --fan-out cannot be combined with ${conflicts.join(', ')}`);
+                process.exit(1);
+                return;
+            }
+            if (process.env.ORCH_FANOUT_DEPTH) {
+                console.error('Error: --fan-out cannot be used inside a fan-out child (ORCH_FANOUT_DEPTH is already set)');
+                process.exit(1);
+                return;
+            }
+
+            const cwd = process.cwd();
+            const { slug } = allocateJob({
+                cwd,
+                prompt,
+                agent: options.agent,
+                maxRounds: options.maxRounds,
+                state: 'running',
+                pid: process.pid,
+                role: 'coordinator',
+            });
+            setJobSlug(slug);
+
+            await runFanoutPipeline(prompt, {
+                ...options,
+                cwd,
+                jobSlug: slug,
+                jobCwd: cwd,
+                maxWorkers: options.maxWorkers,
+                maxConcurrency: options.maxConcurrency ?? null,
+            });
             return;
         }
 

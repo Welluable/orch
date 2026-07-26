@@ -8,3 +8,5 @@ export { testCriticAgentArgs } from './test-critic.js';
 export { codeWriterAgentArgs } from './code-writer.js';
 export { testRunnerAgentArgs } from './test-runner.js';
 export { integratorAgentArgs } from './integrator.js';
+export { boundariesAgentArgs } from './boundaries.js';
+export { decomposerAgentArgs } from './decomposer.js';
