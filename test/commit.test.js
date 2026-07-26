@@ -4,7 +4,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { commitWorktree } from '../lib/commit.js';
+import {
+  commitWorktree,
+  collectWorktreeChanges,
+  printFilesChanged,
+} from '../lib/commit.js';
 
 /**
  * Fake `execFile` for argument-level unit tests. `handlers` maps a predicate
@@ -147,6 +151,113 @@ describe('commitWorktree (injected execFile, argument-level)', () => {
       message: 'orch: slug do the thing',
       execFile,
     }));
+  });
+});
+
+describe('collectWorktreeChanges / printFilesChanged (rollup)', () => {
+  const isCachedNameStatus = (args) =>
+    args.includes('diff') && args.includes('--cached') && args.includes('--name-status');
+  const isCachedShortstat = (args) =>
+    args.includes('diff') && args.includes('--cached') && args.includes('--shortstat');
+
+  it('clean tree: returns null and does not stage or diff', () => {
+    const { execFile, calls } = makeFakeExecFile([
+      { match: isStatus, stdout: '' },
+    ]);
+
+    const result = collectWorktreeChanges({
+      worktreePath: '/repo/root-slug',
+      execFile,
+    });
+
+    assert.equal(result, null);
+    assert.equal(calls.length, 1);
+    assert.ok(isStatus(calls[0].args));
+    assert.equal(calls.filter((c) => isAdd(c.args)).length, 0);
+    assert.equal(calls.filter((c) => isCachedNameStatus(c.args)).length, 0);
+  });
+
+  it('dirty tree: stages then reads cached name-status + shortstat vs HEAD', () => {
+    const { execFile, calls } = makeFakeExecFile([
+      { match: isStatus, stdout: '?? lib/file-tracker.js\n M lib/agent.js\n' },
+      { match: isAdd, stdout: '' },
+      {
+        match: isCachedNameStatus,
+        stdout: 'A\tlib/file-tracker.js\nM\tlib/agent.js\n',
+      },
+      {
+        match: isCachedShortstat,
+        stdout: ' 2 files changed, 40 insertions(+), 3 deletions(-)\n',
+      },
+    ]);
+
+    const result = collectWorktreeChanges({
+      worktreePath: '/repo/root-slug',
+      execFile,
+    });
+
+    assert.deepEqual(result, {
+      files: [
+        { status: 'A', path: 'lib/file-tracker.js' },
+        { status: 'M', path: 'lib/agent.js' },
+      ],
+      shortstat: '2 files changed, 40 insertions(+), 3 deletions(-)',
+    });
+
+    assert.deepEqual(calls[0].args, ['-C', '/repo/root-slug', 'status', '--porcelain']);
+    assert.deepEqual(calls[1].args, ['-C', '/repo/root-slug', 'add', '-A']);
+    assert.ok(isCachedNameStatus(calls[2].args));
+    assert.ok(calls[2].args.includes('HEAD'));
+    assert.ok(isCachedShortstat(calls[3].args));
+    assert.ok(calls[3].args.includes('HEAD'));
+  });
+
+  it('returns null when git fails (missing/stub worktree) instead of throwing', () => {
+    const { execFile } = makeFakeExecFile([
+      {
+        match: isStatus,
+        error: Object.assign(new Error('ENOENT'), { stderr: 'fatal: cannot change to ...' }),
+      },
+    ]);
+
+    assert.equal(
+      collectWorktreeChanges({ worktreePath: '/nonexistent/stub-worktree', execFile }),
+      null,
+    );
+  });
+
+  it('printFilesChanged is a no-op for null/empty changes', () => {
+    const logs = [];
+    const restoreLog = (line) => logs.push(line);
+    // Use a local spy rather than console mock so this stays unit-scoped.
+    printFilesChanged(null, { log: restoreLog });
+    printFilesChanged({ files: [], shortstat: '' }, { log: restoreLog });
+    assert.deepEqual(logs, []);
+  });
+
+  it('printFilesChanged emits the titled files changed block', () => {
+    const logs = [];
+    printFilesChanged(
+      {
+        files: [
+          { status: 'A', path: 'lib/file-tracker.js' },
+          { status: 'M', path: 'lib/agent.js' },
+        ],
+        shortstat: '2 files changed, 40 insertions(+), 3 deletions(-)',
+      },
+      { log: (line) => logs.push(line) },
+    );
+
+    assert.deepEqual(logs, [
+      '',
+      '───────────────',
+      ' files changed ',
+      '───────────────',
+      '  A  lib/file-tracker.js',
+      '  M  lib/agent.js',
+      '  2 files changed, 40 insertions(+), 3 deletions(-)',
+      '',
+    ]);
   });
 });
 

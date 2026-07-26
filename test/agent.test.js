@@ -6,7 +6,8 @@ import path from 'node:path';
 import { AgentCursor } from '../lib/agent-cursor.js';
 import { AgentClaude } from '../lib/agent-claude.js';
 import { AgentAgn } from '../lib/agent-agn.js';
-import { formatElapsed, maybePrintModelLine, modelPrintState } from '../lib/agent.js';
+import { Agent, formatElapsed, maybePrintModelLine, modelPrintState } from '../lib/agent.js';
+import { FileTracker } from '../lib/file-tracker.js';
 import { formatToolStatus } from '../lib/tool-status.js';
 import { parseTriageJson } from '../lib/parse-triage-json.js';
 import { parseVerdict } from '../lib/parse-verdict.js';
@@ -436,6 +437,220 @@ describe('AgentAgn', () => {
 
     assert.deepEqual(statuses, []);
     assert.equal(finish.mock.calls.length, 0);
+  });
+});
+
+describe('Agent file-change sticky lines', () => {
+  function spinningAgent(options = {}) {
+    const agent = new Agent('code-writer 1/5', 'instr', 'prompt', {
+      cwd: '/repo/root-slug',
+      ...options,
+    });
+    const spinnerCalls = [];
+    agent.spinner = {
+      isSpinning: true,
+      stop: () => spinnerCalls.push('stop'),
+      start: () => {
+        spinnerCalls.push('start');
+        agent.spinner.isSpinning = true;
+      },
+    };
+    return { agent, spinnerCalls };
+  }
+
+  it('records completed Write/Edit/Delete into fileTracker and sticky-prints on first path only', () => {
+    const tracker = new FileTracker({ cwd: '/repo/root-slug' });
+    const { agent, spinnerCalls } = spinningAgent({ fileTracker: tracker });
+    const logs = [];
+    const restore = mock.method(console, 'log', (msg) => logs.push(msg));
+
+    try {
+      agent.onToolEvent({
+        name: 'Write',
+        args: { path: 'lib/a.js' },
+        phase: 'started',
+        callId: 'w1',
+      });
+      agent.onToolEvent({
+        name: 'Write',
+        args: { path: 'lib/a.js' },
+        phase: 'completed',
+        callId: 'w1',
+      });
+      agent.onToolEvent({
+        name: 'Edit',
+        args: { path: 'lib/a.js' },
+        phase: 'started',
+        callId: 'e1',
+      });
+      agent.onToolEvent({
+        name: 'Edit',
+        args: { path: 'lib/a.js' },
+        phase: 'completed',
+        callId: 'e1',
+      });
+      agent.onToolEvent({
+        name: 'Delete',
+        args: { path: 'lib/b.js' },
+        phase: 'started',
+        callId: 'd1',
+      });
+      agent.onToolEvent({
+        name: 'Delete',
+        args: { path: 'lib/b.js' },
+        phase: 'completed',
+        callId: 'd1',
+      });
+    } finally {
+      restore.mock.restore();
+    }
+
+    assert.deepEqual(logs, ['  + lib/a.js', '  - lib/b.js']);
+    assert.deepEqual(spinnerCalls, ['stop', 'start', 'stop', 'start']);
+    assert.deepEqual(tracker.getFiles(), [
+      { marker: '~', path: 'lib/a.js' },
+      { marker: '-', path: 'lib/b.js' },
+    ]);
+  });
+
+  it('recalls path from activeTools before delete when completed args are empty', () => {
+    const tracker = new FileTracker({ cwd: '/repo/root-slug' });
+    const { agent } = spinningAgent({ fileTracker: tracker });
+    const logs = [];
+    const restore = mock.method(console, 'log', (msg) => logs.push(msg));
+
+    try {
+      agent.onToolEvent({
+        name: 'write',
+        args: { file_path: 'lib/agent.js' },
+        phase: 'started',
+        callId: 'toolu_2',
+      });
+      agent.onToolEvent({
+        name: '',
+        args: {},
+        phase: 'completed',
+        callId: 'toolu_2',
+      });
+    } finally {
+      restore.mock.restore();
+    }
+
+    assert.deepEqual(logs, ['  + lib/agent.js']);
+    assert.deepEqual(tracker.getFiles(), [{ marker: '+', path: 'lib/agent.js' }]);
+    assert.equal(agent.activeTools.has('toolu_2'), false);
+  });
+
+  it('invokes onFileChange only for the first live print per path', () => {
+    const seen = [];
+    const tracker = new FileTracker({ cwd: '/repo/root-slug' });
+    const { agent } = spinningAgent({
+      fileTracker: tracker,
+      onFileChange: (entry) => seen.push(entry),
+    });
+    const restore = mock.method(console, 'log', () => {});
+
+    try {
+      agent.onToolEvent({
+        name: 'Write',
+        args: { path: 'x.js' },
+        phase: 'started',
+        callId: '1',
+      });
+      agent.onToolEvent({
+        name: 'Write',
+        args: { path: 'x.js' },
+        phase: 'completed',
+        callId: '1',
+      });
+      agent.onToolEvent({
+        name: 'Edit',
+        args: { path: 'x.js' },
+        phase: 'started',
+        callId: '2',
+      });
+      agent.onToolEvent({
+        name: 'Edit',
+        args: { path: 'x.js' },
+        phase: 'completed',
+        callId: '2',
+      });
+    } finally {
+      restore.mock.restore();
+    }
+
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].path, 'x.js');
+    assert.equal(seen[0].marker, '+');
+    assert.deepEqual(tracker.getFiles(), [{ marker: '~', path: 'x.js' }]);
+  });
+
+  it('does not sticky-print Read/Shell and leaves getFiles empty without a tracker write', () => {
+    const tracker = new FileTracker({ cwd: '/repo/root-slug' });
+    const { agent, spinnerCalls } = spinningAgent({ fileTracker: tracker });
+    const logs = [];
+    const restore = mock.method(console, 'log', (msg) => logs.push(msg));
+
+    try {
+      agent.onToolEvent({
+        name: 'Read',
+        args: { path: 'a.js' },
+        phase: 'started',
+        callId: 'r',
+      });
+      agent.onToolEvent({
+        name: 'Read',
+        args: {},
+        phase: 'completed',
+        callId: 'r',
+      });
+      agent.onToolEvent({
+        name: 'Shell',
+        args: { command: 'npm test' },
+        phase: 'started',
+        callId: 's',
+      });
+      agent.onToolEvent({
+        name: 'Shell',
+        args: {},
+        phase: 'completed',
+        callId: 's',
+      });
+    } finally {
+      restore.mock.restore();
+    }
+
+    assert.deepEqual(logs, []);
+    assert.deepEqual(spinnerCalls, []);
+    assert.deepEqual(tracker.getFiles(), []);
+  });
+
+  it('without fileTracker or onFileChange, onToolEvent still updates activeTools only', () => {
+    const { agent, spinnerCalls } = spinningAgent();
+    const logs = [];
+    const restore = mock.method(console, 'log', (msg) => logs.push(msg));
+
+    try {
+      agent.onToolEvent({
+        name: 'Write',
+        args: { path: 'a.js' },
+        phase: 'started',
+        callId: 'w',
+      });
+      assert.equal(agent.activeTools.has('w'), true);
+      agent.onToolEvent({
+        name: 'Write',
+        args: { path: 'a.js' },
+        phase: 'completed',
+        callId: 'w',
+      });
+    } finally {
+      restore.mock.restore();
+    }
+
+    assert.deepEqual(logs, []);
+    assert.deepEqual(spinnerCalls, []);
+    assert.equal(agent.activeTools.has('w'), false);
   });
 });
 

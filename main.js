@@ -15,7 +15,8 @@ import { parseVerdict } from './lib/parse-verdict.js';
 import { splitStageSummary, printStageSummary } from './lib/stage-summary.js';
 import { createRunContext } from './lib/run-context.js';
 import { createWorktree } from './lib/worktree.js';
-import { commitWorktree } from './lib/commit.js';
+import { commitWorktree, collectWorktreeChanges, printFilesChanged } from './lib/commit.js';
+import { FileTracker } from './lib/file-tracker.js';
 import { generateSlug } from './lib/slug.js';
 import {
     jobPaths,
@@ -181,6 +182,7 @@ export async function runPipeline(prompt, options) {
     const createRunContextFn = options.createRunContext ?? createRunContext;
     const createWorktreeFn = options.createWorktree ?? createWorktree;
     const commitWorktreeFn = options.commitWorktree ?? commitWorktree;
+    const collectWorktreeChangesFn = options.collectWorktreeChanges ?? collectWorktreeChanges;
     const invocationCwd = process.cwd();
 
     const jobSlug = options.jobSlug ?? process.env.ORCH_JOB_SLUG;
@@ -371,17 +373,22 @@ export async function runPipeline(prompt, options) {
                 statusPath: runContext.statusPath,
                 criticFeedback,
             });
+            const testWriterTracker = new FileTracker({ cwd: worktree.worktreePath });
             const testWriter = new AgentClass(
                 roundLabel('test-writer', round, maxRounds),
                 testWriterArgs.instructions,
                 testWriterArgs.prompt,
-                testWriterArgs.options,
+                { ...testWriterArgs.options, fileTracker: testWriterTracker },
             );
 
             const testOut = await testWriter.run({ verbose });
             await jobCheckpoint();
             const { content: testWriterContent, summary: testWriterSummary } = splitStageSummary(testOut.result);
-            printStageSummary(roundLabel('test-writer', round, maxRounds), testWriterSummary);
+            printStageSummary(
+                roundLabel('test-writer', round, maxRounds),
+                testWriterSummary,
+                testWriterTracker.getFiles(),
+            );
             if (!testOut.ok) {
                 appendLoopStatus(runContext.statusPath, 'Test loop', {
                     round: testRound,
@@ -471,17 +478,22 @@ export async function runPipeline(prompt, options) {
                 acceptedVerification,
                 runnerFeedback,
             });
+            const codeWriterTracker = new FileTracker({ cwd: worktree.worktreePath });
             const codeWriter = new AgentClass(
                 roundLabel('code-writer', round, maxRounds),
                 codeWriterArgs.instructions,
                 codeWriterArgs.prompt,
-                codeWriterArgs.options,
+                { ...codeWriterArgs.options, fileTracker: codeWriterTracker },
             );
 
             const codeOut = await codeWriter.run({ verbose });
             await jobCheckpoint();
             const { content: codeWriterContent, summary: codeWriterSummary } = splitStageSummary(codeOut.result);
-            printStageSummary(roundLabel('code-writer', round, maxRounds), codeWriterSummary);
+            printStageSummary(
+                roundLabel('code-writer', round, maxRounds),
+                codeWriterSummary,
+                codeWriterTracker.getFiles(),
+            );
             if (!codeOut.ok) {
                 appendLoopStatus(runContext.statusPath, 'Code loop', {
                     round: codeRound,
@@ -544,6 +556,10 @@ export async function runPipeline(prompt, options) {
 
         jobPatch({ phase: 'commit', stage: 'commit', round: null });
         const message = `orch: ${runContext.slug} ${prompt.split('\n')[0]}`;
+        const worktreeChanges = collectWorktreeChangesFn({
+            worktreePath: worktree.worktreePath,
+        });
+        printFilesChanged(worktreeChanges);
         const commitResult = commitWorktreeFn({
             worktreePath: worktree.worktreePath,
             branch: worktree.branch,

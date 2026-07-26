@@ -52,7 +52,7 @@ describe('main.js CLI', () => {
   it('prints version for --version', async () => {
     const { code, stdout } = await runCli(['--version']);
     assert.equal(code, 0);
-    assert.equal(stdout.trim(), '1.0.0');
+    assert.equal(stdout.trim(), '1.1.0');
   });
 
   it('help output mentions --agent, --verbose, --dry-run, --max-rounds, --ask, and --quick', async () => {
@@ -230,6 +230,28 @@ function createMockAgentClass(behaviors, { order } = {}) {
 
     async run() {
       const role = agentRole(this.name);
+      // When main wires a fileTracker onto writers, simulate a completed Write so
+      // printStageSummary can exercise the Files (N) section end-to-end.
+      if (
+        this.options?.fileTracker
+        && typeof this.options.fileTracker.record === 'function'
+        && (role === 'test-writer' || role === 'code-writer')
+      ) {
+        const filePath = role === 'test-writer' ? 'test/example.test.js' : 'lib/example.js';
+        const callId = `${role}-sim`;
+        this.options.fileTracker.record({
+          name: 'Write',
+          args: { path: filePath },
+          phase: 'started',
+          callId,
+        });
+        this.options.fileTracker.record({
+          name: 'Write',
+          args: { path: filePath },
+          phase: 'completed',
+          callId,
+        });
+      }
       const behavior = behaviors[this.name] ?? behaviors[role];
       if (Array.isArray(behavior)) {
         if (!(role in queues)) {
@@ -1806,5 +1828,216 @@ describe('runPipeline per-stage summary output (<<<SUMMARY>>> paragraphs)', () =
     // Other stages, which still include the delimiter, keep printing normally.
     assert.match(joined, stageSummaryBlockRegex('triage', TRIAGE_SUMMARY));
     assert.match(joined, stageSummaryBlockRegex('test-writer 1/5', TEST_WRITER_SUMMARY));
+  });
+});
+
+describe('runPipeline file-change trails (writers + commit rollup)', () => {
+  function collectLogs() {
+    const logs = [];
+    const restore = mock.method(console, 'log', (...args) => logs.push(args.map(String).join(' ')));
+    return { logs, restore: () => restore.mock.restore() };
+  }
+
+  it('wires fileTracker only onto test-writer and code-writer constructions', async () => {
+    const invocationCwd = process.cwd();
+    const runContext = fakeRunContext(invocationCwd);
+    const worktree = fakeWorktree(invocationCwd);
+    const MockAgentClass = createMockAgentClass(complexPassBehaviors());
+
+    const logSpy = mock.method(console, 'log', () => {});
+    try {
+      await runPipeline('do something complex', {
+        agent: 'claude',
+        AgentClass: MockAgentClass,
+        createRunContext: mock.fn(() => runContext),
+        createWorktree: mock.fn(() => worktree),
+        commitWorktree: mock.fn(() => fakeCommitResult(worktree.branch)),
+        collectWorktreeChanges: mock.fn(() => null),
+      });
+    } finally {
+      logSpy.mock.restore();
+    }
+
+    const byRole = Object.fromEntries(
+      MockAgentClass.instances.map((i) => [agentRole(i.name), i]),
+    );
+
+    assert.ok(byRole['test-writer'].options?.fileTracker, 'test-writer should receive fileTracker');
+    assert.ok(byRole['code-writer'].options?.fileTracker, 'code-writer should receive fileTracker');
+
+    for (const role of ['triage', 'research', 'planner', 'test-critic', 'test-runner']) {
+      assert.equal(
+        byRole[role].options?.fileTracker,
+        undefined,
+        `${role} must not receive fileTracker`,
+      );
+      assert.equal(
+        byRole[role].options?.onFileChange,
+        undefined,
+        `${role} must not receive onFileChange`,
+      );
+    }
+  });
+
+  it('prints Files (N) under writer summaries and never under critic/runner summaries', async () => {
+    const invocationCwd = process.cwd();
+    const runContext = fakeRunContext(invocationCwd);
+    const worktree = fakeWorktree(invocationCwd);
+    const MockAgentClass = createMockAgentClass(complexPassBehaviors());
+
+    const { logs, restore } = collectLogs();
+    try {
+      await runPipeline('do something complex', {
+        agent: 'claude',
+        AgentClass: MockAgentClass,
+        createRunContext: mock.fn(() => runContext),
+        createWorktree: mock.fn(() => worktree),
+        commitWorktree: mock.fn(() => fakeCommitResult(worktree.branch)),
+        collectWorktreeChanges: mock.fn(() => null),
+      });
+    } finally {
+      restore();
+    }
+
+    const joined = logs.join('\n');
+    assert.match(joined, / test-writer 1\/5 [\s\S]*?Files \(1\)[\s\S]*?\+ test\/example\.test\.js/);
+    assert.match(joined, / code-writer 1\/5 [\s\S]*?Files \(1\)[\s\S]*?\+ lib\/example\.js/);
+
+    // Critic/runner blocks keep their prose bullet and must not grow a Files section.
+    assert.match(joined, stageSummaryBlockRegex('test-critic 1/5', TEST_CRITIC_SUMMARY));
+    assert.match(joined, stageSummaryBlockRegex('test-runner 1/5', TEST_RUNNER_SUMMARY));
+    assert.doesNotMatch(
+      joined,
+      / test-critic 1\/5 \n─+\n(?: {2}• .+\n)* {2}Files \(/,
+    );
+    assert.doesNotMatch(
+      joined,
+      / test-runner 1\/5 \n─+\n(?: {2}• .+\n)* {2}Files \(/,
+    );
+  });
+
+  it('prints the files changed rollup before the commit line when the tree is dirty', async () => {
+    const invocationCwd = process.cwd();
+    const runContext = fakeRunContext(invocationCwd);
+    const worktree = fakeWorktree(invocationCwd);
+    const MockAgentClass = createMockAgentClass(complexPassBehaviors());
+
+    const collectWorktreeChangesMock = mock.fn(() => ({
+      files: [
+        { status: 'A', path: 'lib/file-tracker.js' },
+        { status: 'M', path: 'lib/agent.js' },
+      ],
+      shortstat: '2 files changed, 40 insertions(+), 3 deletions(-)',
+    }));
+
+    const { logs, restore } = collectLogs();
+    try {
+      await runPipeline('do something complex', {
+        agent: 'claude',
+        AgentClass: MockAgentClass,
+        createRunContext: mock.fn(() => runContext),
+        createWorktree: mock.fn(() => worktree),
+        commitWorktree: mock.fn(() => fakeCommitResult(worktree.branch)),
+        collectWorktreeChanges: collectWorktreeChangesMock,
+      });
+    } finally {
+      restore();
+    }
+
+    assert.equal(collectWorktreeChangesMock.mock.calls.length, 1);
+    assert.equal(
+      collectWorktreeChangesMock.mock.calls[0].arguments[0].worktreePath,
+      worktree.worktreePath,
+    );
+
+    const joined = logs.join('\n');
+    assert.match(joined, / files changed /);
+    assert.match(joined, /A {2}lib\/file-tracker\.js/);
+    assert.match(joined, /M {2}lib\/agent\.js/);
+    assert.match(joined, /2 files changed, 40 insertions\(\+\), 3 deletions\(-\)/);
+    assert.match(joined, /commit: deadbee on /);
+
+    const rollupIdx = joined.indexOf(' files changed ');
+    const commitIdx = joined.indexOf('commit: deadbee');
+    assert.ok(rollupIdx >= 0 && commitIdx > rollupIdx, 'rollup must print before commit:');
+  });
+
+  it('skips the files changed rollup on a clean tree and keeps commit: no changes', async () => {
+    const tmpCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-rollup-clean-'));
+    try {
+      const runContext = fakeRunContext(tmpCwd);
+      fs.mkdirSync(runContext.artifactDir, { recursive: true });
+      const worktree = fakeWorktree(tmpCwd);
+      const MockAgentClass = createMockAgentClass(complexPassBehaviors());
+      const collectWorktreeChangesMock = mock.fn(() => null);
+
+      const { logs, restore } = collectLogs();
+      const exitSpy = mock.method(process, 'exit', () => {});
+      try {
+        await runPipeline('do something complex', {
+          agent: 'claude',
+          AgentClass: MockAgentClass,
+          createRunContext: mock.fn(() => runContext),
+          createWorktree: mock.fn(() => worktree),
+          commitWorktree: mock.fn(() => ({ committed: false, sha: null, branch: worktree.branch })),
+          collectWorktreeChanges: collectWorktreeChangesMock,
+        });
+      } finally {
+        restore();
+        exitSpy.mock.restore();
+      }
+
+      assert.equal(collectWorktreeChangesMock.mock.calls.length, 1);
+      const joined = logs.join('\n');
+      assert.doesNotMatch(joined, / files changed /);
+      assert.match(joined, new RegExp(`commit: no changes on ${escapeRegex(worktree.branch)}`));
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not wire fileTracker on ask or quick-fix paths', async () => {
+    const askMock = createMockAgentClass({
+      ask: { ok: true, result: withSummary('answer', ASK_SUMMARY) },
+    });
+    const quickMock = createMockAgentClass({
+      triage: SIMPLE_TRIAGE,
+      'quick-fix': { ok: true, result: withSummary('fixed', QUICK_FIX_SUMMARY) },
+    });
+
+    const logSpy = mock.method(console, 'log', () => {});
+    const errorSpy = mock.method(console, 'error', () => {});
+    const exitSpy = mock.method(process, 'exit', () => {});
+    try {
+      await runPipeline('where?', {
+        agent: 'claude',
+        ask: true,
+        AgentClass: askMock,
+        createRunContext: mock.fn(() => fakeRunContext(process.cwd())),
+        createWorktree: mock.fn(() => fakeWorktree(process.cwd())),
+        commitWorktree: mock.fn(),
+        collectWorktreeChanges: mock.fn(() => {
+          throw new Error('rollup must not run on ask');
+        }),
+      });
+      await runPipeline('fix typo', {
+        agent: 'claude',
+        AgentClass: quickMock,
+        createRunContext: mock.fn(() => fakeRunContext(process.cwd())),
+        createWorktree: mock.fn(() => fakeWorktree(process.cwd())),
+        commitWorktree: mock.fn(),
+        collectWorktreeChanges: mock.fn(() => {
+          throw new Error('rollup must not run on quick-fix');
+        }),
+      });
+    } finally {
+      logSpy.mock.restore();
+      errorSpy.mock.restore();
+      exitSpy.mock.restore();
+    }
+
+    for (const agent of [...askMock.instances, ...quickMock.instances]) {
+      assert.equal(agent.options?.fileTracker, undefined);
+    }
   });
 });

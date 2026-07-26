@@ -117,4 +117,81 @@ describe('printStageSummary', () => {
     assert.ok(logs.some((line) => line.includes('code-writer 2/5')));
     assert.ok(logs.some((line) => line.includes('• Implemented the checklist.')));
   });
+
+  it('appends a Files (N) section after prose bullets when files are provided', () => {
+    const logs = [];
+    const restore = mock.method(console, 'log', (...args) => logs.push(args.join(' ')));
+    try {
+      printStageSummary('code-writer 1/5', 'Implemented the checklist.', [
+        { marker: '~', path: 'lib/agent.js' },
+        { marker: '+', path: 'lib/file-tracker.js' },
+      ]);
+    } finally {
+      restore.mock.restore();
+    }
+    assert.deepEqual(logs, [
+      '',
+      '─────────────────',
+      ' code-writer 1/5 ',
+      '─────────────────',
+      '  • Implemented the checklist.',
+      '  Files (2)',
+      '    ~ lib/agent.js',
+      '    + lib/file-tracker.js',
+      '',
+    ]);
+  });
+
+  it('prints a titled Files-only block when prose is empty but files are nonempty', () => {
+    const logs = [];
+    const restore = mock.method(console, 'log', (...args) => logs.push(args.join(' ')));
+    try {
+      printStageSummary('test-writer 1/5', '', [
+        { marker: '+', path: 'test/file-tracker.test.js' },
+      ]);
+    } finally {
+      restore.mock.restore();
+    }
+    assert.deepEqual(logs, [
+      '',
+      '─────────────────',
+      ' test-writer 1/5 ',
+      '─────────────────',
+      '  Files (1)',
+      '    + test/file-tracker.test.js',
+      '',
+    ]);
+  });
+
+  it('prints prose without a Files section when files is omitted or empty', () => {
+    const logs = [];
+    const restore = mock.method(console, 'log', (...args) => logs.push(args.join(' ')));
+    try {
+      printStageSummary('triage', 'Routed to research.', []);
+    } finally {
+      restore.mock.restore();
+    }
+    assert.deepEqual(logs, [
+      '',
+      '────────',
+      ' triage ',
+      '────────',
+      '  • Routed to research.',
+      '',
+    ]);
+    assert.equal(logs.some((line) => /Files \(/.test(line)), false);
+  });
+
+  it('is a no-op when both summary and files are empty', () => {
+    const logs = [];
+    const restore = mock.method(console, 'log', (...args) => logs.push(args.join(' ')));
+    try {
+      printStageSummary('code-writer 1/5', '', []);
+      printStageSummary('code-writer 1/5', '', undefined);
+      printStageSummary('code-writer 1/5', '');
+    } finally {
+      restore.mock.restore();
+    }
+    assert.deepEqual(logs, []);
+  });
 });
