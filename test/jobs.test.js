@@ -1,4 +1,4 @@
-import { describe, it } from 'node:test';
+import { describe, it, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -18,6 +18,7 @@ import {
   stopJob,
   cleanJobs,
 } from '../lib/jobs.js';
+import { allocateJob } from '../lib/job-lifecycle.js';
 
 /**
  * Contract this file pins down for lib/jobs.js (net-new module, see
@@ -596,5 +597,150 @@ describe('cleanJobs', () => {
     const tmpCwd = makeTmpCwd();
     fs.mkdirSync(path.join(tmpCwd, '.orch'), { recursive: true });
     assert.deepEqual(cleanJobs(tmpCwd), []);
+  });
+});
+
+/**
+ * Contract this section pins down for the net-new shared job-allocation
+ * helper (`lib/job-lifecycle.js`, see task "make job records universal"):
+ *
+ * - `allocateJob({ cwd, prompt, agent, maxRounds, state, pid, generateSlug,
+ *   createRunContext, writeJob })` generates a slug (via the injectable
+ *   `generateSlug`, defaulting to `lib/slug.js`'s `generateSlug`), creates the
+ *   run directory via the injectable `createRunContext` (defaulting to
+ *   `lib/run-context.js`'s `createRunContext`, called as
+ *   `createRunContext({ cwd, slug })`), and writes an initial `run.json` via
+ *   the injectable `writeJob` (defaulting to this module's `writeJob`).
+ * - It returns `{ slug, runContext, record }`: the generated slug, the
+ *   `createRunContext` return value verbatim, and the exact record written to
+ *   `run.json`.
+ * - The written record always has `pauseRequested: false`, `branch: null`,
+ *   `worktree: null`, `phase: null`, `stage: null`, `round: null`,
+ *   `finishedAt: null`, `exitCode: null`, a fresh `startedAt`, and
+ *   `logPath: jobPaths(cwd, slug).logPath` — this is what lets `--ask`/
+ *   `--quick` records (which have no worktree/branch/rounds concept) degrade
+ *   gracefully: callers simply omit `maxRounds` (defaults to `null`) rather
+ *   than the helper needing ask/quick-specific branches.
+ * - `state` defaults to `"starting"` (the detached-parent case, where a
+ *   separate child process still has to start) but callers pass `"running"`
+ *   for foreground/non-detached invocations (ask, quick, and the plain
+ *   pipeline), since there is no separate process to wait on. `pid` defaults
+ *   to `null` (detached parent doesn't know the child pid yet) but foreground
+ *   callers pass `process.pid`.
+ * - This is the one implementation `runDetached` (main.js) and the
+ *   Commander action's non-detached branch both call — not two diverging
+ *   inline copies of the same eager-allocate-then-writeJob logic.
+ */
+describe('allocateJob (shared job-allocation helper, lib/job-lifecycle.js)', () => {
+  it('generates a slug, creates the run directory, and writes an initial run.json in the given state', () => {
+    const tmpCwd = makeTmpCwd();
+    const { slug, runContext, record } = allocateJob({
+      cwd: tmpCwd,
+      prompt: 'do something',
+      agent: 'claude',
+      maxRounds: 5,
+      state: 'starting',
+    });
+
+    assert.match(slug, /^[a-z]+-[a-z]+-[0-9a-f]{4}$/);
+    assert.equal(fs.existsSync(jobPaths(tmpCwd, slug).dir), true);
+    assert.equal(runContext.slug, slug);
+
+    const onDisk = readJob(tmpCwd, slug);
+    assert.deepEqual(onDisk, record);
+    assert.equal(onDisk.task, 'do something');
+    assert.equal(onDisk.agent, 'claude');
+    assert.equal(onDisk.maxRounds, 5);
+    assert.equal(onDisk.state, 'starting');
+    assert.equal(onDisk.pid, null);
+    assert.equal(onDisk.branch, null);
+    assert.equal(onDisk.worktree, null);
+    assert.equal(onDisk.phase, null);
+    assert.equal(onDisk.stage, null);
+    assert.equal(onDisk.round, null);
+    assert.equal(onDisk.finishedAt, null);
+    assert.equal(onDisk.exitCode, null);
+    assert.equal(onDisk.logPath, jobPaths(tmpCwd, slug).logPath);
+    assert.ok(onDisk.startedAt);
+  });
+
+  it('accepts state:"running" and an explicit pid — for foreground (non-detached) runs with no separate child to wait on', () => {
+    const tmpCwd = makeTmpCwd();
+    const { record } = allocateJob({
+      cwd: tmpCwd,
+      prompt: 'where is the CLI entrypoint?',
+      agent: 'claude',
+      state: 'running',
+      pid: process.pid,
+    });
+
+    assert.equal(record.state, 'running');
+    assert.equal(record.pid, process.pid);
+  });
+
+  it('defaults maxRounds to null for runs with no writer/critic loop concept (--ask / --quick)', () => {
+    const tmpCwd = makeTmpCwd();
+    const { record } = allocateJob({
+      cwd: tmpCwd,
+      prompt: 'fix the typo',
+      agent: 'claude',
+      state: 'running',
+      pid: process.pid,
+    });
+
+    assert.equal(record.maxRounds, null);
+    assert.equal(record.branch, null);
+    assert.equal(record.worktree, null);
+    assert.equal(record.phase, null);
+    assert.equal(record.stage, null);
+    assert.equal(record.round, null);
+  });
+
+  it('calls the injected generateSlug/createRunContext/writeJob (all overridable for tests)', () => {
+    const tmpCwd = makeTmpCwd();
+    const generateSlugMock = mock.fn(() => 'stub-stub-1234');
+    const createRunContextCalls = [];
+    const createRunContextMock = mock.fn((opts) => {
+      createRunContextCalls.push(opts);
+      return { slug: opts.slug, artifactDir: path.join(tmpCwd, '.orch', opts.slug) };
+    });
+    const writeJobCalls = [];
+    const writeJobMock = mock.fn((cwd, slug, record) => writeJobCalls.push({ cwd, slug, record }));
+
+    const { slug, runContext } = allocateJob({
+      cwd: tmpCwd,
+      prompt: 'p',
+      agent: 'claude',
+      state: 'starting',
+      generateSlug: generateSlugMock,
+      createRunContext: createRunContextMock,
+      writeJob: writeJobMock,
+    });
+
+    assert.equal(slug, 'stub-stub-1234');
+    assert.equal(generateSlugMock.mock.calls.length, 1);
+    assert.deepEqual(createRunContextCalls, [{ cwd: tmpCwd, slug: 'stub-stub-1234' }]);
+    assert.equal(writeJobCalls.length, 1);
+    assert.equal(writeJobCalls[0].cwd, tmpCwd);
+    assert.equal(writeJobCalls[0].slug, 'stub-stub-1234');
+    assert.equal(runContext.artifactDir, path.join(tmpCwd, '.orch', 'stub-stub-1234'));
+    // Real writeJob was never called — nothing landed on disk.
+    assert.equal(fs.existsSync(jobPaths(tmpCwd, 'stub-stub-1234').runJsonPath), false);
+  });
+
+  it('returns the createRunContext result verbatim as runContext', () => {
+    const tmpCwd = makeTmpCwd();
+    const { slug, runContext } = allocateJob({
+      cwd: tmpCwd,
+      prompt: 'p',
+      agent: 'claude',
+      state: 'starting',
+    });
+
+    assert.equal(runContext.slug, slug);
+    assert.equal(runContext.artifactDir, jobPaths(tmpCwd, slug).dir);
+    assert.equal(runContext.researchPath, path.join(runContext.artifactDir, 'research.md'));
+    assert.equal(runContext.taskPath, path.join(runContext.artifactDir, 'task.md'));
+    assert.equal(runContext.statusPath, path.join(runContext.artifactDir, 'status.md'));
   });
 });

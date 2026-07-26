@@ -10,6 +10,7 @@ import {
   shutdown,
   trackLiveChild,
   resetShutdownState,
+  setJobSlug,
 } from '../lib/agent.js';
 import { readJob, writeJob } from '../lib/jobs.js';
 
@@ -97,15 +98,26 @@ describe('shutdown reaps detached children', () => {
 });
 
 /**
- * Contract pinned down here (task.md section 3): when ORCH_JOB_SLUG names an
- * active job, shutdown() must synchronously patch that job's run.json to
- * `state: "stopped"`, `exitCode: exitCodeForSignal(signal)`, and
- * `finishedAt: <now>` — via lib/jobs.js's patchJob, so it stays lock-safe
- * against a concurrent `orch pause`/`resume`/`status` write — guarded by the
- * same `shuttingDown` idempotency latch, before/while children are reaped.
- * shutdown() accepts an injectable `jobCwd` (defaulting to `process.cwd()`,
- * matching how the real detached child's cwd equals the job's `.orch/<slug>`
- * root) so tests don't need to `process.chdir()`.
+ * Contract pinned down here (task.md section 3, extended by the "make job
+ * records universal" task): when a job is active, shutdown() must
+ * synchronously patch that job's run.json to `state: "stopped"`,
+ * `exitCode: exitCodeForSignal(signal)`, and `finishedAt: <now>` — via
+ * lib/jobs.js's patchJob, so it stays lock-safe against a concurrent
+ * `orch pause`/`resume`/`status` write — guarded by the same `shuttingDown`
+ * idempotency latch, before/while children are reaped. shutdown() accepts an
+ * injectable `jobCwd` (defaulting to `process.cwd()`, matching how the real
+ * detached child's cwd equals the job's `.orch/<slug>` root) so tests don't
+ * need to `process.chdir()`.
+ *
+ * "Active job" now resolves from two sources, because job records are no
+ * longer detached-only: `process.env.ORCH_JOB_SLUG` (set on the detached
+ * child's own env, a separate process from its parent) OR the in-process
+ * active slug set via the exported `setJobSlug(slug)` (set by main.js for a
+ * foreground/non-detached invocation, which never spawns a separate process
+ * to carry an env var). `process.env.ORCH_JOB_SLUG` takes precedence when
+ * both are set. `resetShutdownState()` clears the in-process slug back to
+ * unset, alongside its existing latch/child-set resets, so tests don't leak
+ * state into each other.
  */
 describe('shutdown persists job state when ORCH_JOB_SLUG is set', () => {
   function makeTmpCwd() {
@@ -220,7 +232,7 @@ describe('shutdown persists job state when ORCH_JOB_SLUG is set', () => {
     }
   });
 
-  it('does not touch any run.json when ORCH_JOB_SLUG is unset (foreground runs untouched)', async () => {
+  it('does not touch any run.json when no job is active — neither ORCH_JOB_SLUG nor the in-process slug is set', async () => {
     const tmpCwd = makeTmpCwd();
     try {
       delete process.env.ORCH_JOB_SLUG;
@@ -241,8 +253,102 @@ describe('shutdown persists job state when ORCH_JOB_SLUG is set', () => {
       });
 
       assert.equal(exitedWith, 143);
-      // No slug means no job to patch — the `.orch` dir shouldn't even exist.
+      // No active job means no job to patch — the `.orch` dir shouldn't even exist.
       assert.equal(existsSync(path.join(tmpCwd, '.orch')), false);
+
+      await waitFor(() => !pidAlive(child.pid));
+    } finally {
+      rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('persists job state via the in-process active slug when ORCH_JOB_SLUG is unset — this is what makes Ctrl+C during a foreground (non-detached) run also record "stopped"', async () => {
+    const tmpCwd = makeTmpCwd();
+    try {
+      delete process.env.ORCH_JOB_SLUG;
+      const record = baseRecord({ slug: 'shutdown-foreground-0000' });
+      writeJob(tmpCwd, record.slug, record);
+      setJobSlug(record.slug);
+
+      const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+        detached: true,
+        stdio: 'ignore',
+      });
+      child.unref();
+      trackLiveChild(child);
+
+      let exitedWith;
+      await new Promise((resolve) => {
+        shutdown('SIGINT', {
+          exit: (exitCode) => { exitedWith = exitCode; resolve(); },
+          jobCwd: tmpCwd,
+        });
+      });
+
+      assert.equal(exitedWith, 130);
+      const updated = readJob(tmpCwd, record.slug);
+      assert.equal(updated.state, 'stopped');
+      assert.equal(updated.exitCode, 130);
+      assert.ok(updated.finishedAt);
+
+      await waitFor(() => !pidAlive(child.pid));
+    } finally {
+      rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('prefers process.env.ORCH_JOB_SLUG over the in-process slug when both happen to be set', async () => {
+    const tmpCwd = makeTmpCwd();
+    try {
+      const envRecord = baseRecord({ slug: 'shutdown-env-wins-0000' });
+      const inProcessRecord = baseRecord({ slug: 'shutdown-inprocess-loses-0000' });
+      writeJob(tmpCwd, envRecord.slug, envRecord);
+      writeJob(tmpCwd, inProcessRecord.slug, inProcessRecord);
+      process.env.ORCH_JOB_SLUG = envRecord.slug;
+      setJobSlug(inProcessRecord.slug);
+
+      const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+        detached: true,
+        stdio: 'ignore',
+      });
+      child.unref();
+      trackLiveChild(child);
+
+      await new Promise((resolve) => {
+        shutdown('SIGTERM', { exit: () => resolve(), jobCwd: tmpCwd });
+      });
+
+      assert.equal(readJob(tmpCwd, envRecord.slug).state, 'stopped');
+      assert.equal(readJob(tmpCwd, inProcessRecord.slug).state, 'running');
+
+      await waitFor(() => !pidAlive(child.pid));
+    } finally {
+      rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('resetShutdownState() clears the in-process active slug, so a later shutdown() with no slug re-set touches nothing', async () => {
+    const tmpCwd = makeTmpCwd();
+    try {
+      delete process.env.ORCH_JOB_SLUG;
+      const record = baseRecord({ slug: 'shutdown-cleared-0000' });
+      writeJob(tmpCwd, record.slug, record);
+      setJobSlug(record.slug);
+
+      resetShutdownState();
+
+      const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+        detached: true,
+        stdio: 'ignore',
+      });
+      child.unref();
+      trackLiveChild(child);
+
+      await new Promise((resolve) => {
+        shutdown('SIGTERM', { exit: () => resolve(), jobCwd: tmpCwd });
+      });
+
+      assert.equal(readJob(tmpCwd, record.slug).state, 'running');
 
       await waitFor(() => !pidAlive(child.pid));
     } finally {
