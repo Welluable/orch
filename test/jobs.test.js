@@ -630,6 +630,13 @@ describe('cleanJobs', () => {
  * - This is the one implementation `runDetached` (main.js) and the
  *   Commander action's non-detached branch both call — not two diverging
  *   inline copies of the same eager-allocate-then-writeJob logic.
+ * - Fan-out phase 2 (see .spec/fanout-2-child-paths.md section 1 and
+ *   .spec/fanout.md's "Child job records") extends the accepted options with
+ *   optional `parent = null`, `role = null`, `workerId = null`, merged
+ *   verbatim into the written record as additive keys — every existing
+ *   caller (plain pipeline, `--ask`, `--quick`, `runDetached`) keeps omitting
+ *   them and gets `null` for all three, so a normal job's `run.json` still
+ *   reads as a normal (non-fan-out) job.
  */
 describe('allocateJob (shared job-allocation helper, lib/job-lifecycle.js)', () => {
   it('generates a slug, creates the run directory, and writes an initial run.json in the given state', () => {
@@ -742,5 +749,94 @@ describe('allocateJob (shared job-allocation helper, lib/job-lifecycle.js)', () 
     assert.equal(runContext.researchPath, path.join(runContext.artifactDir, 'research.md'));
     assert.equal(runContext.taskPath, path.join(runContext.artifactDir, 'task.md'));
     assert.equal(runContext.statusPath, path.join(runContext.artifactDir, 'status.md'));
+  });
+
+  it('defaults parent/role/workerId to null when omitted (existing non-fanout callers unaffected)', () => {
+    const tmpCwd = makeTmpCwd();
+    const { record } = allocateJob({
+      cwd: tmpCwd,
+      prompt: 'do something',
+      agent: 'claude',
+      state: 'running',
+      pid: process.pid,
+    });
+
+    assert.equal(record.parent, null);
+    assert.equal(record.role, null);
+    assert.equal(record.workerId, null);
+
+    const onDisk = readJob(tmpCwd, record.slug);
+    assert.equal(onDisk.parent, null);
+    assert.equal(onDisk.role, null);
+    assert.equal(onDisk.workerId, null);
+  });
+
+  it('round-trips parent/role/workerId into run.json when passed (worker job)', () => {
+    const tmpCwd = makeTmpCwd();
+    const { slug, record } = allocateJob({
+      cwd: tmpCwd,
+      prompt: 'implement invoice endpoints',
+      agent: 'claude',
+      state: 'running',
+      pid: process.pid,
+      parent: 'wise-pine-e904',
+      role: 'worker',
+      workerId: '02-invoices',
+    });
+
+    assert.equal(record.parent, 'wise-pine-e904');
+    assert.equal(record.role, 'worker');
+    assert.equal(record.workerId, '02-invoices');
+
+    const onDisk = readJob(tmpCwd, slug);
+    assert.equal(onDisk.parent, 'wise-pine-e904');
+    assert.equal(onDisk.role, 'worker');
+    assert.equal(onDisk.workerId, '02-invoices');
+  });
+
+  it('round-trips parent/role into run.json with workerId left null (integration job)', () => {
+    const tmpCwd = makeTmpCwd();
+    const { slug, record } = allocateJob({
+      cwd: tmpCwd,
+      prompt: 'integrate worker branches',
+      agent: 'claude',
+      state: 'running',
+      pid: process.pid,
+      parent: 'wise-pine-e904',
+      role: 'integration',
+    });
+
+    assert.equal(record.parent, 'wise-pine-e904');
+    assert.equal(record.role, 'integration');
+    assert.equal(record.workerId, null);
+
+    const onDisk = readJob(tmpCwd, slug);
+    assert.equal(onDisk.parent, 'wise-pine-e904');
+    assert.equal(onDisk.role, 'integration');
+    assert.equal(onDisk.workerId, null);
+  });
+
+  it('does not disturb any other default field when parent/role/workerId are passed', () => {
+    const tmpCwd = makeTmpCwd();
+    const { record } = allocateJob({
+      cwd: tmpCwd,
+      prompt: 'do something',
+      agent: 'claude',
+      maxRounds: 5,
+      state: 'starting',
+      parent: 'wise-pine-e904',
+      role: 'worker',
+      workerId: '01-scaffold',
+    });
+
+    assert.equal(record.pauseRequested, false);
+    assert.equal(record.branch, null);
+    assert.equal(record.worktree, null);
+    assert.equal(record.phase, null);
+    assert.equal(record.stage, null);
+    assert.equal(record.round, null);
+    assert.equal(record.finishedAt, null);
+    assert.equal(record.exitCode, null);
+    assert.equal(record.maxRounds, 5);
   });
 });

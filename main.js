@@ -40,6 +40,20 @@ import { testWriterAgentArgs } from './agents/test-writer.js';
 import { testCriticAgentArgs } from './agents/test-critic.js';
 import { codeWriterAgentArgs } from './agents/code-writer.js';
 import { testRunnerAgentArgs } from './agents/test-runner.js';
+import { integratorAgentArgs } from './agents/integrator.js';
+import {
+    readFanout,
+    patchWorker,
+    patchIntegration,
+    recordChangedFiles,
+    buildWorkerEnvelope,
+} from './lib/fanout.js';
+import {
+    mergeBranches,
+    abortMerge,
+    conflictedFiles,
+    hasConflictMarkers,
+} from './lib/integrate.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -168,6 +182,246 @@ function appendLoopStatus(statusPath, title, { round, maxRounds, passed, summary
 
 function roundLabel(role, round, maxRounds) {
     return `${role} ${round}/${maxRounds}`;
+}
+
+function defaultExecFile(command, args, options = {}) {
+    return execFileSync(command, args, { encoding: 'utf8', ...options });
+}
+
+/** The test-writer ⇄ test-critic loop shared by `runPipeline` and `runWorkerPipeline`. */
+async function runTestLoop({
+    prompt,
+    worktreePath,
+    branch,
+    taskPath,
+    statusPath,
+    maxRounds,
+    AgentClass,
+    verbose,
+    jobPatch,
+    jobCheckpoint,
+}) {
+    let testAccepted = null;
+    let criticFeedback = null;
+    let testRound = 0;
+    let testSummary = '';
+
+    for (let round = 1; round <= maxRounds; round++) {
+        testRound = round;
+
+        jobPatch({ phase: 'test-loop', stage: 'test-writer', round });
+        const testWriterArgs = testWriterAgentArgs({
+            prompt,
+            cwd: worktreePath,
+            worktreePath,
+            branch,
+            taskPath,
+            statusPath,
+            criticFeedback,
+        });
+        const testWriterTracker = new FileTracker({ cwd: worktreePath });
+        const testWriter = new AgentClass(
+            roundLabel('test-writer', round, maxRounds),
+            testWriterArgs.instructions,
+            testWriterArgs.prompt,
+            { ...testWriterArgs.options, fileTracker: testWriterTracker },
+        );
+
+        const testOut = await testWriter.run({ verbose });
+        await jobCheckpoint();
+        const { content: testWriterContent, summary: testWriterSummary } = splitStageSummary(testOut.result);
+        printStageSummary(
+            roundLabel('test-writer', round, maxRounds),
+            testWriterSummary,
+            testWriterTracker.getFiles(),
+        );
+        if (!testOut.ok) {
+            appendLoopStatus(statusPath, 'Test loop', {
+                round: testRound,
+                maxRounds,
+                passed: false,
+                summary: 'test-writer failed',
+            });
+            throw new Error('test-writer failed; stopping before code-writer');
+        }
+
+        jobPatch({ phase: 'test-loop', stage: 'test-critic', round });
+        const testCriticArgs = testCriticAgentArgs({
+            prompt,
+            cwd: worktreePath,
+            worktreePath,
+            branch,
+            taskPath,
+            statusPath,
+            testWriterOutput: testWriterContent,
+        });
+        const testCritic = new AgentClass(
+            roundLabel('test-critic', round, maxRounds),
+            testCriticArgs.instructions,
+            testCriticArgs.prompt,
+            testCriticArgs.options,
+        );
+
+        const criticOut = await testCritic.run({ verbose });
+        await jobCheckpoint();
+        const { content: testCriticContent, summary: testCriticSummary } = splitStageSummary(criticOut.result);
+        printStageSummary(roundLabel('test-critic', round, maxRounds), testCriticSummary);
+        if (!criticOut.ok) {
+            appendLoopStatus(statusPath, 'Test loop', {
+                round: testRound,
+                maxRounds,
+                passed: false,
+                summary: 'test-critic failed',
+            });
+            throw new Error('test-critic failed; stopping before code-writer');
+        }
+
+        const verdict = parseVerdict(testCriticContent);
+        testSummary = verdict.summary;
+        if (verdict.passed) {
+            testAccepted = { writerContent: testWriterContent, criticOut, verdict, round };
+            break;
+        }
+        criticFeedback = formatVerdictFeedback(verdict, testCriticContent);
+    }
+
+    appendLoopStatus(statusPath, 'Test loop', {
+        round: testAccepted?.round ?? testRound,
+        maxRounds,
+        passed: Boolean(testAccepted),
+        summary: testAccepted?.verdict.summary ?? testSummary,
+    });
+
+    if (!testAccepted) {
+        throw new Error(`test loop exhausted after ${maxRounds} rounds`);
+    }
+
+    return testAccepted;
+}
+
+/**
+ * The code-writer ⇄ test-runner loop shared by `runPipeline`, `runWorkerPipeline`, and
+ * `runIntegratePipeline`. `runnerFirst` (used by `--integrate`'s verify loop) skips
+ * `code-writer` on round 1 only; if that lone `test-runner` attempt fails, rounds 2+
+ * alternate `code-writer` → `test-runner` exactly like the default writer-first shape.
+ */
+async function runCodeLoop({
+    prompt,
+    worktreePath,
+    branch,
+    taskPath,
+    statusPath,
+    maxRounds,
+    AgentClass,
+    verbose,
+    jobPatch,
+    jobCheckpoint,
+    acceptedVerification,
+    runnerFirst = false,
+    loopTitle = 'Code loop',
+}) {
+    let codeAccepted = null;
+    let runnerFeedback = null;
+    let codeRound = 0;
+    let codeSummary = '';
+    let codeWriterContent = null;
+
+    for (let round = 1; round <= maxRounds; round++) {
+        codeRound = round;
+        const skipWriter = runnerFirst && round === 1;
+
+        if (!skipWriter) {
+            jobPatch({ phase: 'code-loop', stage: 'code-writer', round });
+            const codeWriterArgs = codeWriterAgentArgs({
+                prompt,
+                cwd: worktreePath,
+                worktreePath,
+                branch,
+                taskPath,
+                statusPath,
+                round,
+                acceptedVerification,
+                runnerFeedback,
+            });
+            const codeWriterTracker = new FileTracker({ cwd: worktreePath });
+            const codeWriter = new AgentClass(
+                roundLabel('code-writer', round, maxRounds),
+                codeWriterArgs.instructions,
+                codeWriterArgs.prompt,
+                { ...codeWriterArgs.options, fileTracker: codeWriterTracker },
+            );
+
+            const codeOut = await codeWriter.run({ verbose });
+            await jobCheckpoint();
+            const { content, summary } = splitStageSummary(codeOut.result);
+            codeWriterContent = content;
+            printStageSummary(
+                roundLabel('code-writer', round, maxRounds),
+                summary,
+                codeWriterTracker.getFiles(),
+            );
+            if (!codeOut.ok) {
+                appendLoopStatus(statusPath, loopTitle, {
+                    round: codeRound,
+                    maxRounds,
+                    passed: false,
+                    summary: 'code-writer failed',
+                });
+                throw new Error('code-writer failed; stopping before commit');
+            }
+        }
+
+        jobPatch({ phase: 'code-loop', stage: 'test-runner', round });
+        const testRunnerArgs = testRunnerAgentArgs({
+            prompt,
+            cwd: worktreePath,
+            worktreePath,
+            branch,
+            statusPath,
+            codeWriterOutput: codeWriterContent,
+        });
+        const testRunner = new AgentClass(
+            roundLabel('test-runner', round, maxRounds),
+            testRunnerArgs.instructions,
+            testRunnerArgs.prompt,
+            testRunnerArgs.options,
+        );
+
+        const runnerOut = await testRunner.run({ verbose });
+        await jobCheckpoint();
+        const { content: testRunnerContent, summary: testRunnerSummary } = splitStageSummary(runnerOut.result);
+        printStageSummary(roundLabel('test-runner', round, maxRounds), testRunnerSummary);
+        if (!runnerOut.ok) {
+            appendLoopStatus(statusPath, loopTitle, {
+                round: codeRound,
+                maxRounds,
+                passed: false,
+                summary: 'test-runner failed',
+            });
+            throw new Error('test-runner failed; stopping before commit');
+        }
+
+        const verdict = parseVerdict(testRunnerContent);
+        codeSummary = verdict.summary;
+        if (verdict.passed) {
+            codeAccepted = { writerContent: codeWriterContent, verdict, round };
+            break;
+        }
+        runnerFeedback = formatVerdictFeedback(verdict, testRunnerContent);
+    }
+
+    appendLoopStatus(statusPath, loopTitle, {
+        round: codeAccepted?.round ?? codeRound,
+        maxRounds,
+        passed: Boolean(codeAccepted),
+        summary: codeAccepted?.verdict.summary ?? codeSummary,
+    });
+
+    if (!codeAccepted) {
+        throw new Error(`code loop exhausted after ${maxRounds} rounds`);
+    }
+
+    return codeAccepted;
 }
 
 export async function runPipeline(prompt, options) {
@@ -367,107 +621,20 @@ export async function runPipeline(prompt, options) {
         );
 
         // --- test loop: test-writer ⇄ test-critic ---
-        let testAccepted = null;
-        let criticFeedback = null;
-        let testRound = 0;
-        let testSummary = '';
-
-        for (let round = 1; round <= maxRounds; round++) {
-            testRound = round;
-
-            jobPatch({ phase: 'test-loop', stage: 'test-writer', round });
-            const testWriterArgs = testWriterAgentArgs({
-                prompt,
-                cwd: worktree.worktreePath,
-                worktreePath: worktree.worktreePath,
-                branch: worktree.branch,
-                taskPath: runContext.taskPath,
-                statusPath: runContext.statusPath,
-                criticFeedback,
-            });
-            const testWriterTracker = new FileTracker({ cwd: worktree.worktreePath });
-            const testWriter = new AgentClass(
-                roundLabel('test-writer', round, maxRounds),
-                testWriterArgs.instructions,
-                testWriterArgs.prompt,
-                { ...testWriterArgs.options, fileTracker: testWriterTracker },
-            );
-
-            const testOut = await testWriter.run({ verbose });
-            await jobCheckpoint();
-            const { content: testWriterContent, summary: testWriterSummary } = splitStageSummary(testOut.result);
-            printStageSummary(
-                roundLabel('test-writer', round, maxRounds),
-                testWriterSummary,
-                testWriterTracker.getFiles(),
-            );
-            if (!testOut.ok) {
-                appendLoopStatus(runContext.statusPath, 'Test loop', {
-                    round: testRound,
-                    maxRounds,
-                    passed: false,
-                    summary: 'test-writer failed',
-                });
-                throw new Error('test-writer failed; stopping before code-writer');
-            }
-
-            jobPatch({ phase: 'test-loop', stage: 'test-critic', round });
-            const testCriticArgs = testCriticAgentArgs({
-                prompt,
-                cwd: worktree.worktreePath,
-                worktreePath: worktree.worktreePath,
-                branch: worktree.branch,
-                taskPath: runContext.taskPath,
-                statusPath: runContext.statusPath,
-                testWriterOutput: testWriterContent,
-            });
-            const testCritic = new AgentClass(
-                roundLabel('test-critic', round, maxRounds),
-                testCriticArgs.instructions,
-                testCriticArgs.prompt,
-                testCriticArgs.options,
-            );
-
-            const criticOut = await testCritic.run({ verbose });
-            await jobCheckpoint();
-            const { content: testCriticContent, summary: testCriticSummary } = splitStageSummary(criticOut.result);
-            printStageSummary(roundLabel('test-critic', round, maxRounds), testCriticSummary);
-            if (!criticOut.ok) {
-                appendLoopStatus(runContext.statusPath, 'Test loop', {
-                    round: testRound,
-                    maxRounds,
-                    passed: false,
-                    summary: 'test-critic failed',
-                });
-                throw new Error('test-critic failed; stopping before code-writer');
-            }
-
-            const verdict = parseVerdict(testCriticContent);
-            testSummary = verdict.summary;
-            if (verdict.passed) {
-                testAccepted = { writerContent: testWriterContent, criticOut, verdict, round };
-                break;
-            }
-            criticFeedback = formatVerdictFeedback(verdict, testCriticContent);
-        }
-
-        appendLoopStatus(runContext.statusPath, 'Test loop', {
-            round: testAccepted?.round ?? testRound,
+        const testAccepted = await runTestLoop({
+            prompt,
+            worktreePath: worktree.worktreePath,
+            branch: worktree.branch,
+            taskPath: runContext.taskPath,
+            statusPath: runContext.statusPath,
             maxRounds,
-            passed: Boolean(testAccepted),
-            summary: testAccepted?.verdict.summary ?? testSummary,
+            AgentClass,
+            verbose,
+            jobPatch,
+            jobCheckpoint,
         });
 
-        if (!testAccepted) {
-            throw new Error(`test loop exhausted after ${maxRounds} rounds`);
-        }
-
         // --- code loop: code-writer ⇄ test-runner ---
-        let codeAccepted = null;
-        let runnerFeedback = null;
-        let codeRound = 0;
-        let codeSummary = '';
-
         const acceptedVerification = [
             testAccepted.verdict.summary,
             testAccepted.writerContent,
@@ -475,96 +642,19 @@ export async function runPipeline(prompt, options) {
             .filter(Boolean)
             .join('\n');
 
-        for (let round = 1; round <= maxRounds; round++) {
-            codeRound = round;
-
-            jobPatch({ phase: 'code-loop', stage: 'code-writer', round });
-            const codeWriterArgs = codeWriterAgentArgs({
-                prompt,
-                cwd: worktree.worktreePath,
-                worktreePath: worktree.worktreePath,
-                branch: worktree.branch,
-                taskPath: runContext.taskPath,
-                statusPath: runContext.statusPath,
-                round,
-                acceptedVerification,
-                runnerFeedback,
-            });
-            const codeWriterTracker = new FileTracker({ cwd: worktree.worktreePath });
-            const codeWriter = new AgentClass(
-                roundLabel('code-writer', round, maxRounds),
-                codeWriterArgs.instructions,
-                codeWriterArgs.prompt,
-                { ...codeWriterArgs.options, fileTracker: codeWriterTracker },
-            );
-
-            const codeOut = await codeWriter.run({ verbose });
-            await jobCheckpoint();
-            const { content: codeWriterContent, summary: codeWriterSummary } = splitStageSummary(codeOut.result);
-            printStageSummary(
-                roundLabel('code-writer', round, maxRounds),
-                codeWriterSummary,
-                codeWriterTracker.getFiles(),
-            );
-            if (!codeOut.ok) {
-                appendLoopStatus(runContext.statusPath, 'Code loop', {
-                    round: codeRound,
-                    maxRounds,
-                    passed: false,
-                    summary: 'code-writer failed',
-                });
-                throw new Error('code-writer failed; stopping before commit');
-            }
-
-            jobPatch({ phase: 'code-loop', stage: 'test-runner', round });
-            const testRunnerArgs = testRunnerAgentArgs({
-                prompt,
-                cwd: worktree.worktreePath,
-                worktreePath: worktree.worktreePath,
-                branch: worktree.branch,
-                statusPath: runContext.statusPath,
-                codeWriterOutput: codeWriterContent,
-            });
-            const testRunner = new AgentClass(
-                roundLabel('test-runner', round, maxRounds),
-                testRunnerArgs.instructions,
-                testRunnerArgs.prompt,
-                testRunnerArgs.options,
-            );
-
-            const runnerOut = await testRunner.run({ verbose });
-            await jobCheckpoint();
-            const { content: testRunnerContent, summary: testRunnerSummary } = splitStageSummary(runnerOut.result);
-            printStageSummary(roundLabel('test-runner', round, maxRounds), testRunnerSummary);
-            if (!runnerOut.ok) {
-                appendLoopStatus(runContext.statusPath, 'Code loop', {
-                    round: codeRound,
-                    maxRounds,
-                    passed: false,
-                    summary: 'test-runner failed',
-                });
-                throw new Error('test-runner failed; stopping before commit');
-            }
-
-            const verdict = parseVerdict(testRunnerContent);
-            codeSummary = verdict.summary;
-            if (verdict.passed) {
-                codeAccepted = { writerContent: codeWriterContent, verdict, round };
-                break;
-            }
-            runnerFeedback = formatVerdictFeedback(verdict, testRunnerContent);
-        }
-
-        appendLoopStatus(runContext.statusPath, 'Code loop', {
-            round: codeAccepted?.round ?? codeRound,
+        await runCodeLoop({
+            prompt,
+            worktreePath: worktree.worktreePath,
+            branch: worktree.branch,
+            taskPath: runContext.taskPath,
+            statusPath: runContext.statusPath,
             maxRounds,
-            passed: Boolean(codeAccepted),
-            summary: codeAccepted?.verdict.summary ?? codeSummary,
+            AgentClass,
+            verbose,
+            jobPatch,
+            jobCheckpoint,
+            acceptedVerification,
         });
-
-        if (!codeAccepted) {
-            throw new Error(`code loop exhausted after ${maxRounds} rounds`);
-        }
 
         jobPatch({ phase: 'commit', stage: 'commit', round: null });
         const message = `orch: ${runContext.slug} ${prompt.split('\n')[0]}`;
@@ -669,6 +759,561 @@ export async function runDetached(prompt, options = {}) {
     exit(0);
 }
 
+/**
+ * The `--worker <parent>:<workerId>` driver: skips triage and runs research → planner →
+ * worktree (from the fan-out's recorded `base`) → test loop → code loop (writer-first) →
+ * commit, exactly like `runPipeline` minus triage. `prompt` is the worker's subtask text
+ * with the envelope already appended by the CLI wiring. On success, patches the parent's
+ * `fanout.json.workers[]` entry to `state:'done'` with `sha`/`changedFiles`; on failure,
+ * patches it (and this job's own `run.json`) to `state:'failed'` before exiting non-zero.
+ */
+export async function runWorkerPipeline(prompt, options = {}) {
+    const verbose = Boolean(options.verbose);
+    const maxRounds = options.maxRounds ?? 5;
+    const backend = AGENT_BACKENDS[options.agent];
+    if (!backend) {
+        throw new Error(`Unknown agent backend: ${options.agent}`);
+    }
+    const AgentClass = options.AgentClass ?? backend.AgentClass;
+    const cwd = options.cwd ?? process.cwd();
+    const { parentSlug, workerId, base } = options;
+
+    const createRunContextFn = options.createRunContext ?? createRunContext;
+    const createWorktreeFn = options.createWorktree ?? createWorktree;
+    const commitWorktreeFn = options.commitWorktree ?? commitWorktree;
+    const collectWorktreeChangesFn = options.collectWorktreeChanges ?? collectWorktreeChanges;
+    const patchWorkerFn = options.patchWorker ?? patchWorker;
+    const recordChangedFilesFn = options.recordChangedFiles ?? recordChangedFiles;
+    const execFileFn = options.execFile;
+
+    const jobSlug = options.jobSlug ?? process.env.ORCH_JOB_SLUG;
+    const jobCwd = options.jobCwd ?? cwd;
+    const patchJobFn = options.patchJob ?? patchJob;
+    const checkpointPauseFn = options.checkpointPause ?? checkpointPause;
+    const pausePollIntervalMs = options.pausePollIntervalMs ?? 500;
+
+    const jobPatch = (fields) => {
+        if (!jobSlug) return;
+        patchJobFn(jobCwd, jobSlug, fields);
+    };
+    const jobCheckpoint = async () => {
+        if (!jobSlug) return;
+        await checkpointPauseFn(jobCwd, jobSlug, { pollIntervalMs: pausePollIntervalMs });
+    };
+
+    if (!options.AgentClass) {
+        ensureBinaryOnPath(backend.binary, options.agent);
+    }
+
+    try {
+        const runContext = createRunContextFn(jobSlug ? { cwd, slug: jobSlug } : { cwd });
+
+        jobPatch({ phase: 'research', stage: 'research', round: null });
+        const research = researchAgentArgs({ prompt, cwd, researchPath: runContext.researchPath });
+        const researchAgent = new AgentClass(
+            research.name,
+            research.instructions,
+            research.prompt,
+            research.options,
+        );
+        const researchResult = await researchAgent.run({ verbose });
+        await jobCheckpoint();
+        const { content: researchContent, summary: researchSummary } = splitStageSummary(researchResult.result);
+        printStageSummary('research', researchSummary);
+
+        jobPatch({ phase: 'plan', stage: 'planner', round: null });
+        const planner = plannerAgentArgs({
+            prompt,
+            cwd,
+            researchPath: runContext.researchPath,
+            taskPath: runContext.taskPath,
+            researchOutput: researchContent,
+        });
+        const plannerAgent = new AgentClass(
+            planner.name,
+            planner.instructions,
+            planner.prompt,
+            planner.options,
+        );
+        const plannerResult = await plannerAgent.run({ verbose });
+        await jobCheckpoint();
+        const { summary: plannerSummary } = splitStageSummary(plannerResult.result);
+        printStageSummary('planner', plannerSummary);
+
+        jobPatch({ phase: 'worktree', stage: 'worktree', round: null });
+        const worktree = createWorktreeFn({ cwd, slug: runContext.slug, base });
+        jobPatch({ branch: worktree.branch, worktree: worktree.worktreePath });
+
+        fs.mkdirSync(path.dirname(runContext.statusPath), { recursive: true });
+        fs.writeFileSync(
+            runContext.statusPath,
+            `# Status\n\n- Slug: \`${runContext.slug}\`\n- Branch: \`${worktree.branch}\`\n- Worktree: \`${worktree.worktreePath}\`\n- Parent: \`${parentSlug}\`\n- Worker: \`${workerId}\`\n`,
+        );
+
+        const testAccepted = await runTestLoop({
+            prompt,
+            worktreePath: worktree.worktreePath,
+            branch: worktree.branch,
+            taskPath: runContext.taskPath,
+            statusPath: runContext.statusPath,
+            maxRounds,
+            AgentClass,
+            verbose,
+            jobPatch,
+            jobCheckpoint,
+        });
+
+        const acceptedVerification = [testAccepted.verdict.summary, testAccepted.writerContent]
+            .filter(Boolean)
+            .join('\n');
+
+        await runCodeLoop({
+            prompt,
+            worktreePath: worktree.worktreePath,
+            branch: worktree.branch,
+            taskPath: runContext.taskPath,
+            statusPath: runContext.statusPath,
+            maxRounds,
+            AgentClass,
+            verbose,
+            jobPatch,
+            jobCheckpoint,
+            acceptedVerification,
+        });
+
+        jobPatch({ phase: 'commit', stage: 'commit', round: null });
+        const message = `orch: ${runContext.slug} ${prompt.split('\n')[0]}`;
+        const worktreeChanges = collectWorktreeChangesFn({ worktreePath: worktree.worktreePath });
+        printFilesChanged(worktreeChanges);
+        const commitResult = commitWorktreeFn({
+            worktreePath: worktree.worktreePath,
+            branch: worktree.branch,
+            message,
+        });
+
+        if (commitResult.committed) {
+            fs.appendFileSync(
+                runContext.statusPath,
+                `\n## Commit\n\n- SHA: \`${commitResult.sha}\`\n- Branch: \`${commitResult.branch}\`\n`,
+            );
+            console.log(`commit: ${commitResult.sha.slice(0, 7)} on ${commitResult.branch}`);
+        } else {
+            fs.appendFileSync(
+                runContext.statusPath,
+                `\n## Commit\n\n- No changes to commit on \`${commitResult.branch}\`.\n`,
+            );
+            console.log(`commit: no changes on ${commitResult.branch}`);
+        }
+
+        let changedFiles = [];
+        try {
+            changedFiles = recordChangedFilesFn({
+                repoRoot: worktree.repoRoot,
+                base,
+                branch: worktree.branch,
+                execFile: execFileFn,
+            });
+        } catch {
+            // Best-effort: changedFiles is informational only, never masks a successful commit.
+        }
+
+        patchWorkerFn(cwd, parentSlug, workerId, {
+            state: 'done',
+            sha: commitResult.sha,
+            changedFiles,
+        });
+        jobPatch({ state: 'done', exitCode: 0, finishedAt: new Date().toISOString() });
+    } catch (err) {
+        console.error(`Error: ${err.message}`);
+        try {
+            patchWorkerFn(cwd, parentSlug, workerId, { state: 'failed' });
+        } catch {
+            // Best-effort: don't let a fanout-state write failure mask the real error.
+        }
+        if (jobSlug) {
+            try {
+                patchJobFn(jobCwd, jobSlug, {
+                    state: 'failed',
+                    exitCode: 1,
+                    finishedAt: new Date().toISOString(),
+                });
+            } catch {
+                // Best-effort: don't let a job-state write failure mask the real error.
+            }
+        }
+        process.exit(1);
+    }
+}
+
+/**
+ * The `--integrate <parent>` driver: reuses (or creates) the integration worktree keyed
+ * by the parent slug, merges `fanout.integration.candidates` in order (repairing conflicts
+ * via the `integrator` agent, one conflict at a time), then runs a runner-first verify
+ * loop and commits on green. Never invokes triage/research/planner/test-writer/test-critic.
+ * Appends every step to `.orch/<job-slug>/integration.md` as it happens.
+ */
+export async function runIntegratePipeline(options = {}) {
+    const verbose = Boolean(options.verbose);
+    const maxRounds = options.maxRounds ?? 5;
+    const backend = AGENT_BACKENDS[options.agent];
+    if (!backend) {
+        throw new Error(`Unknown agent backend: ${options.agent}`);
+    }
+    const AgentClass = options.AgentClass ?? backend.AgentClass;
+    const cwd = options.cwd ?? process.cwd();
+    const { parentSlug } = options;
+
+    const createWorktreeFn = options.createWorktree ?? createWorktree;
+    const commitWorktreeFn = options.commitWorktree ?? commitWorktree;
+    const readFanoutFn = options.readFanout ?? readFanout;
+    const patchIntegrationFn = options.patchIntegration ?? patchIntegration;
+    const mergeBranchesFn = options.mergeBranches ?? mergeBranches;
+    const abortMergeFn = options.abortMerge ?? abortMerge;
+    const conflictedFilesFn = options.conflictedFiles ?? conflictedFiles;
+    const hasConflictMarkersFn = options.hasConflictMarkers ?? hasConflictMarkers;
+    const execFileFn = options.execFile ?? defaultExecFile;
+
+    const jobSlug = options.jobSlug ?? process.env.ORCH_JOB_SLUG;
+    const jobCwd = options.jobCwd ?? cwd;
+    const patchJobFn = options.patchJob ?? patchJob;
+    const checkpointPauseFn = options.checkpointPause ?? checkpointPause;
+    const pausePollIntervalMs = options.pausePollIntervalMs ?? 500;
+
+    const jobPatch = (fields) => {
+        if (!jobSlug) return;
+        patchJobFn(jobCwd, jobSlug, fields);
+    };
+    const jobCheckpoint = async () => {
+        if (!jobSlug) return;
+        await checkpointPauseFn(jobCwd, jobSlug, { pollIntervalMs: pausePollIntervalMs });
+    };
+
+    if (!options.AgentClass) {
+        ensureBinaryOnPath(backend.binary, options.agent);
+    }
+
+    const fanout = readFanoutFn(cwd, parentSlug);
+    if (!fanout) {
+        console.error(`Error: unknown parent ${parentSlug} (no fanout.json found)`);
+        process.exit(1);
+        return;
+    }
+
+    const integrationSlug = jobSlug ?? parentSlug;
+    const integrationDir = path.join(jobCwd, '.orch', integrationSlug);
+    const integrationMdPath = path.join(integrationDir, 'integration.md');
+    const logIntegration = (line) => {
+        fs.mkdirSync(integrationDir, { recursive: true });
+        fs.appendFileSync(integrationMdPath, `${line}\n`);
+    };
+
+    let merged = [...fanout.integration.merged];
+    let skipped = [...(fanout.integration.skipped ?? [])];
+
+    try {
+        fs.mkdirSync(integrationDir, { recursive: true });
+        fs.appendFileSync(integrationMdPath, `# Integration: ${parentSlug}\n\n`);
+
+        jobPatch({ phase: 'worktree', stage: 'worktree', round: null });
+
+        const reuseWorktreePath = `${cwd}-${parentSlug}`;
+        const expectedBranch = `orch/${parentSlug}`;
+        let worktree = null;
+
+        if (fs.existsSync(reuseWorktreePath)) {
+            const currentBranch = execFileFn('git', ['-C', reuseWorktreePath, 'rev-parse', '--abbrev-ref', 'HEAD']).trim();
+            if (currentBranch === expectedBranch) {
+                worktree = { repoRoot: cwd, worktreePath: reuseWorktreePath, branch: expectedBranch };
+            }
+        }
+
+        const reused = Boolean(worktree);
+        if (!worktree) {
+            worktree = createWorktreeFn({ cwd, slug: parentSlug, base: fanout.base });
+        }
+
+        logIntegration(
+            reused
+                ? `- Reused existing worktree at \`${worktree.worktreePath}\` on \`${worktree.branch}\`.`
+                : `- Created worktree at \`${worktree.worktreePath}\` on \`${worktree.branch}\`.`,
+        );
+
+        jobPatch({ branch: worktree.branch, worktree: worktree.worktreePath });
+        patchIntegrationFn(cwd, parentSlug, (current) => ({
+            worktree: current.worktree ?? worktree.worktreePath,
+            branch: current.branch ?? worktree.branch,
+        }));
+
+        let remaining = fanout.integration.candidates.filter(
+            (branch) => !merged.includes(branch) && !skipped.includes(branch),
+        );
+
+        while (remaining.length > 0) {
+            const results = mergeBranchesFn({
+                cwd: worktree.worktreePath,
+                candidates: remaining,
+                merged,
+                overlappingFiles: fanout.integration.overlappingFiles,
+                execFile: execFileFn,
+            });
+
+            for (const result of results) {
+                if (result.status === 'skipped') continue;
+
+                if (result.status === 'merged') {
+                    merged.push(result.branch);
+                    patchIntegrationFn(cwd, parentSlug, (current) => ({
+                        merged: [...current.merged, result.branch],
+                    }));
+                    logIntegration(`- Merged \`${result.branch}\` cleanly.`);
+                    continue;
+                }
+
+                // status === 'conflict'
+                logIntegration(`- Conflict merging \`${result.branch}\`; entering repair.`);
+                patchIntegrationFn(cwd, parentSlug, { state: 'repairing' });
+
+                const conflicted = conflictedFilesFn({ cwd: worktree.worktreePath, execFile: execFileFn });
+                const involvedWorkers = fanout.workers
+                    .filter((worker) => worker.branch === result.branch)
+                    .map(({ id, title, subtask, area }) => ({ id, title, subtask, area }));
+
+                jobPatch({ phase: 'integrate', stage: 'integrator', round: null });
+                const integratorArgs = integratorAgentArgs({
+                    prompt: `Resolve the merge conflict from combining \`${result.branch}\` into the integration branch for "${fanout.task}".`,
+                    cwd: worktree.worktreePath,
+                    conflictedFiles: conflicted,
+                    mergeOutput: result.output,
+                    involvedWorkers,
+                });
+                const integratorAgent = new AgentClass(
+                    'integrator',
+                    integratorArgs.instructions,
+                    integratorArgs.prompt,
+                    integratorArgs.options,
+                );
+
+                let integratorOk = false;
+                try {
+                    const integratorOut = await integratorAgent.run({ verbose });
+                    await jobCheckpoint();
+                    const { summary: integratorSummary } = splitStageSummary(integratorOut.result);
+                    printStageSummary('integrator', integratorSummary);
+                    integratorOk = Boolean(integratorOut.ok);
+                } catch (err) {
+                    logIntegration(`- Integrator agent errored: ${err.message}`);
+                    integratorOk = false;
+                }
+
+                const stillConflicted = integratorOk
+                    ? hasConflictMarkersFn({ cwd: worktree.worktreePath, execFile: execFileFn })
+                    : true;
+
+                if (!stillConflicted) {
+                    execFileFn('git', ['-C', worktree.worktreePath, 'commit']);
+                    merged.push(result.branch);
+                    patchIntegrationFn(cwd, parentSlug, (current) => ({
+                        merged: [...current.merged, result.branch],
+                    }));
+                    logIntegration(`- Integrator resolved conflicts in \`${result.branch}\`; merge completed.`);
+                } else {
+                    abortMergeFn({ cwd: worktree.worktreePath, execFile: execFileFn });
+                    skipped.push(result.branch);
+                    patchIntegrationFn(cwd, parentSlug, (current) => ({
+                        skipped: [...(current.skipped ?? []), result.branch],
+                    }));
+                    logIntegration(`- Conflicts in \`${result.branch}\` remained unresolved; aborted merge and skipped.`);
+                }
+            }
+
+            remaining = remaining.slice(results.length);
+        }
+
+        // --- runner-first verify loop: test-runner first, code-writer only on failure ---
+        await runCodeLoop({
+            prompt: fanout.task,
+            worktreePath: worktree.worktreePath,
+            branch: worktree.branch,
+            taskPath: path.join(integrationDir, 'task.md'),
+            statusPath: integrationMdPath,
+            maxRounds,
+            AgentClass,
+            verbose,
+            jobPatch,
+            jobCheckpoint,
+            acceptedVerification: '',
+            runnerFirst: true,
+            loopTitle: 'Verify loop',
+        });
+
+        jobPatch({ phase: 'commit', stage: 'commit', round: null });
+        const message = `orch: ${parentSlug} ${fanout.task.split('\n')[0]}`;
+        const commitResult = commitWorktreeFn({
+            worktreePath: worktree.worktreePath,
+            branch: `orch/${parentSlug}`,
+            message,
+        });
+
+        logIntegration(
+            commitResult.committed
+                ? `- Committed \`${commitResult.sha}\` on \`${commitResult.branch}\`.`
+                : `- No changes to commit on \`${commitResult.branch}\`.`,
+        );
+
+        patchIntegrationFn(cwd, parentSlug, {
+            state: 'done',
+            sha: commitResult.sha,
+            merged,
+            skipped,
+        });
+        jobPatch({ state: 'done', exitCode: 0, finishedAt: new Date().toISOString() });
+    } catch (err) {
+        console.error(`Error: ${err.message}`);
+        try {
+            logIntegration(`- Error: ${err.message}`);
+        } catch {
+            // Best-effort: don't let a log write failure mask the real error.
+        }
+        try {
+            patchIntegrationFn(cwd, parentSlug, { state: 'failed', merged, skipped });
+        } catch {
+            // Best-effort: don't let a fanout-state write failure mask the real error.
+        }
+        if (jobSlug) {
+            try {
+                patchJobFn(jobCwd, jobSlug, {
+                    state: 'failed',
+                    exitCode: 1,
+                    finishedAt: new Date().toISOString(),
+                });
+            } catch {
+                // Best-effort: don't let a job-state write failure mask the real error.
+            }
+        }
+        process.exit(1);
+    }
+}
+
+/** Splits `--worker`'s `<parent-slug>:<worker-id>` value on the first colon. */
+function splitParentWorker(value) {
+    const idx = value.indexOf(':');
+    if (idx === -1) return { parentSlug: null, workerId: null };
+    return { parentSlug: value.slice(0, idx), workerId: value.slice(idx + 1) };
+}
+
+/** CLI glue for `--worker`: resolves the parent fan-out/worker record, builds the worker
+ * envelope, allocates (or reuses) the job record, then calls `runWorkerPipeline`. */
+async function runWorkerFromCli(options) {
+    const cwd = process.cwd();
+    const { parentSlug, workerId } = splitParentWorker(options.worker);
+    if (!parentSlug || !workerId) {
+        console.error(`Error: --worker must be in the form <parent-slug>:<worker-id>, got "${options.worker}"`);
+        process.exit(1);
+        return;
+    }
+
+    // ORCH_FANOUT_DEPTH guards against a future --fan-out spawning nested fan-outs.
+    process.env.ORCH_FANOUT_DEPTH = '1';
+
+    const fanout = readFanout(cwd, parentSlug);
+    if (!fanout) {
+        console.error(`Error: unknown parent ${parentSlug} (no fanout.json found)`);
+        process.exit(1);
+        return;
+    }
+
+    const worker = fanout.workers.find((w) => w.id === workerId);
+    if (!worker) {
+        console.error(`Error: unknown worker ${workerId} in ${parentSlug}`);
+        process.exit(1);
+        return;
+    }
+
+    const siblingTitles = fanout.workers
+        .filter((w) => w.id !== workerId)
+        .map((w) => w.title)
+        .filter(Boolean);
+    const envelope = buildWorkerEnvelope({
+        subtask: worker.subtask,
+        area: worker.area,
+        scaffold: worker.scaffold,
+        siblingTitles,
+    });
+    const workerPrompt = `${worker.subtask}\n\n${envelope}`;
+
+    let jobSlug = process.env.ORCH_JOB_SLUG;
+    if (!jobSlug) {
+        const alloc = allocateJob({
+            cwd,
+            prompt: workerPrompt,
+            agent: options.agent,
+            maxRounds: options.maxRounds,
+            state: 'running',
+            pid: process.pid,
+            parent: parentSlug,
+            role: 'worker',
+            workerId,
+        });
+        jobSlug = alloc.slug;
+    }
+    setJobSlug(jobSlug);
+
+    await runWorkerPipeline(workerPrompt, {
+        agent: options.agent,
+        maxRounds: options.maxRounds,
+        verbose: options.verbose,
+        cwd,
+        parentSlug,
+        workerId,
+        base: fanout.base,
+        jobSlug,
+        jobCwd: cwd,
+    });
+}
+
+/** CLI glue for `--integrate`: resolves the parent fan-out, allocates (or reuses) the
+ * integration job record, then calls `runIntegratePipeline`. */
+async function runIntegrateFromCli(options) {
+    const cwd = process.cwd();
+    const parentSlug = options.integrate;
+
+    // ORCH_FANOUT_DEPTH guards against a future --fan-out spawning nested fan-outs.
+    process.env.ORCH_FANOUT_DEPTH = '1';
+
+    const fanout = readFanout(cwd, parentSlug);
+    if (!fanout) {
+        console.error(`Error: unknown parent ${parentSlug} (no fanout.json found)`);
+        process.exit(1);
+        return;
+    }
+
+    let jobSlug = process.env.ORCH_JOB_SLUG;
+    if (!jobSlug) {
+        const alloc = allocateJob({
+            cwd,
+            prompt: fanout.task,
+            agent: options.agent,
+            maxRounds: options.maxRounds,
+            state: 'running',
+            pid: process.pid,
+            parent: parentSlug,
+            role: 'integration',
+        });
+        jobSlug = alloc.slug;
+    }
+    setJobSlug(jobSlug);
+
+    await runIntegratePipeline({
+        agent: options.agent,
+        maxRounds: options.maxRounds,
+        verbose: options.verbose,
+        cwd,
+        parentSlug,
+        jobSlug,
+        jobCwd: cwd,
+    });
+}
+
 const program = new Command();
 
 program
@@ -693,6 +1338,8 @@ program
             .choices(['cursor', 'claude', 'agn'])
             .default('cursor'),
     )
+    .addOption(new Option('--worker <value>', 'internal: run a single fan-out worker "<parent-slug>:<worker-id>"').hideHelp())
+    .addOption(new Option('--integrate <value>', 'internal: (re)run fan-out integration for "<parent-slug>"').hideHelp())
     .addHelpText(
         'after',
         `
@@ -719,6 +1366,25 @@ Headless runs:
         if (!prompt) {
             console.error('Error: task cannot be empty');
             process.exit(1);
+            return;
+        }
+
+        if (options.worker || options.integrate) {
+            const flagName = options.worker ? '--worker' : '--integrate';
+            const conflicts = ['ask', 'quick', 'detach', 'dryRun']
+                .filter((key) => options[key])
+                .map((key) => `--${key === 'dryRun' ? 'dry-run' : key}`);
+            if (conflicts.length > 0) {
+                console.error(`Error: ${flagName} cannot be combined with ${conflicts.join(', ')}`);
+                process.exit(1);
+                return;
+            }
+
+            if (options.worker) {
+                await runWorkerFromCli(options);
+            } else {
+                await runIntegrateFromCli(options);
+            }
             return;
         }
 
