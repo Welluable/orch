@@ -18,7 +18,7 @@ import { createWorktree } from './lib/worktree.js';
 import { commitWorktree, collectWorktreeChanges, printFilesChanged } from './lib/commit.js';
 import { FileTracker } from './lib/file-tracker.js';
 import { allocateJob } from './lib/job-lifecycle.js';
-import { setJobSlug, exitCodeForSignal } from './lib/agent.js';
+import { setJobSlug, exitCodeForSignal, formatElapsed } from './lib/agent.js';
 import {
     jobPaths,
     readJob,
@@ -126,14 +126,24 @@ function formatRelativeTime(iso) {
     return `${Math.floor(hr / 24)}d ago`;
 }
 
+function jobDuration(job) {
+    if (!job.startedAt) return '-';
+    const start = new Date(job.startedAt).getTime();
+    if (Number.isNaN(start)) return '-';
+    const end = job.finishedAt ? new Date(job.finishedAt).getTime() : Date.now();
+    if (Number.isNaN(end)) return '-';
+    return formatElapsed(Math.max(0, end - start));
+}
+
 function formatJobsTable(jobs) {
-    const header = ['SLUG', 'STATE', 'PHASE', 'AGENT', 'STARTED', 'PID'];
+    const header = ['SLUG', 'STATE', 'PHASE', 'AGENT', 'STARTED', 'DURATION', 'PID'];
     const rows = jobs.map((job) => [
         job.slug,
         job.state,
         job.phase ?? '-',
         job.agent ?? '-',
         formatRelativeTime(job.startedAt),
+        jobDuration(job),
         TERMINAL_JOB_STATES.includes(job.state) ? '-' : (job.pid ?? '-'),
     ]);
     const widths = header.map((h, i) => Math.max(h.length, ...rows.map((row) => String(row[i]).length)));

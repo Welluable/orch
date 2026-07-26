@@ -257,7 +257,7 @@ progresses. Manage it with the subcommands below, all scoped to the current
 directory's `.orch/`:
 
 ```bash
-orch list                     # SLUG  STATE  PHASE  AGENT  STARTED  PID
+orch list                     # SLUG  STATE  PHASE  AGENT  STARTED  DURATION  PID
 orch status swift-lagoon-49ea # full record: state, phase, branch, worktree, exit code, ...
 orch pause swift-lagoon-49ea  # request a pause at the next stage-boundary checkpoint
 orch resume swift-lagoon-49ea # resume a paused/pausing run

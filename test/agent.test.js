@@ -41,6 +41,11 @@ describe('formatElapsed', () => {
   it('formats minutes and seconds', () => {
     assert.equal(formatElapsed(182000), '3m 2s');
   });
+
+  it('formats hours and minutes', () => {
+    assert.equal(formatElapsed(4560000), '1h 16m');
+    assert.equal(formatElapsed(3600000), '1h 0m');
+  });
 });
 
 describe('parseTriageJson', () => {
