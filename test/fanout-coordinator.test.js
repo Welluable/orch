@@ -1421,6 +1421,22 @@ describe('runFanoutPipeline — interrupt wiring (composes with lib/agent.js shu
         exitMock.mock.calls.some((c) => c.arguments[0] === exitCodeForSignal('SIGTERM')),
         'expected the coordinator to eventually exit with exitCodeForSignal("SIGTERM") (143) after the interrupt',
       );
+
+      // lastOutcome capture (task.md section 1, the 4th of the 4 named
+      // terminal-write call sites — "stopped" specifically): the same
+      // shutdown()-driven `state:"stopped"` write that already carries
+      // exitCode/finishedAt must also carry a fresh `lastOutcome`, mirroring
+      // the record's own live fields at that terminal moment.
+      const stoppedRecord = readJob(cwd, jobSlug);
+      assert.equal(stoppedRecord.state, 'stopped');
+      assert.ok(stoppedRecord.lastOutcome, 'expected a lastOutcome object on the stopped record');
+      assert.equal(stoppedRecord.lastOutcome.state, 'stopped');
+      assert.equal(stoppedRecord.lastOutcome.exitCode, stoppedRecord.exitCode);
+      assert.equal(stoppedRecord.lastOutcome.finishedAt, stoppedRecord.finishedAt);
+      assert.equal(stoppedRecord.lastOutcome.task, 'do two independent things');
+      assert.equal(stoppedRecord.lastOutcome.phase, stoppedRecord.phase);
+      assert.equal(stoppedRecord.lastOutcome.stage, stoppedRecord.stage);
+      assert.equal(stoppedRecord.lastOutcome.round, stoppedRecord.round);
     } finally {
       logSpy.mock.restore();
       for (const sig of Object.keys(preexisting)) {
@@ -1431,5 +1447,115 @@ describe('runFanoutPipeline — interrupt wiring (composes with lib/agent.js shu
         if (pidAlive(child.pid)) process.kill(child.pid, 'SIGKILL');
       }
     }
+  });
+});
+
+/**
+ * Contract this section pins down for `lastOutcome` capture on the fan-out
+ * coordinator driver itself — the 4th of the 4 terminal-write call sites
+ * named in `.orch/sunny-oasis-a761/task.md` section 1 (`runPipeline`/
+ * `runWorkerPipeline` covered in test/main.test.js and
+ * test/fanout-children.test.js, `runIntegratePipeline` covered in
+ * test/fanout-children.test.js, "stopped" covered above in the interrupt-
+ * wiring test). The coordinator's own `run.json.lastOutcome` is independent
+ * of any child worker's/integration session's `run.json`. Unlike
+ * `runPipeline`/`runWorkerPipeline`/`runIntegratePipeline` (which each run
+ * a code loop in-process and so have an unambiguous `codeAccepted.verdict.
+ * summary` to source `lastOutcome.summary` from), the coordinator's own
+ * process never runs a code loop itself in the fan-out (non-decline) path —
+ * workers and integration run in spawned children with their own separate
+ * `run.json`s — so this suite only pins down that `summary` is present as a
+ * best-effort string (per the same "fall back to '' if nothing captured"
+ * rule every other lastOutcome write follows), not its exact text.
+ */
+describe('runFanoutPipeline lastOutcome capture on terminal states', () => {
+  it('writes lastOutcome.state:"done" with a best-effort summary string when every worker + integration succeed', async () => {
+    const cwd = makeTmpCwd('orch-fanout-lastoutcome-done-');
+    const jobSlug = 'wise-pine-e904';
+    seedCoordinatorJob(cwd, jobSlug);
+    const { execFile } = makeFakeExecFile([
+      { match: (args) => args.includes('rev-parse') && args.includes('HEAD'), stdout: 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678\n' },
+    ]);
+
+    const workers = [
+      { id: 'a', title: 'a', subtask: 'do a', area: 'src/a/', owns: ['src/a/'], dependsOn: [], scaffold: false },
+      { id: 'b', title: 'b', subtask: 'do b', area: 'src/b/', owns: ['src/b/'], dependsOn: [], scaffold: false },
+    ];
+    const MockAgentClass = createMockAgentClass({ triage: TRIAGE_COMPLEX, boundaries: BOUNDARIES_OK, decomposer: decomposeReply(workers) });
+    const { spawnFn } = fakeChildSpawn({ cwd, parentSlug: jobSlug, outcomes: { a: 'done', b: 'done' }, integrationOutcome: 'done', delayMs: 10 });
+    const exitMock = mock.fn();
+
+    const logSpy = mock.method(console, 'log', () => {});
+    try {
+      await runFanoutPipeline('do two independent things', {
+        agent: 'claude',
+        AgentClass: MockAgentClass,
+        cwd,
+        jobSlug,
+        jobCwd: cwd,
+        maxWorkers: 4,
+        pollIntervalMs: 5,
+        execFile,
+        spawn: spawnFn,
+        allocateJob: makeDeterministicAllocateJob(),
+        exit: exitMock,
+      });
+    } finally {
+      logSpy.mock.restore();
+    }
+
+    assert.deepEqual(exitMock.mock.calls.map((c) => c.arguments[0]), [0]);
+    const record = readJob(cwd, jobSlug);
+    assert.equal(record.state, 'done');
+    assert.ok(record.lastOutcome, 'expected a lastOutcome object on the terminal record');
+    assert.equal(record.lastOutcome.state, 'done');
+    assert.equal(record.lastOutcome.exitCode, 0);
+    assert.equal(record.lastOutcome.finishedAt, record.finishedAt);
+    assert.equal(record.lastOutcome.task, 'do two independent things');
+    assert.equal(record.lastOutcome.phase, record.phase);
+    assert.equal(record.lastOutcome.stage, record.stage);
+    assert.equal(record.lastOutcome.round, record.round);
+    assert.equal(typeof record.lastOutcome.summary, 'string');
+    assert.ok(record.lastOutcome.error == null, 'error should be omitted/null on a clean done');
+  });
+
+  it('writes lastOutcome.state:"failed" with the thrown error message when a stage throws (triage agent errors)', async () => {
+    const cwd = makeTmpCwd('orch-fanout-lastoutcome-failed-');
+    const jobSlug = 'wise-pine-e904';
+    seedCoordinatorJob(cwd, jobSlug);
+
+    class ThrowingTriageAgent {
+      constructor(name) { this.name = name; }
+      async run() { throw new Error('triage agent exploded'); }
+    }
+    const exitMock = mock.fn();
+
+    const logSpy = mock.method(console, 'log', () => {});
+    const errorSpy = mock.method(console, 'error', () => {});
+    try {
+      await runFanoutPipeline('do two independent things', {
+        agent: 'claude',
+        AgentClass: ThrowingTriageAgent,
+        cwd,
+        jobSlug,
+        jobCwd: cwd,
+        exit: exitMock,
+      });
+    } finally {
+      logSpy.mock.restore();
+      errorSpy.mock.restore();
+    }
+
+    assert.deepEqual(exitMock.mock.calls.map((c) => c.arguments[0]), [1]);
+    const record = readJob(cwd, jobSlug);
+    assert.equal(record.state, 'failed');
+    assert.ok(record.lastOutcome, 'expected a lastOutcome object on the terminal record');
+    assert.equal(record.lastOutcome.state, 'failed');
+    assert.equal(record.lastOutcome.exitCode, 1);
+    assert.equal(record.lastOutcome.task, 'do two independent things');
+    assert.equal(record.lastOutcome.phase, record.phase);
+    assert.equal(record.lastOutcome.stage, record.stage);
+    assert.equal(typeof record.lastOutcome.error, 'string');
+    assert.match(record.lastOutcome.error, /triage agent exploded/);
   });
 });

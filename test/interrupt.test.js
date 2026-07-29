@@ -198,6 +198,60 @@ describe('shutdown persists job state when ORCH_JOB_SLUG is set', () => {
     }
   });
 
+  /**
+   * lastOutcome capture on shutdown()'s "stopped" write (task.md section 1's
+   * "stopped" state — this is the actual production call site for a plain,
+   * non-fan-out `orch run`/`orch --worker` job's Ctrl+C/SIGTERM/SIGHUP
+   * handling; the coordinator has its own separate "stopped" write, covered
+   * in test/fanout-coordinator.test.js). Because shutdown() patches via
+   * `patchJob`'s current-record-aware form, `lastOutcome.phase`/`stage`/
+   * `round`/`task` should mirror whatever the job's own live fields already
+   * were the moment shutdown() ran — here, `baseRecord()`'s
+   * phase:"code-loop"/stage:"code-writer"/round:1. No caught error or loop
+   * summary are available at signal time, so `summary` falls back to `''`
+   * and `error` stays null/omitted — same best-effort rule as
+   * `reconcileJob`'s crashed lastOutcome (test/jobs.test.js).
+   */
+  it('also writes a lastOutcome object on the "stopped" write, mirroring the record\'s live phase/stage/round/task', async () => {
+    const tmpCwd = makeTmpCwd();
+    try {
+      const record = baseRecord({ slug: 'shutdown-lastoutcome-0000' });
+      writeJob(tmpCwd, record.slug, record);
+      process.env.ORCH_JOB_SLUG = record.slug;
+
+      const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+        detached: true,
+        stdio: 'ignore',
+      });
+      child.unref();
+      trackLiveChild(child);
+
+      await new Promise((resolve) => {
+        shutdown('SIGINT', {
+          exit: () => resolve(),
+          jobCwd: tmpCwd,
+        });
+      });
+
+      const updated = readJob(tmpCwd, record.slug);
+      assert.equal(updated.state, 'stopped');
+      assert.ok(updated.lastOutcome, 'expected a lastOutcome object on the stopped record');
+      assert.equal(updated.lastOutcome.state, 'stopped');
+      assert.equal(updated.lastOutcome.exitCode, updated.exitCode);
+      assert.equal(updated.lastOutcome.finishedAt, updated.finishedAt);
+      assert.equal(updated.lastOutcome.task, record.task);
+      assert.equal(updated.lastOutcome.phase, record.phase);
+      assert.equal(updated.lastOutcome.stage, record.stage);
+      assert.equal(updated.lastOutcome.round, record.round);
+      assert.equal(updated.lastOutcome.summary, '');
+      assert.ok(updated.lastOutcome.error == null, 'error should be omitted/null — no caught error at shutdown time');
+
+      await waitFor(() => !pidAlive(child.pid));
+    } finally {
+      rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
   it('overwrites a "paused" job to "stopped" on shutdown (stop while paused wakes no stage, just records stopped)', async () => {
     const tmpCwd = makeTmpCwd();
     try {

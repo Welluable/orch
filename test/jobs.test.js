@@ -247,6 +247,40 @@ describe('reconcileJob', () => {
       assert.equal(onDisk.exitCode, null);
       assert.ok(onDisk.finishedAt);
     });
+
+    /**
+     * lastOutcome capture on the `crashed` transition (task.md section 1's
+     * "stopped/crashed" states, the one lastOutcome-bearing terminal write
+     * that does not live inside runPipeline/runWorkerPipeline/
+     * runIntegratePipeline/the coordinator driver themselves — `crashed` is
+     * only ever detected here, out-of-band, by reconcileJob discovering a
+     * dead pid on a live state). No caught error and no captured stage
+     * summary are available at detection time, so `error` stays null/omitted
+     * and `summary` falls back to `''` per the same best-effort rule as
+     * every other lastOutcome write.
+     */
+    it(`rewrites a dead-pid ${state} job's lastOutcome to mirror the crashed rewrite`, async () => {
+      const tmpCwd = makeTmpCwd();
+      const pid = await deadPid();
+      const record = baseRecord({ slug: `dead-lastoutcome-${state}-0000`, state, pid });
+      writeJob(tmpCwd, record.slug, record);
+
+      const result = reconcileJob(tmpCwd, record.slug, record);
+
+      assert.ok(result.lastOutcome, 'expected a lastOutcome object on the crashed rewrite');
+      assert.equal(result.lastOutcome.state, 'crashed');
+      assert.equal(result.lastOutcome.exitCode, null);
+      assert.equal(result.lastOutcome.finishedAt, result.finishedAt);
+      assert.equal(result.lastOutcome.task, record.task);
+      assert.equal(result.lastOutcome.phase, record.phase);
+      assert.equal(result.lastOutcome.stage, record.stage);
+      assert.equal(result.lastOutcome.round, record.round);
+      assert.equal(result.lastOutcome.summary, '');
+      assert.ok(result.lastOutcome.error == null, 'error should be omitted/null — no caught error at crash-detection time');
+
+      const onDisk = readJob(tmpCwd, record.slug);
+      assert.deepEqual(onDisk.lastOutcome, result.lastOutcome);
+    });
   }
 
   for (const state of ['done', 'failed', 'stopped', 'crashed']) {

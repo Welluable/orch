@@ -33,7 +33,14 @@ import {
     stopJob,
     cleanJobs,
     isPidAlive,
+    reopenJob,
+    buildLastOutcome,
 } from './lib/jobs.js';
+import {
+    validateContinue,
+    snapshotPriorOutcome,
+    buildPriorOutcomeText,
+} from './lib/continue.js';
 import { askAgentArgs } from './agents/ask.js';
 import { triageAgentArgs } from './agents/triage.js';
 import { quickFixAgentArgs } from './agents/quick-fix.js';
@@ -211,6 +218,18 @@ export function formatStatus(cwd, record) {
         lines.splice(1, 0, `parent:   ${record.parent}`);
     }
 
+    if (record.continuation > 1) {
+        const stateIdx = lines.findIndex((line) => line.startsWith('state:'));
+        lines.splice(stateIdx + 1, 0, `continuation: ${record.continuation}`);
+    }
+
+    if (record.lastOutcome) {
+        const o = record.lastOutcome;
+        lines.push(`outcome:  ${o.phase ?? '-'} / ${o.stage ?? '-'} (round ${o.round ?? '-'})`);
+        if (o.summary) lines.push(`summary:  ${o.summary}`);
+        if (o.error) lines.push(`error:    ${o.error}`);
+    }
+
     const statusPath = path.join(jobPaths(cwd, record.slug).dir, 'status.md');
     if (fs.existsSync(statusPath)) {
         const last = lastNonEmptyLine(fs.readFileSync(statusPath, 'utf8'));
@@ -273,6 +292,28 @@ function roundLabel(role, round, maxRounds) {
 
 function defaultExecFile(command, args, options = {}) {
     return execFileSync(command, args, { encoding: 'utf8', ...options });
+}
+
+/** Patch a job to a terminal state and write a matching `lastOutcome` in the same write. */
+function patchTerminalJob(patchJobFn, jobCwd, jobSlug, { state, exitCode, summary = '', error = null, task }) {
+    if (!jobSlug) return;
+    const finishedAt = new Date().toISOString();
+    patchJobFn(jobCwd, jobSlug, (current) => ({
+        state,
+        exitCode,
+        finishedAt,
+        lastOutcome: buildLastOutcome({
+            state,
+            phase: current.phase,
+            stage: current.stage,
+            round: current.round,
+            exitCode,
+            finishedAt,
+            task: task ?? current.task,
+            summary,
+            error,
+        }),
+    }));
 }
 
 /** The test-writer ⇄ test-critic loop shared by `runPipeline` and `runWorkerPipeline`. */
@@ -729,7 +770,7 @@ export async function runPipeline(prompt, options) {
             .filter(Boolean)
             .join('\n');
 
-        await runCodeLoop({
+        const codeAccepted = await runCodeLoop({
             prompt,
             worktreePath: worktree.worktreePath,
             branch: worktree.branch,
@@ -762,6 +803,7 @@ export async function runPipeline(prompt, options) {
             );
             console.log(`commit: ${commitResult.sha.slice(0, 7)} on ${commitResult.branch}`);
             console.log(`merge:  git merge ${commitResult.branch}`);
+            console.log(`next:   orch continue ${runContext.slug} "…"`);
         } else {
             fs.appendFileSync(
                 runContext.statusPath,
@@ -770,20 +812,29 @@ export async function runPipeline(prompt, options) {
             console.log(`commit: no changes on ${commitResult.branch}`);
         }
 
-        jobPatch({ state: 'done', exitCode: 0, finishedAt: new Date().toISOString() });
+        patchTerminalJob(patchJobFn, jobCwd, jobSlug, {
+            state: 'done',
+            exitCode: 0,
+            summary: codeAccepted?.verdict?.summary ?? '',
+            error: null,
+            task: prompt,
+        });
     } catch (err) {
         console.error(`Error: ${err.message}`);
         if (jobSlug) {
             try {
-                patchJobFn(jobCwd, jobSlug, {
+                patchTerminalJob(patchJobFn, jobCwd, jobSlug, {
                     state: 'failed',
                     exitCode: 1,
-                    finishedAt: new Date().toISOString(),
+                    summary: '',
+                    error: err.message,
+                    task: prompt,
                 });
             } catch {
                 // Best-effort: don't let a job-state write failure mask the real error.
             }
         }
+        console.error(`next:   orch continue ${jobSlug ?? '<slug>'} "fix the failure and finish"`);
         process.exit(1);
     }
 }
@@ -843,6 +894,311 @@ export async function runDetached(prompt, options = {}) {
     patchJob(cwd, slug, { pid: child.pid, state: 'running' });
 
     console.log(`started ${slug} (pid ${child.pid})`);
+    exit(0);
+}
+
+/**
+ * Continue pipeline: full complex stages on an existing worktree/branch.
+ * Skips triage and `createWorktree`. Injects prior-outcome text into
+ * research/planner only. See `.spec/continue.md`.
+ */
+export async function runContinuePipeline(prompt, options = {}) {
+    const verbose = Boolean(options.verbose);
+    const maxRounds = options.maxRounds ?? 5;
+    const backend = AGENT_BACKENDS[options.agent];
+    if (!backend) {
+        throw new Error(`Unknown agent backend: ${options.agent}`);
+    }
+    const AgentClass = options.AgentClass ?? backend.AgentClass;
+    const cwd = options.cwd ?? process.cwd();
+    const {
+        slug,
+        worktreePath,
+        branch,
+        role,
+        parentSlug,
+        workerId,
+        priorOutcome,
+        continuation,
+    } = options;
+
+    const createRunContextFn = options.createRunContext ?? createRunContext;
+    const commitWorktreeFn = options.commitWorktree ?? commitWorktree;
+    const collectWorktreeChangesFn = options.collectWorktreeChanges ?? collectWorktreeChanges;
+    const patchWorkerFn = options.patchWorker ?? patchWorker;
+    const recordChangedFilesFn = options.recordChangedFiles ?? recordChangedFiles;
+    const execFileFn = options.execFile;
+
+    const jobSlug = options.jobSlug ?? slug ?? process.env.ORCH_JOB_SLUG;
+    const jobCwd = options.jobCwd ?? cwd;
+    const patchJobFn = options.patchJob ?? patchJob;
+    const checkpointPauseFn = options.checkpointPause ?? checkpointPause;
+    const pausePollIntervalMs = options.pausePollIntervalMs ?? 500;
+
+    const jobPatch = (fields) => {
+        if (!jobSlug) return;
+        patchJobFn(jobCwd, jobSlug, fields);
+    };
+    const jobCheckpoint = async () => {
+        if (!jobSlug) return;
+        await checkpointPauseFn(jobCwd, jobSlug, { pollIntervalMs: pausePollIntervalMs });
+    };
+
+    if (!options.AgentClass) {
+        ensureBinaryOnPath(backend.binary, options.agent);
+    }
+
+    const priorBlock = buildPriorOutcomeText(priorOutcome, {
+        slug,
+        continuation,
+        worktreePath,
+        branch,
+        parentSlug,
+        workerId,
+    });
+    const researchPlannerPrompt = `${priorBlock}\n\nUser follow-up:\n${prompt}`;
+
+    try {
+        const runContext = createRunContextFn({ cwd, slug });
+
+        fs.mkdirSync(path.dirname(runContext.statusPath), { recursive: true });
+        const prior = priorOutcome ?? {};
+        const startedIso = new Date().toISOString();
+        let continueSection = `\n## Continue ${continuation}\n\n`;
+        continueSection += `- Task: ${prompt.split('\n')[0]}\n`;
+        continueSection += `- Started: ${startedIso}\n`;
+        continueSection += `- Branch: \`${branch}\`\n`;
+        continueSection += `- Worktree: \`${worktreePath}\`\n`;
+        if (parentSlug) continueSection += `- Fan-out parent: \`${parentSlug}\`\n`;
+        if (workerId) continueSection += `- Worker id: \`${workerId}\`\n`;
+        continueSection += `\n### Prior outcome\n\n`;
+        continueSection += `- State: ${prior.state ?? '(none recorded)'}\n`;
+        continueSection += `- Phase: ${prior.phase ?? '(none recorded)'}\n`;
+        continueSection += `- Stage: ${prior.stage ?? '(none recorded)'}\n`;
+        continueSection += `- Round: ${prior.round ?? 'null'}\n`;
+        continueSection += `- Summary: ${prior.summary || '(none recorded)'}\n`;
+        if (prior.error) continueSection += `- Error: ${prior.error}\n`;
+        fs.appendFileSync(runContext.statusPath, continueSection);
+
+        jobPatch({ phase: 'research', stage: 'research', round: null });
+        const research = researchAgentArgs({
+            prompt: researchPlannerPrompt,
+            cwd: worktreePath,
+            researchPath: runContext.researchPath,
+        });
+        const researchAgent = new AgentClass(
+            research.name,
+            research.instructions,
+            research.prompt,
+            research.options,
+        );
+        const researchResult = await researchAgent.run({ verbose });
+        await jobCheckpoint();
+        const { content: researchContent, summary: researchSummary } = splitStageSummary(researchResult.result);
+        printStageSummary('research', researchSummary);
+
+        jobPatch({ phase: 'plan', stage: 'planner', round: null });
+        const planner = plannerAgentArgs({
+            prompt: researchPlannerPrompt,
+            cwd: worktreePath,
+            researchPath: runContext.researchPath,
+            taskPath: runContext.taskPath,
+            researchOutput: researchContent,
+        });
+        const plannerAgent = new AgentClass(
+            planner.name,
+            planner.instructions,
+            planner.prompt,
+            planner.options,
+        );
+        const plannerResult = await plannerAgent.run({ verbose });
+        await jobCheckpoint();
+        const { summary: plannerSummary } = splitStageSummary(plannerResult.result);
+        printStageSummary('planner', plannerSummary);
+
+        const testAccepted = await runTestLoop({
+            prompt,
+            worktreePath,
+            branch,
+            taskPath: runContext.taskPath,
+            statusPath: runContext.statusPath,
+            maxRounds,
+            AgentClass,
+            verbose,
+            jobPatch,
+            jobCheckpoint,
+        });
+
+        const acceptedVerification = [testAccepted.verdict.summary, testAccepted.writerContent]
+            .filter(Boolean)
+            .join('\n');
+
+        const codeAccepted = await runCodeLoop({
+            prompt,
+            worktreePath,
+            branch,
+            taskPath: runContext.taskPath,
+            statusPath: runContext.statusPath,
+            maxRounds,
+            AgentClass,
+            verbose,
+            jobPatch,
+            jobCheckpoint,
+            acceptedVerification,
+        });
+
+        jobPatch({ phase: 'commit', stage: 'commit', round: null });
+        const message = `orch: ${slug} (continue ${continuation}): ${prompt.split('\n')[0]}`;
+        const worktreeChanges = collectWorktreeChangesFn({ worktreePath });
+        printFilesChanged(worktreeChanges);
+        const commitResult = commitWorktreeFn({
+            worktreePath,
+            branch,
+            message,
+        });
+
+        if (commitResult.committed) {
+            fs.appendFileSync(
+                runContext.statusPath,
+                `\n## Commit\n\n- SHA: \`${commitResult.sha}\`\n- Branch: \`${commitResult.branch}\`\n`,
+            );
+            console.log(`commit: ${commitResult.sha.slice(0, 7)} on ${commitResult.branch}`);
+            console.log(`merge:  git merge ${commitResult.branch}`);
+        } else {
+            fs.appendFileSync(
+                runContext.statusPath,
+                `\n## Commit\n\n- No changes to commit on \`${commitResult.branch}\`.\n`,
+            );
+            console.log(`commit: no changes on ${commitResult.branch}`);
+        }
+
+        if (role === 'worker' && parentSlug && workerId) {
+            let changedFiles = [];
+            try {
+                changedFiles = recordChangedFilesFn({
+                    repoRoot: cwd,
+                    base: undefined,
+                    branch,
+                    execFile: execFileFn,
+                });
+            } catch {
+                // Best-effort.
+            }
+            if (commitResult.committed) {
+                patchWorkerFn(cwd, parentSlug, workerId, {
+                    state: 'done',
+                    sha: commitResult.sha,
+                    changedFiles,
+                });
+                console.log(`next:   orch --integrate ${parentSlug}`);
+            }
+        }
+
+        patchTerminalJob(patchJobFn, jobCwd, jobSlug, {
+            state: 'done',
+            exitCode: 0,
+            summary: codeAccepted?.verdict?.summary ?? '',
+            error: null,
+            task: prompt,
+        });
+    } catch (err) {
+        console.error(`Error: ${err.message}`);
+        if (role === 'worker' && parentSlug && workerId) {
+            try {
+                patchWorkerFn(cwd, parentSlug, workerId, { state: 'failed' });
+            } catch {
+                // Best-effort.
+            }
+        }
+        if (jobSlug) {
+            try {
+                patchTerminalJob(patchJobFn, jobCwd, jobSlug, {
+                    state: 'failed',
+                    exitCode: 1,
+                    summary: '',
+                    error: err.message,
+                    task: prompt,
+                });
+            } catch {
+                // Best-effort.
+            }
+        }
+        process.exit(1);
+    }
+}
+
+/**
+ * Detach-parent path for `orch continue`: validate, PATH-check, spawn a
+ * `--detach`-stripped re-invocation, reopen the existing slug with the child
+ * pid, print `started`, exit. Never runs pipeline stages itself.
+ */
+export async function runContinueDetached(slug, prompt, options = {}) {
+    const {
+        agent,
+        maxRounds = 5,
+        verbose,
+        cwd = process.cwd(),
+        spawn: spawnFn = spawn,
+        exit = (code) => process.exit(code),
+        validateContinue: validateContinueFn = validateContinue,
+        reopenJob: reopenJobFn = reopenJob,
+        snapshotPriorOutcome: snapshotPriorOutcomeFn = snapshotPriorOutcome,
+    } = options;
+
+    const backend = AGENT_BACKENDS[agent];
+    if (!backend) {
+        throw new Error(`Unknown agent backend: ${agent}`);
+    }
+
+    let record;
+    try {
+        record = validateContinueFn(cwd, slug, { task: prompt });
+    } catch (err) {
+        console.error(`Error: ${err.message}`);
+        exit(1);
+        return;
+    }
+
+    if (!isBinaryOnPath(backend.binary)) {
+        console.error(binaryMissingHint(agent));
+        exit(1);
+        return;
+    }
+
+    const prior = snapshotPriorOutcomeFn(cwd, slug, record);
+    const { logPath } = jobPaths(cwd, slug);
+    fs.mkdirSync(path.dirname(logPath), { recursive: true });
+    const logFd = fs.openSync(logPath, 'a');
+
+    const childArgs = [
+        __filename,
+        'continue',
+        slug,
+        prompt,
+        '--agent',
+        agent,
+        '--max-rounds',
+        String(maxRounds),
+    ];
+    if (verbose) childArgs.push('--verbose');
+
+    const child = spawnFn(process.execPath, childArgs, {
+        cwd,
+        env: { ...process.env, ORCH_JOB_SLUG: slug, ORCH_DETACHED: '1' },
+        detached: true,
+        stdio: ['ignore', logFd, logFd],
+    });
+    child.unref();
+
+    const updated = reopenJobFn(cwd, slug, {
+        task: prompt,
+        agent,
+        maxRounds,
+        pid: child.pid,
+        prior,
+    });
+
+    console.log(`started ${slug} (pid ${child.pid}, continuation ${updated.continuation})`);
     exit(0);
 }
 
@@ -954,7 +1310,7 @@ export async function runWorkerPipeline(prompt, options = {}) {
             .filter(Boolean)
             .join('\n');
 
-        await runCodeLoop({
+        const codeAccepted = await runCodeLoop({
             prompt,
             worktreePath: worktree.worktreePath,
             branch: worktree.branch,
@@ -1009,7 +1365,13 @@ export async function runWorkerPipeline(prompt, options = {}) {
             sha: commitResult.sha,
             changedFiles,
         });
-        jobPatch({ state: 'done', exitCode: 0, finishedAt: new Date().toISOString() });
+        patchTerminalJob(patchJobFn, jobCwd, jobSlug, {
+            state: 'done',
+            exitCode: 0,
+            summary: codeAccepted?.verdict?.summary ?? '',
+            error: null,
+            task: prompt,
+        });
     } catch (err) {
         console.error(`Error: ${err.message}`);
         try {
@@ -1019,15 +1381,19 @@ export async function runWorkerPipeline(prompt, options = {}) {
         }
         if (jobSlug) {
             try {
-                patchJobFn(jobCwd, jobSlug, {
+                patchTerminalJob(patchJobFn, jobCwd, jobSlug, {
                     state: 'failed',
                     exitCode: 1,
-                    finishedAt: new Date().toISOString(),
+                    summary: '',
+                    error: err.message,
+                    task: prompt,
                 });
             } catch {
                 // Best-effort: don't let a job-state write failure mask the real error.
             }
         }
+        console.error(`next:   orch continue ${jobSlug ?? '<slug>'} "fix the failure and finish"`);
+        if (parentSlug) console.error(`        orch --integrate ${parentSlug}`);
         process.exit(1);
     }
 }
@@ -1217,7 +1583,7 @@ export async function runIntegratePipeline(options = {}) {
         }
 
         // --- runner-first verify loop: test-runner first, code-writer only on failure ---
-        await runCodeLoop({
+        const codeAccepted = await runCodeLoop({
             prompt: fanout.task,
             worktreePath: worktree.worktreePath,
             branch: worktree.branch,
@@ -1253,7 +1619,13 @@ export async function runIntegratePipeline(options = {}) {
             merged,
             skipped,
         });
-        jobPatch({ state: 'done', exitCode: 0, finishedAt: new Date().toISOString() });
+        patchTerminalJob(patchJobFn, jobCwd, jobSlug, {
+            state: 'done',
+            exitCode: 0,
+            summary: codeAccepted?.verdict?.summary ?? '',
+            error: null,
+            task: fanout.task,
+        });
     } catch (err) {
         console.error(`Error: ${err.message}`);
         try {
@@ -1268,10 +1640,12 @@ export async function runIntegratePipeline(options = {}) {
         }
         if (jobSlug) {
             try {
-                patchJobFn(jobCwd, jobSlug, {
+                patchTerminalJob(patchJobFn, jobCwd, jobSlug, {
                     state: 'failed',
                     exitCode: 1,
-                    finishedAt: new Date().toISOString(),
+                    summary: '',
+                    error: err.message,
+                    task: fanout?.task,
                 });
             } catch {
                 // Best-effort: don't let a job-state write failure mask the real error.
@@ -1392,11 +1766,24 @@ export async function runFanoutPipeline(prompt, options = {}) {
         }
         if (jobSlug) {
             try {
-                patchJobFn(jobCwd, jobSlug, {
+                const exitCode = exitCodeForSignal(signal);
+                const finishedAt = new Date().toISOString();
+                patchJobFn(jobCwd, jobSlug, (current) => ({
                     state: 'stopped',
-                    exitCode: exitCodeForSignal(signal),
-                    finishedAt: new Date().toISOString(),
-                });
+                    exitCode,
+                    finishedAt,
+                    lastOutcome: buildLastOutcome({
+                        state: 'stopped',
+                        phase: current.phase,
+                        stage: current.stage,
+                        round: current.round,
+                        exitCode,
+                        finishedAt,
+                        task: prompt,
+                        summary: '',
+                        error: null,
+                    }),
+                }));
             } catch {
                 // Best-effort: don't let a job-state write failure block shutdown.
             }
@@ -1942,17 +2329,31 @@ export async function runFanoutPipeline(prompt, options = {}) {
             console.log(`retry integration after fixing it: orch --integrate ${jobSlug}`);
         }
 
-        jobPatch({ state: success ? 'done' : 'failed', exitCode: success ? 0 : 1, finishedAt: new Date().toISOString() });
+        const finishedAt = new Date().toISOString();
+        const summary = success
+            ? `fan-out complete: ${doneWorkers.length} worker${doneWorkers.length === 1 ? '' : 's'} integrated`
+            : (failedWorkers.length > 0
+                ? `${failedWorkers.length} worker(s) failed`
+                : 'fan-out failed');
+        patchTerminalJob(patchJobFn, jobCwd, jobSlug, {
+            state: success ? 'done' : 'failed',
+            exitCode: success ? 0 : 1,
+            summary,
+            error: success ? null : summary,
+            task: prompt,
+        });
         exitFn(success ? 0 : 1);
     } catch (err) {
         if (err instanceof FanoutInterrupted) return;
         console.error(`Error: ${err.message}`);
         if (jobSlug) {
             try {
-                patchJobFn(jobCwd, jobSlug, {
+                patchTerminalJob(patchJobFn, jobCwd, jobSlug, {
                     state: 'failed',
                     exitCode: 1,
-                    finishedAt: new Date().toISOString(),
+                    summary: '',
+                    error: err.message,
+                    task: prompt,
                 });
             } catch {
                 // Best-effort: don't let a job-state write failure mask the real error.
@@ -2132,7 +2533,9 @@ Headless runs:
   $ orch list                                          # show all tracked runs
   $ orch status [slug]                                 # show full status (defaults to most recent)
   $ orch pause <slug>                                  # request a pause at the next stage boundary
-  $ orch resume <slug>                                 # resume a paused/pausing run
+  $ orch resume <slug>                                 # unpause a paused/pausing run
+  $ orch continue <slug> "new task"                    # new work on a finished run's worktree
+                                                       # (workers: same command; then re-integrate the parent)
   $ orch stop <slug>                                   # send SIGTERM to a running job
   $ orch logs <slug> [-f]                              # print (or follow) a run's log file
 
@@ -2233,6 +2636,124 @@ Fan-out:
         }
 
         await runPipeline(prompt, options);
+    });
+
+program
+    .command('continue')
+    .description(
+        'Start new complex work on a finished run\'s existing worktree (not the same as resume, which only unpauses). Workers: continue the worker slug, then re-integrate the parent',
+    )
+    .argument('<slug>', 'Existing run slug under .orch/')
+    .argument('<task...>', 'New task prompt for this continue iteration')
+    .option('-v, --verbose', 'Stream agent thinking/output deltas to stderr as the pipeline runs')
+    .option('--dry-run', 'Validate eligibility and agent PATH; do not reopen the job or run agents')
+    .option('--ask', 'Rejected: continue does not support --ask')
+    .option('--quick', 'Rejected: continue does not support --quick')
+    .option('--detach', 'Run the continue in the background under the same slug')
+    .option('--max-rounds <n>', 'Max writer⇄critic and writer⇄runner iterations per implementer loop', positiveIntParser('--max-rounds'), 5)
+    .addOption(
+        new Option('--agent <agent>', 'Agent backend: "cursor", "claude", or "agn"')
+            .choices(['cursor', 'claude', 'agn'])
+            .default('cursor'),
+    )
+    .action(async (slug, taskParts, options, command) => {
+        // Parent program also defines --ask/--quick/--dry-run/--agent/--detach/
+        // --max-rounds; when those flags appear after the continue arguments,
+        // Commander attaches them to the parent. Merge via optsWithGlobals.
+        const opts = typeof command.optsWithGlobals === 'function'
+            ? command.optsWithGlobals()
+            : { ...program.opts(), ...options };
+        const prompt = taskParts.join(' ').trim();
+        const cwd = process.cwd();
+
+        let record;
+        try {
+            record = validateContinue(cwd, slug, {
+                task: prompt,
+                ask: opts.ask,
+                quick: opts.quick,
+            });
+        } catch (err) {
+            console.error(`Error: ${err.message}`);
+            process.exit(1);
+            return;
+        }
+
+        if (opts.detach) {
+            await runContinueDetached(slug, prompt, {
+                agent: opts.agent,
+                maxRounds: opts.maxRounds,
+                verbose: opts.verbose,
+                cwd,
+            });
+            return;
+        }
+
+        if (opts.dryRun) {
+            const backend = AGENT_BACKENDS[opts.agent];
+            if (!isBinaryOnPath(backend.binary)) {
+                console.error(binaryMissingHint(opts.agent));
+                process.exit(1);
+                return;
+            }
+            console.log(`dry-run: continue ${slug} ok`);
+            return;
+        }
+
+        const alreadyReopened = Boolean(process.env.ORCH_JOB_SLUG);
+        let priorOutcome;
+        let continuation;
+        let worktreePath = record.worktree;
+        let branch = record.branch;
+        let role = record.role;
+        let parentSlug = record.parent;
+        let workerId = record.workerId;
+
+        if (!alreadyReopened) {
+            priorOutcome = snapshotPriorOutcome(cwd, slug, record);
+            const updated = reopenJob(cwd, slug, {
+                task: prompt,
+                agent: opts.agent,
+                maxRounds: opts.maxRounds,
+                pid: process.pid,
+                prior: priorOutcome,
+            });
+            continuation = updated.continuation;
+            setJobSlug(slug);
+        } else {
+            const live = readJob(cwd, slug) ?? record;
+            continuation = live.continuation ?? 2;
+            const entries = Array.isArray(live.continuations) ? live.continuations : [];
+            const last = entries[entries.length - 1];
+            priorOutcome = last?.prior ?? snapshotPriorOutcome(cwd, slug, live);
+            worktreePath = live.worktree ?? worktreePath;
+            branch = live.branch ?? branch;
+            role = live.role ?? role;
+            parentSlug = live.parent ?? parentSlug;
+            workerId = live.workerId ?? workerId;
+            setJobSlug(slug);
+        }
+
+        // PATH check after reopen (foreground) so empty-PATH tests can observe the bump.
+        const backend = AGENT_BACKENDS[opts.agent];
+        ensureBinaryOnPath(backend.binary, opts.agent);
+
+        await runContinuePipeline(prompt, {
+            agent: opts.agent,
+            maxRounds: opts.maxRounds,
+            verbose: opts.verbose,
+            cwd,
+            slug,
+            worktreePath,
+            branch,
+            role,
+            parentSlug,
+            workerId,
+            priorOutcome,
+            continuation,
+            jobSlug: slug,
+            jobCwd: cwd,
+        });
     });
 
 program

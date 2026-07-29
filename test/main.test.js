@@ -97,7 +97,7 @@ describe('main.js CLI', () => {
   it('prints version for --version', async () => {
     const { code, stdout } = await runCli(['--version']);
     assert.equal(code, 0);
-    assert.equal(stdout.trim(), '1.1.0');
+    assert.equal(stdout.trim(), '1.2.0');
   });
 
   it('help output mentions --agent, --verbose, --dry-run, --max-rounds, --ask, and --quick', async () => {
@@ -2510,5 +2510,121 @@ describe('runPipeline job-record patching for the plain/full pipeline (universal
     }
 
     assert.equal(patchJobMock.mock.calls.length, 0);
+  });
+});
+
+/**
+ * Contract this section pins down for `lastOutcome` capture (net-new field
+ * on every terminal `jobPatch`, see `.spec/continue.md` "lastOutcome
+ * (written on every terminal transition)" and
+ * `.orch/sunny-oasis-a761/task.md` section 1). It does not exist yet as of
+ * this test-writing round.
+ *
+ * On every terminal `runPipeline` write (`done` or `failed`), the same
+ * `patchJob` call (or one immediately following it, still before any
+ * `process.exit`) must also include a `lastOutcome` object:
+ * `{ state, phase, stage, round, exitCode, finishedAt, task, summary,
+ * error }`.
+ *   - `state`/`exitCode`/`finishedAt` mirror the terminal fields written
+ *     alongside it.
+ *   - `phase`/`stage`/`round` mirror the record's live values at that
+ *     terminal moment (code-loop/test-runner/<last round> on a code-loop
+ *     failure or success; commit/commit/null on a clean `done`).
+ *   - `task` is the prompt for this pipeline invocation.
+ *   - `summary` is best-effort: on a successful `done`, the final
+ *     code-loop verdict's summary (`codeAccepted.verdict.summary`, e.g.
+ *     "suite green" for the `PASS_RUNNER` fixture used across this suite).
+ *   - `error` is the caught `Error.message` on a thrown-stage `failed`
+ *     (e.g. "test-runner failed; stopping before commit"); omitted/`null`
+ *     on a clean `done`.
+ */
+describe('runPipeline lastOutcome capture on terminal states', () => {
+  it('writes lastOutcome.state:"done" with the final code-loop verdict summary on a clean success', async () => {
+    const tmpCwd = makeTmpCwd('orch-lastoutcome-done-');
+    try {
+      const slug = 'lastoutcome-done-0000';
+      seedForegroundJob(tmpCwd, slug, 'do something complex');
+      const runContext = fakeRunContext(tmpCwd);
+      const worktree = fakeWorktree(tmpCwd);
+      const MockAgentClass = createMockAgentClass(complexPassBehaviors());
+      const patchCalls = [];
+      const patchJobMock = realDiskPatchJobSpy(patchCalls);
+
+      const logSpy = mock.method(console, 'log', () => {});
+      try {
+        await runPipeline('do something complex', {
+          agent: 'claude',
+          AgentClass: MockAgentClass,
+          createRunContext: mock.fn(() => runContext),
+          createWorktree: mock.fn(() => worktree),
+          commitWorktree: mock.fn(() => fakeCommitResult(worktree.branch)),
+          jobSlug: slug,
+          jobCwd: tmpCwd,
+          patchJob: patchJobMock,
+        });
+      } finally {
+        logSpy.mock.restore();
+      }
+
+      const record = readJob(tmpCwd, slug);
+      assert.equal(record.state, 'done');
+      assert.ok(record.lastOutcome, 'expected a lastOutcome object on the terminal record');
+      assert.equal(record.lastOutcome.state, 'done');
+      assert.equal(record.lastOutcome.exitCode, 0);
+      assert.equal(record.lastOutcome.finishedAt, record.finishedAt);
+      assert.equal(record.lastOutcome.task, 'do something complex');
+      assert.equal(record.lastOutcome.summary, 'suite green');
+      assert.ok(record.lastOutcome.error == null, 'error should be omitted/null on a clean done');
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('writes lastOutcome.state:"failed" with phase/stage/round and the thrown error message', async () => {
+    const tmpCwd = makeTmpCwd('orch-lastoutcome-failed-');
+    try {
+      const slug = 'lastoutcome-failed-0000';
+      seedForegroundJob(tmpCwd, slug, 'do something complex');
+      const runContext = fakeRunContext(tmpCwd);
+      const worktree = fakeWorktree(tmpCwd);
+      const MockAgentClass = createMockAgentClass(complexPassBehaviors({
+        'test-runner': { ok: false, result: 'test runner crashed' },
+      }));
+      const patchCalls = [];
+      const patchJobMock = realDiskPatchJobSpy(patchCalls);
+
+      const logSpy = mock.method(console, 'log', () => {});
+      const errorSpy = mock.method(console, 'error', () => {});
+      const exitSpy = mock.method(process, 'exit', () => {});
+      try {
+        await runPipeline('do something complex', {
+          agent: 'claude',
+          AgentClass: MockAgentClass,
+          createRunContext: mock.fn(() => runContext),
+          createWorktree: mock.fn(() => worktree),
+          commitWorktree: mock.fn(() => { throw new Error('commitWorktree must not be called after a failed code loop'); }),
+          jobSlug: slug,
+          jobCwd: tmpCwd,
+          patchJob: patchJobMock,
+        });
+      } finally {
+        logSpy.mock.restore();
+        errorSpy.mock.restore();
+        exitSpy.mock.restore();
+      }
+
+      const record = readJob(tmpCwd, slug);
+      assert.equal(record.state, 'failed');
+      assert.ok(record.lastOutcome, 'expected a lastOutcome object on the terminal record');
+      assert.equal(record.lastOutcome.state, 'failed');
+      assert.equal(record.lastOutcome.exitCode, 1);
+      assert.equal(record.lastOutcome.phase, 'code-loop');
+      assert.equal(record.lastOutcome.stage, 'test-runner');
+      assert.equal(record.lastOutcome.task, 'do something complex');
+      assert.equal(typeof record.lastOutcome.error, 'string');
+      assert.match(record.lastOutcome.error, /test-runner/);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
   });
 });

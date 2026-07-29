@@ -480,6 +480,124 @@ describe('runWorkerPipeline (--worker driver)', () => {
   });
 });
 
+/**
+ * Contract this section pins down for `lastOutcome` capture on
+ * `runWorkerPipeline` (net-new field on every terminal `jobPatch`, see
+ * `.spec/continue.md` "lastOutcome (written on every terminal transition)"
+ * and `.orch/sunny-oasis-a761/task.md` section 1). It does not exist yet as
+ * of this test-writing round. Same shape as the `runPipeline` lastOutcome
+ * tests in test/main.test.js, but for the `--worker` driver: a worker's own
+ * `run.json.lastOutcome` must be captured the same way an ordinary complex
+ * run's is, independent of its `fanout.json` bookkeeping.
+ */
+describe('runWorkerPipeline lastOutcome capture on terminal states', () => {
+  it('writes lastOutcome.state:"done" with the final code-loop verdict summary on a clean success', async () => {
+    const cwd = makeTmpCwd('orch-worker-lastoutcome-done-');
+    const doc = baseFanout();
+    writeFanout(cwd, doc.parentSlug, doc);
+    const workerSlug = 'merry-elk-r4b1';
+    const runContext = fakeRunContext(cwd, workerSlug);
+    const worktree = fakeWorktree(cwd, workerSlug);
+    const MockAgentClass = createMockAgentClass(workerPassBehaviors());
+
+    allocateJob({
+      cwd,
+      prompt: 'Implement create and list invoice endpoints.',
+      agent: 'claude',
+      state: 'running',
+      pid: process.pid,
+      parent: doc.parentSlug,
+      role: 'worker',
+      workerId: '02-invoices',
+      generateSlug: () => workerSlug,
+    });
+
+    const logSpy = mock.method(console, 'log', () => {});
+    try {
+      await runWorkerPipeline('Implement create and list invoice endpoints.', {
+        agent: 'claude',
+        AgentClass: MockAgentClass,
+        cwd,
+        parentSlug: doc.parentSlug,
+        workerId: '02-invoices',
+        base: doc.base,
+        jobSlug: workerSlug,
+        jobCwd: cwd,
+        createRunContext: mock.fn(() => runContext),
+        createWorktree: mock.fn(() => worktree),
+        commitWorktree: mock.fn(() => fakeCommitResult(worktree.branch)),
+      });
+    } finally {
+      logSpy.mock.restore();
+    }
+
+    const record = readJob(cwd, workerSlug);
+    assert.equal(record.state, 'done');
+    assert.ok(record.lastOutcome, 'expected a lastOutcome object on the terminal record');
+    assert.equal(record.lastOutcome.state, 'done');
+    assert.equal(record.lastOutcome.exitCode, 0);
+    assert.equal(record.lastOutcome.task, 'Implement create and list invoice endpoints.');
+    assert.equal(record.lastOutcome.summary, 'suite green');
+    assert.ok(record.lastOutcome.error == null, 'error should be omitted/null on a clean done');
+  });
+
+  it('writes lastOutcome.state:"failed" with phase/stage and the thrown error message', async () => {
+    const cwd = makeTmpCwd('orch-worker-lastoutcome-failed-');
+    const doc = baseFanout();
+    writeFanout(cwd, doc.parentSlug, doc);
+    const workerSlug = 'merry-elk-r4b1';
+    const runContext = fakeRunContext(cwd, workerSlug);
+    const worktree = fakeWorktree(cwd, workerSlug);
+    const MockAgentClass = createMockAgentClass(workerPassBehaviors({
+      'test-runner': { ok: false, result: 'test runner crashed' },
+    }));
+
+    allocateJob({
+      cwd,
+      prompt: 'subtask',
+      agent: 'claude',
+      state: 'running',
+      pid: process.pid,
+      parent: doc.parentSlug,
+      role: 'worker',
+      workerId: '02-invoices',
+      generateSlug: () => workerSlug,
+    });
+
+    const logSpy = mock.method(console, 'log', () => {});
+    const errorSpy = mock.method(console, 'error', () => {});
+    const exitSpy = mock.method(process, 'exit', () => {});
+    try {
+      await runWorkerPipeline('subtask text', {
+        agent: 'claude',
+        AgentClass: MockAgentClass,
+        cwd,
+        parentSlug: doc.parentSlug,
+        workerId: '02-invoices',
+        base: doc.base,
+        jobSlug: workerSlug,
+        jobCwd: cwd,
+        createRunContext: mock.fn(() => runContext),
+        createWorktree: mock.fn(() => worktree),
+        commitWorktree: mock.fn(() => { throw new Error('commitWorktree must not be called after a failed code loop'); }),
+      });
+    } finally {
+      logSpy.mock.restore();
+      errorSpy.mock.restore();
+      exitSpy.mock.restore();
+    }
+
+    const record = readJob(cwd, workerSlug);
+    assert.equal(record.state, 'failed');
+    assert.ok(record.lastOutcome, 'expected a lastOutcome object on the terminal record');
+    assert.equal(record.lastOutcome.state, 'failed');
+    assert.equal(record.lastOutcome.exitCode, 1);
+    assert.equal(record.lastOutcome.phase, 'code-loop');
+    assert.equal(record.lastOutcome.stage, 'test-runner');
+    assert.equal(typeof record.lastOutcome.error, 'string');
+  });
+});
+
 describe('runIntegratePipeline (--integrate driver)', () => {
   it('never constructs triage/research/planner/test-writer/test-critic; verifies runner-first when merges are already green', async () => {
     const cwd = makeTmpCwd('orch-integrate-green-');
@@ -846,6 +964,115 @@ describe('runIntegratePipeline (--integrate driver)', () => {
     }
 
     assert.deepEqual(mergedOrder, ['orch/merry-elk-r4b1', 'orch/wise-owl-k1a8', 'orch/rapid-fox-x7q2']);
+  });
+});
+
+/**
+ * Contract this section pins down for `lastOutcome` capture on
+ * `runIntegratePipeline` (the third of the four terminal-write call sites
+ * named in `.orch/sunny-oasis-a761/task.md` section 1, alongside
+ * `runPipeline`/`runWorkerPipeline` already covered above and the fan-out
+ * coordinator driver covered in test/fanout-coordinator.test.js). Same shape
+ * as the `runWorkerPipeline` lastOutcome tests above: the integration
+ * session's own `run.json.lastOutcome` must be captured independent of its
+ * `fanout.json` bookkeeping. `task` here is `fanout.task` (the parent's
+ * original task), since `runIntegratePipeline` never receives its own
+ * `prompt` option — it drives off the fanout doc.
+ */
+describe('runIntegratePipeline lastOutcome capture on terminal states', () => {
+  it('writes lastOutcome.state:"done" with the final verify-loop verdict summary when merges are already green', async () => {
+    const cwd = makeTmpCwd('orch-integrate-lastoutcome-done-');
+    const doc = baseFanout();
+    writeFanout(cwd, doc.parentSlug, doc);
+    const integrationSlug = 'tidy-heron-m2p9';
+    const worktree = fakeWorktree(cwd, doc.parentSlug);
+
+    const { execFile } = makeFakeExecFile([
+      { match: (args) => args.includes('merge') && !args.includes('--abort'), stdout: 'Merge made by the ort strategy.' },
+    ]);
+
+    const MockAgentClass = createMockAgentClass({ 'test-runner': PASS_RUNNER });
+
+    const logSpy = mock.method(console, 'log', () => {});
+    try {
+      await runIntegratePipeline({
+        agent: 'claude',
+        AgentClass: MockAgentClass,
+        cwd,
+        parentSlug: doc.parentSlug,
+        jobSlug: integrationSlug,
+        jobCwd: cwd,
+        execFile,
+        createWorktree: mock.fn(() => worktree),
+        commitWorktree: mock.fn(() => fakeCommitResult(`orch/${doc.parentSlug}`)),
+      });
+    } finally {
+      logSpy.mock.restore();
+    }
+
+    const record = readJob(cwd, integrationSlug);
+    assert.equal(record.state, 'done');
+    assert.ok(record.lastOutcome, 'expected a lastOutcome object on the terminal record');
+    assert.equal(record.lastOutcome.state, 'done');
+    assert.equal(record.lastOutcome.exitCode, 0);
+    assert.equal(record.lastOutcome.finishedAt, record.finishedAt);
+    assert.equal(record.lastOutcome.phase, 'commit');
+    assert.equal(record.lastOutcome.stage, 'commit');
+    assert.equal(record.lastOutcome.task, doc.task);
+    assert.equal(record.lastOutcome.summary, 'suite green');
+    assert.ok(record.lastOutcome.error == null, 'error should be omitted/null on a clean done');
+  });
+
+  it('writes lastOutcome.state:"failed" with phase/stage/round and the thrown error message when the verify loop never goes green', async () => {
+    const cwd = makeTmpCwd('orch-integrate-lastoutcome-failed-');
+    const doc = baseFanout();
+    writeFanout(cwd, doc.parentSlug, doc);
+    const integrationSlug = 'tidy-heron-m2p9';
+    const worktree = fakeWorktree(cwd, doc.parentSlug);
+
+    const { execFile } = makeFakeExecFile([
+      { match: (args) => args.includes('merge') && !args.includes('--abort'), stdout: 'Merge made by the ort strategy.' },
+    ]);
+
+    const MockAgentClass = createMockAgentClass({
+      'test-runner': [FAIL_RUNNER, FAIL_RUNNER],
+      'code-writer': { ok: true, result: withSummary('tried', 'code tried') },
+    });
+
+    const logSpy = mock.method(console, 'log', () => {});
+    const errorSpy = mock.method(console, 'error', () => {});
+    const exitSpy = mock.method(process, 'exit', () => {});
+    try {
+      await runIntegratePipeline({
+        agent: 'claude',
+        maxRounds: 2,
+        AgentClass: MockAgentClass,
+        cwd,
+        parentSlug: doc.parentSlug,
+        jobSlug: integrationSlug,
+        jobCwd: cwd,
+        execFile,
+        createWorktree: mock.fn(() => worktree),
+        commitWorktree: mock.fn(() => { throw new Error('commitWorktree must not be called after an exhausted verify loop'); }),
+      });
+    } finally {
+      logSpy.mock.restore();
+      errorSpy.mock.restore();
+      exitSpy.mock.restore();
+    }
+
+    assert.ok(exitSpy.mock.calls.some((c) => c.arguments[0] === 1));
+    const record = readJob(cwd, integrationSlug);
+    assert.equal(record.state, 'failed');
+    assert.ok(record.lastOutcome, 'expected a lastOutcome object on the terminal record');
+    assert.equal(record.lastOutcome.state, 'failed');
+    assert.equal(record.lastOutcome.exitCode, 1);
+    assert.equal(record.lastOutcome.phase, 'code-loop');
+    assert.equal(record.lastOutcome.stage, 'test-runner');
+    assert.equal(record.lastOutcome.round, 2);
+    assert.equal(record.lastOutcome.task, doc.task);
+    assert.equal(typeof record.lastOutcome.error, 'string');
+    assert.match(record.lastOutcome.error, /code loop exhausted/);
   });
 });
 
