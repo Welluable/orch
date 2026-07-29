@@ -51,7 +51,10 @@ npm install -g @welluable/orch
 
 Make sure an agent CLI is on your `PATH` — orch defaults to `--agent cursor`
 (the Cursor Agent CLI, command `agent`); `claude` and `agn` are also
-supported. See [Requirements](#requirements) for details.
+supported. Pin a default with `orch config --agent <name>` so you don't need
+`--agent` on every run (local `.orch/config` overrides global
+`~/.orch/config`; CLI `--agent` still wins). See [Requirements](#requirements)
+for details.
 
 ```bash
 orch "fix the typo in the README"
@@ -210,8 +213,17 @@ Usage: orch [options] [command] <task...>
   at once; omit to let the coordinator choose (typically the current layer's
   size); only meaningful with `--fan-out`.
 - `--agent <cursor|claude|agn>` — selects the backend for the whole pipeline;
-  defaults to `cursor`.
+  when omitted, uses local `.orch/config`, then global `~/.orch/config`, else
+  `cursor`.
 - `-h, --help` — displays help for the command.
+
+Config:
+
+- `orch config` — prints the effective agent and which file(s) contributed
+  (local / global / default). Does not prompt.
+- `orch config --agent <cursor|claude|agn> [--global|--local]` — writes the
+  default agent. Bare `--agent` (and `--global`) write `~/.orch/config`;
+  `--local` writes `<cwd>/.orch/config`. There is no `orch init`.
 
 Job-control subcommands (see [Headless runs](#headless-runs)):
 
@@ -241,6 +253,9 @@ orch "implement the local spec" --agent agn -v
 orch --ask "where is the CLI entrypoint?" --agent claude
 orch --quick "fix the typo in the README" --agent claude
 orch "noop" --dry-run --agent cursor
+orch config
+orch config --agent claude
+orch config --agent agn --local
 ```
 
 ## Headless runs
@@ -437,7 +452,7 @@ pkill -f 'agn '        # --agent agn
 
 | Backend | `--agent` value | Status | Notes |
 | --- | --- | --- | --- |
-| Cursor Agent CLI | `cursor` | Supported (default) | Command `agent` on `PATH`. |
+| Cursor Agent CLI | `cursor` | Supported (builtin default) | Command `agent` on `PATH`. Override via `orch config` or `--agent`. |
 | Claude Code CLI | `claude` | Supported | Command `claude` on `PATH`. |
 | agn | `agn` | Supported | Requires `npm install -g @welluable/agn-cli` (`>= 0.0.12`) and `agn init`. |
 

@@ -112,7 +112,12 @@ describe('main.js CLI', () => {
   });
 
   it('--dry-run reports readiness without running the pipeline', async () => {
-    const { code, stdout, stderr } = await runCli(['noop', '--dry-run']);
+    // Isolate HOME so a developer/global ~/.orch/config cannot change the
+    // effective agent when --agent is omitted.
+    const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-dry-home-'));
+    const { code, stdout, stderr } = await runCli(['noop', '--dry-run'], {
+      env: { ...process.env, HOME: isolatedHome },
+    });
     assert.match(stdout, /cwd:/);
     assert.match(stdout, /agent:\s+cursor/);
     assert.match(stdout, /^(pass|fail)$/m);

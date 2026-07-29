@@ -74,6 +74,13 @@ import {
     conflictedFiles,
     hasConflictMarkers,
 } from './lib/integrate.js';
+import {
+    resolveAgent,
+    writeConfig,
+    printConfig,
+    globalConfigPath,
+    localConfigPath,
+} from './lib/config.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -2494,6 +2501,17 @@ function positiveIntParser(flagName) {
     };
 }
 
+/** Resolve the effective agent (CLI > local > global > cursor) or exit 1. */
+function resolveAgentOrExit(cliAgent, cwd = process.cwd()) {
+    try {
+        return resolveAgent({ cliAgent, cwd });
+    } catch (err) {
+        console.error(`Error: ${err.message}`);
+        process.exit(1);
+        return undefined;
+    }
+}
+
 const program = new Command();
 
 program
@@ -2511,9 +2529,8 @@ program
     .option('--max-workers <n>', 'Max number of parallel fan-out workers (only meaningful with --fan-out)', positiveIntParser('--max-workers'), 4)
     .option('--max-concurrency <n>', 'Optional hard ceiling on in-flight fan-out workers at once (only meaningful with --fan-out; default: coordinator chooses)', positiveIntParser('--max-concurrency'))
     .addOption(
-        new Option('--agent <agent>', 'Agent backend to run the pipeline with: "cursor" (Cursor Agent CLI), "claude" (Claude Code CLI), or "agn" (agn CLI)')
-            .choices(['cursor', 'claude', 'agn'])
-            .default('cursor'),
+        new Option('--agent <agent>', 'Agent backend to run the pipeline with: "cursor" (Cursor Agent CLI), "claude" (Claude Code CLI), or "agn" (agn CLI). Omitting uses local then global config, else cursor')
+            .choices(['cursor', 'claude', 'agn']),
     )
     .addOption(new Option('--worker <value>', 'internal: run a single fan-out worker "<parent-slug>:<worker-id>"').hideHelp())
     .addOption(new Option('--integrate <value>', 'internal: (re)run fan-out integration for "<parent-slug>"').hideHelp())
@@ -2527,6 +2544,9 @@ Examples:
   $ orch --ask "where is the CLI entrypoint?" --agent claude
   $ orch --quick "fix the typo in the README" --agent claude
   $ orch "noop" --dry-run --agent cursor
+  $ orch config                                          # print effective agent
+  $ orch config --agent claude                           # pin global default
+  $ orch config --agent agn --local                      # pin project default
 
 Headless runs:
   $ orch "long-running task" --detach --agent claude   # start in the background, prints the run slug
@@ -2551,6 +2571,8 @@ Fan-out:
             process.exit(1);
             return;
         }
+
+        options.agent = resolveAgentOrExit(options.agent);
 
         if (options.fanOut) {
             const conflicts = ['ask', 'quick', 'dryRun']
@@ -2652,9 +2674,8 @@ program
     .option('--detach', 'Run the continue in the background under the same slug')
     .option('--max-rounds <n>', 'Max writer⇄critic and writer⇄runner iterations per implementer loop', positiveIntParser('--max-rounds'), 5)
     .addOption(
-        new Option('--agent <agent>', 'Agent backend: "cursor", "claude", or "agn"')
-            .choices(['cursor', 'claude', 'agn'])
-            .default('cursor'),
+        new Option('--agent <agent>', 'Agent backend: "cursor", "claude", or "agn". Omitting uses local then global config, else cursor')
+            .choices(['cursor', 'claude', 'agn']),
     )
     .action(async (slug, taskParts, options, command) => {
         // Parent program also defines --ask/--quick/--dry-run/--agent/--detach/
@@ -2665,6 +2686,8 @@ program
             : { ...program.opts(), ...options };
         const prompt = taskParts.join(' ').trim();
         const cwd = process.cwd();
+
+        opts.agent = resolveAgentOrExit(opts.agent, cwd);
 
         let record;
         try {
@@ -2754,6 +2777,59 @@ program
             jobSlug: slug,
             jobCwd: cwd,
         });
+    });
+
+program
+    .command('config')
+    .description('Print or set the default agent (global ~/.orch/config or local .orch/config)')
+    .addOption(
+        new Option('--agent <agent>', 'Set the default agent backend')
+            .choices(['cursor', 'claude', 'agn']),
+    )
+    .option('--global', 'Write the global config (~/.orch/config); default when --agent is set')
+    .option('--local', 'Write the project-local config (.orch/config)')
+    .action((options, command) => {
+        // Parent also defines --agent; flags after `config` may land on the
+        // parent. Merge so either placement works.
+        const opts = typeof command.optsWithGlobals === 'function'
+            ? command.optsWithGlobals()
+            : { ...program.opts(), ...options };
+        const cwd = process.cwd();
+
+        if (opts.global && opts.local) {
+            console.error('Error: --global and --local are mutually exclusive');
+            process.exit(1);
+            return;
+        }
+
+        if ((opts.global || opts.local) && !opts.agent) {
+            console.error('Error: --global/--local require --agent (omit flags to print config)');
+            process.exit(1);
+            return;
+        }
+
+        if (opts.agent) {
+            const targetPath = opts.local
+                ? localConfigPath(cwd)
+                : globalConfigPath();
+            try {
+                writeConfig(targetPath, { agent: opts.agent });
+            } catch (err) {
+                console.error(`Error: ${err.message}`);
+                process.exit(1);
+                return;
+            }
+            console.log(`wrote ${targetPath}`);
+            process.stdout.write(`${JSON.stringify({ agent: opts.agent }, null, 2)}\n`);
+            return;
+        }
+
+        try {
+            printConfig({ cwd });
+        } catch (err) {
+            console.error(`Error: ${err.message}`);
+            process.exit(1);
+        }
     });
 
 program
