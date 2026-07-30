@@ -86,18 +86,19 @@ describe('main.js CLI', () => {
     assert.match(stdout, /<task\.\.\.>/);
   });
 
-  it('--help lists agn alongside cursor and claude', async () => {
+  it('--help lists agn and opencode alongside cursor and claude', async () => {
     const { code, stdout } = await runCli(['--help']);
     assert.equal(code, 0);
     assert.match(stdout, /cursor/);
     assert.match(stdout, /claude/);
     assert.match(stdout, /agn/);
+    assert.match(stdout, /opencode/);
   });
 
   it('prints version for --version', async () => {
     const { code, stdout } = await runCli(['--version']);
     assert.equal(code, 0);
-    assert.equal(stdout.trim(), '1.2.0');
+    assert.equal(stdout.trim(), '1.3.0');
   });
 
   it('help output mentions --agent, --verbose, --dry-run, --max-rounds, --ask, and --quick', async () => {
@@ -160,6 +161,32 @@ describe('main.js CLI', () => {
     assert.match(stderr, /npm install -g @welluable\/agn-cli/);
   });
 
+  it('--agent opencode --dry-run prints agent: opencode and resolves the opencode binary', async () => {
+    const { code, stdout, stderr } = await runCli(['noop', '--dry-run', '--agent', 'opencode']);
+    assert.match(stdout, /cwd:/);
+    assert.match(stdout, /agent:\s+opencode/);
+    assert.match(stdout, /^(pass|fail)$/m);
+    assert.doesNotMatch(stdout, /model:/);
+    if (code === 0) {
+      assert.match(stdout, /^pass$/m);
+    } else {
+      assert.equal(code, 1);
+      assert.match(stdout, /^fail$/m);
+      assert.match(stderr, /opencode not found/i);
+    }
+  });
+
+  it('reports the opencode-specific install hint when the opencode binary is not on PATH', async () => {
+    const { code, stdout, stderr } = await runCli(
+      ['noop', '--dry-run', '--agent', 'opencode'],
+      { env: { ...process.env, PATH: '/nonexistent-empty-path-for-tests' } },
+    );
+    assert.equal(code, 1);
+    assert.match(stdout, /^fail$/m);
+    assert.match(stderr, /opencode not found/i);
+    assert.match(stderr, /opencode\.ai/);
+  });
+
   it('rejects missing task argument', async () => {
     const { code, stderr } = await runCli([]);
     assert.notEqual(code, 0);
@@ -184,6 +211,7 @@ describe('main.js CLI', () => {
     assert.match(stderr, /cursor/);
     assert.match(stderr, /claude/);
     assert.match(stderr, /agn/);
+    assert.match(stderr, /opencode/);
   });
 
   it('accepts a multi-word positional task argument without an argument-parsing error', async () => {
@@ -193,6 +221,7 @@ describe('main.js CLI', () => {
     assert.match(stderr, /cursor/);
     assert.match(stderr, /claude/);
     assert.match(stderr, /agn/);
+    assert.match(stderr, /opencode/);
   });
 
   it('does not create .orch merely from being invoked, in either the install dir or the invocation cwd', async () => {

@@ -34,7 +34,7 @@ orch: commit: a1b2c3d on orch/verbose-flag-x7q2
   worktree on an `orch/<slug>` branch, so your working tree stays untouched
   until you decide to merge.
 - **Agent-agnostic backends.** Pick the CLI you already trust with
-  `--agent cursor|claude|agn` — orch owns the pipeline, the agent CLI does
+  `--agent cursor|claude|agn|opencode` — orch owns the pipeline, the agent CLI does
   the reading and writing.
 - **Readable runs.** Every stage prints a one-paragraph natural-language
   summary of what it did; add `-v` if you also want the raw thinking/output
@@ -50,7 +50,7 @@ npm install -g @welluable/orch
 ```
 
 Make sure an agent CLI is on your `PATH` — orch defaults to `--agent cursor`
-(the Cursor Agent CLI, command `agent`); `claude` and `agn` are also
+(the Cursor Agent CLI, command `agent`); `claude`, `agn`, and `opencode` are also
 supported. Pin a default with `orch config --agent <name>` so you don't need
 `--agent` on every run (local `.orch/config` overrides global
 `~/.orch/config`; CLI `--agent` still wins). See [Requirements](#requirements)
@@ -156,7 +156,8 @@ runs, since foreground runs already stream their output to your terminal.
                                ▼
                     ┌──────────────────────┐
                     │ agent backend adapter │
-                    │ (cursor / claude / agn)│
+                    │ (cursor/claude/agn/   │
+                    │  opencode)            │
                     └──────────────────────┘
 ```
 
@@ -174,7 +175,8 @@ agent CLI does all the actual reading and writing of files.
 | `--detach` | Runs the pipeline in a background process and returns immediately, printing the run slug. Manage it with `orch list/status/pause/resume/stop/logs`. | You want to kick off a run and keep using your shell, or run several tasks concurrently. |
 
 For `--ask`, Cursor uses `--mode ask`, Claude uses `--permission-mode plan`,
-and `agn` is prompt-only best-effort (it has no dedicated read-only flag).
+`agn` is prompt-only best-effort (it has no dedicated read-only flag), and
+OpenCode uses `--agent plan` with `edit`/`bash` denied via `OPENCODE_PERMISSION`.
 
 `--detach` only controls backgrounding, not whether a job record exists —
 every non-`--dry-run` invocation gets one. Combining `--detach` with
@@ -212,7 +214,7 @@ Usage: orch [options] [command] <task...>
 - `--max-concurrency <n>` — optional hard ceiling on in-flight fan-out workers
   at once; omit to let the coordinator choose (typically the current layer's
   size); only meaningful with `--fan-out`.
-- `--agent <cursor|claude|agn>` — selects the backend for the whole pipeline;
+- `--agent <cursor|claude|agn|opencode>` — selects the backend for the whole pipeline;
   when omitted, uses local `.orch/config`, then global `~/.orch/config`, else
   `cursor`.
 - `-h, --help` — displays help for the command.
@@ -221,7 +223,7 @@ Config:
 
 - `orch config` — prints the effective agent and which file(s) contributed
   (local / global / default). Does not prompt.
-- `orch config --agent <cursor|claude|agn> [--global|--local]` — writes the
+- `orch config --agent <cursor|claude|agn|opencode> [--global|--local]` — writes the
   default agent. Bare `--agent` (and `--global`) write `~/.orch/config`;
   `--local` writes `<cwd>/.orch/config`. There is no `orch init`.
 
@@ -250,12 +252,16 @@ Examples:
 orch "fix the typo in the README" --agent claude
 orch "fix the bug described in task.md" --agent cursor -v
 orch "implement the local spec" --agent agn -v
+orch "fix the typo in the README" --agent opencode
 orch --ask "where is the CLI entrypoint?" --agent claude
+orch --ask "where is package.json?" --agent opencode
 orch --quick "fix the typo in the README" --agent claude
 orch "noop" --dry-run --agent cursor
+orch "noop" --dry-run --agent opencode
 orch config
 orch config --agent claude
 orch config --agent agn --local
+orch config --agent opencode
 ```
 
 ## Headless runs
@@ -446,6 +452,7 @@ manually if that happens:
 pkill -f 'agent -p'    # --agent cursor
 pkill -f 'claude '     # --agent claude, adjust to local argv
 pkill -f 'agn '        # --agent agn
+pkill -f 'opencode run' # --agent opencode
 ```
 
 ## Agent compatibility
@@ -455,12 +462,13 @@ pkill -f 'agn '        # --agent agn
 | Cursor Agent CLI | `cursor` | Supported (builtin default) | Command `agent` on `PATH`. Override via `orch config` or `--agent`. |
 | Claude Code CLI | `claude` | Supported | Command `claude` on `PATH`. |
 | agn | `agn` | Supported | Requires `npm install -g @welluable/agn-cli` (`>= 0.0.12`) and `agn init`. |
+| OpenCode CLI | `opencode` | Supported | Command `opencode` on `PATH` (`>= 1.17.18`). Install from https://opencode.ai; first-time setup: `opencode auth login`. Read-only/`--ask` uses `--agent plan` with edit/bash denied. |
 
 ## Requirements
 
 - A modern Node.js runtime.
 - One supported agent CLI on your `PATH`: `agent` (Cursor), `claude` (Claude
-  Code), or `agn`.
+  Code), `agn`, or `opencode` (OpenCode `>= 1.17.18`).
 - Git, for any run that isn't `--ask` or `--quick` (worktrees and commits
   need it).
 

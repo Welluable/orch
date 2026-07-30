@@ -9,6 +9,7 @@ import {
   normalizeCursorToolEvent,
   normalizeClaudeToolEvent,
   normalizeAgnToolEvent,
+  normalizeOpencodeToolEvent,
   claudeToolFormatterKey,
   truncate,
   basename,
@@ -381,6 +382,163 @@ describe('normalizeAgnToolEvent', () => {
         input: { command: 'npm test' },
       }).name,
       'shell',
+    );
+  });
+});
+
+describe('normalizeOpencodeToolEvent', () => {
+  it('returns null for non-tool_use events', () => {
+    assert.equal(normalizeOpencodeToolEvent({ type: 'step_start' }), null);
+    assert.equal(normalizeOpencodeToolEvent({ type: 'text', part: { text: 'hi' } }), null);
+  });
+
+  it('returns null when tool or callID is missing or empty', () => {
+    assert.equal(
+      normalizeOpencodeToolEvent({
+        type: 'tool_use',
+        part: { tool: '', callID: 'call_1', state: { status: 'completed', input: {} } },
+      }),
+      null,
+    );
+    assert.equal(
+      normalizeOpencodeToolEvent({
+        type: 'tool_use',
+        part: { tool: 'glob', callID: '', state: { status: 'completed', input: {} } },
+      }),
+      null,
+    );
+    assert.equal(
+      normalizeOpencodeToolEvent({
+        type: 'tool_use',
+        part: { tool: 'glob', state: { status: 'completed', input: {} } },
+      }),
+      null,
+    );
+  });
+
+  it('returns null when state.status is not completed', () => {
+    assert.equal(
+      normalizeOpencodeToolEvent({
+        type: 'tool_use',
+        part: {
+          tool: 'glob',
+          callID: 'call_1',
+          state: { status: 'running', input: { pattern: '*.md' } },
+        },
+      }),
+      null,
+    );
+  });
+
+  it('normalizes a completed glob tool_use from fixture', () => {
+    const [event] = loadFixture('opencode-tool-use-glob.jsonl');
+    assert.deepEqual(normalizeOpencodeToolEvent(event), {
+      name: 'glob',
+      args: { pattern: '*.md' },
+      phase: 'completed',
+      callId: 'call_1',
+    });
+  });
+
+  it('aliases bash to shell', () => {
+    assert.deepEqual(
+      normalizeOpencodeToolEvent({
+        type: 'tool_use',
+        part: {
+          tool: 'bash',
+          callID: 'call_bash',
+          state: { status: 'completed', input: { command: 'npm test' } },
+        },
+      }),
+      {
+        name: 'shell',
+        args: { command: 'npm test' },
+        phase: 'completed',
+        callId: 'call_bash',
+      },
+    );
+  });
+
+  it('formats read/write/edit/shell/default via the shared formatter', () => {
+    assert.match(
+      formatToolStatus(
+        normalizeOpencodeToolEvent({
+          type: 'tool_use',
+          part: {
+            tool: 'read',
+            callID: 'c-r',
+            state: { status: 'completed', input: { path: 'lib/a.js' } },
+          },
+        }),
+      ),
+      /Reading a\.js/,
+    );
+    assert.match(
+      formatToolStatus(
+        normalizeOpencodeToolEvent({
+          type: 'tool_use',
+          part: {
+            tool: 'write',
+            callID: 'c-w',
+            state: { status: 'completed', input: { path: 'lib/a.js', content: 'secret' } },
+          },
+        }),
+      ),
+      /Writing a\.js/,
+    );
+    assert.match(
+      formatToolStatus(
+        normalizeOpencodeToolEvent({
+          type: 'tool_use',
+          part: {
+            tool: 'edit',
+            callID: 'c-e',
+            state: { status: 'completed', input: { path: 'lib/a.js' } },
+          },
+        }),
+      ),
+      /Editing a\.js/,
+    );
+    assert.match(
+      formatToolStatus(
+        normalizeOpencodeToolEvent({
+          type: 'tool_use',
+          part: {
+            tool: 'bash',
+            callID: 'c-b',
+            state: { status: 'completed', input: { command: 'npm test' } },
+          },
+        }),
+      ),
+      /Running: npm test/,
+    );
+    assert.equal(
+      formatToolStatus(
+        normalizeOpencodeToolEvent({
+          type: 'tool_use',
+          part: {
+            tool: 'CustomTool',
+            callID: 'c-x',
+            state: { status: 'completed', input: { path: 'foo' } },
+          },
+        }),
+      ),
+      'Running CustomTool(path=foo)…',
+    );
+  });
+
+  it('defaults args to {} when state.input is absent', () => {
+    assert.deepEqual(
+      normalizeOpencodeToolEvent({
+        type: 'tool_use',
+        part: { tool: 'grep', callID: 'call_g', state: { status: 'completed' } },
+      }),
+      {
+        name: 'grep',
+        args: {},
+        phase: 'completed',
+        callId: 'call_g',
+      },
     );
   });
 });

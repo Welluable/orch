@@ -1,0 +1,4 @@
+{"type":"step_finish","timestamp":0,"sessionID":"ses_1","part":{"type":"step-finish","reason":"tool-calls","tokens":{"input":10,"output":5},"cost":0}}
+{"type":"text","timestamp":0,"sessionID":"ses_1","part":{"type":"text","text":"There are two markdown files."}}
+{"type":"text","timestamp":0,"sessionID":"ses_1","part":{"type":"text","text":" Done."}}
+{"type":"step_finish","timestamp":0,"sessionID":"ses_1","part":{"type":"step-finish","reason":"stop","tokens":{"input":20,"output":15},"cost":0}}

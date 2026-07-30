@@ -56,6 +56,8 @@ describe('lib/config helpers', () => {
     const p = path.join(dir, 'config');
     fs.writeFileSync(p, '{"agent":"claude"}\n');
     assert.deepEqual(loadConfig(p), { agent: 'claude' });
+    fs.writeFileSync(p, '{"agent":"opencode"}\n');
+    assert.deepEqual(loadConfig(p), { agent: 'opencode' });
   });
 
   it('loadConfig throws on bad JSON', () => {
@@ -71,7 +73,18 @@ describe('lib/config helpers', () => {
     fs.writeFileSync(p, '{"agent":"gpt"}\n');
     assert.throws(
       () => loadConfig(p, '~/.orch/config'),
-      /invalid agent in ~\/\.orch\/config: "gpt"/,
+      /invalid agent in ~\/\.orch\/config: "gpt".*opencode/,
+    );
+  });
+
+  it('writeConfig accepts opencode and rejects unknown agents mentioning opencode', () => {
+    const dir = makeTmp('orch-cfg-write-oc-');
+    const p = path.join(dir, '.orch', 'config');
+    assert.equal(writeConfig(p, { agent: 'opencode' }), p);
+    assert.equal(fs.readFileSync(p, 'utf8'), '{\n  "agent": "opencode"\n}\n');
+    assert.throws(
+      () => writeConfig(p, { agent: 'gpt' }),
+      /invalid agent: "gpt".*opencode/,
     );
   });
 
@@ -270,6 +283,7 @@ describe('orch config CLI', () => {
     assert.match(stderr, /cursor/);
     assert.match(stderr, /claude/);
     assert.match(stderr, /agn/);
+    assert.match(stderr, /opencode/);
   });
 
   it('orch config is a subcommand (not a task prompt)', async () => {

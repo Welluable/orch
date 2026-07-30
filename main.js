@@ -10,6 +10,7 @@ import { fileURLToPath } from 'url';
 import { AgentCursor } from './lib/agent-cursor.js';
 import { AgentClaude } from './lib/agent-claude.js';
 import { AgentAgn } from './lib/agent-agn.js';
+import { AgentOpencode } from './lib/agent-opencode.js';
 import { parseTriageJson } from './lib/parse-triage-json.js';
 import { parseVerdict } from './lib/parse-verdict.js';
 import { splitStageSummary, printStageSummary } from './lib/stage-summary.js';
@@ -104,6 +105,12 @@ const AGENT_BACKENDS = {
         AgentClass: AgentAgn,
         binary: 'agn',
         missingHint: 'agn not found; run npm install -g @welluable/agn-cli or use --agent cursor',
+    },
+    opencode: {
+        AgentClass: AgentOpencode,
+        binary: 'opencode',
+        missingHint:
+            'opencode not found; install OpenCode (https://opencode.ai) or use --agent cursor',
     },
 };
 
@@ -2529,8 +2536,8 @@ program
     .option('--max-workers <n>', 'Max number of parallel fan-out workers (only meaningful with --fan-out)', positiveIntParser('--max-workers'), 4)
     .option('--max-concurrency <n>', 'Optional hard ceiling on in-flight fan-out workers at once (only meaningful with --fan-out; default: coordinator chooses)', positiveIntParser('--max-concurrency'))
     .addOption(
-        new Option('--agent <agent>', 'Agent backend to run the pipeline with: "cursor" (Cursor Agent CLI), "claude" (Claude Code CLI), or "agn" (agn CLI). Omitting uses local then global config, else cursor')
-            .choices(['cursor', 'claude', 'agn']),
+        new Option('--agent <agent>', 'Agent backend to run the pipeline with: "cursor" (Cursor Agent CLI), "claude" (Claude Code CLI), "agn" (agn CLI), or "opencode" (OpenCode CLI). Omitting uses local then global config, else cursor')
+            .choices(['cursor', 'claude', 'agn', 'opencode']),
     )
     .addOption(new Option('--worker <value>', 'internal: run a single fan-out worker "<parent-slug>:<worker-id>"').hideHelp())
     .addOption(new Option('--integrate <value>', 'internal: (re)run fan-out integration for "<parent-slug>"').hideHelp())
@@ -2541,12 +2548,15 @@ Examples:
   $ orch "fix the typo in the README" --agent claude
   $ orch "fix the bug described in task.md" --agent cursor -v
   $ orch "implement the local spec" --agent agn -v
+  $ orch "fix the typo in the README" --agent opencode
   $ orch --ask "where is the CLI entrypoint?" --agent claude
   $ orch --quick "fix the typo in the README" --agent claude
   $ orch "noop" --dry-run --agent cursor
+  $ orch "noop" --dry-run --agent opencode
   $ orch config                                          # print effective agent
   $ orch config --agent claude                           # pin global default
   $ orch config --agent agn --local                      # pin project default
+  $ orch config --agent opencode                         # pin OpenCode as default
 
 Headless runs:
   $ orch "long-running task" --detach --agent claude   # start in the background, prints the run slug
@@ -2674,8 +2684,8 @@ program
     .option('--detach', 'Run the continue in the background under the same slug')
     .option('--max-rounds <n>', 'Max writer⇄critic and writer⇄runner iterations per implementer loop', positiveIntParser('--max-rounds'), 5)
     .addOption(
-        new Option('--agent <agent>', 'Agent backend: "cursor", "claude", or "agn". Omitting uses local then global config, else cursor')
-            .choices(['cursor', 'claude', 'agn']),
+        new Option('--agent <agent>', 'Agent backend: "cursor", "claude", "agn", or "opencode". Omitting uses local then global config, else cursor')
+            .choices(['cursor', 'claude', 'agn', 'opencode']),
     )
     .action(async (slug, taskParts, options, command) => {
         // Parent program also defines --ask/--quick/--dry-run/--agent/--detach/
@@ -2784,7 +2794,7 @@ program
     .description('Print or set the default agent (global ~/.orch/config or local .orch/config)')
     .addOption(
         new Option('--agent <agent>', 'Set the default agent backend')
-            .choices(['cursor', 'claude', 'agn']),
+            .choices(['cursor', 'claude', 'agn', 'opencode']),
     )
     .option('--global', 'Write the global config (~/.orch/config); default when --agent is set')
     .option('--local', 'Write the project-local config (.orch/config)')

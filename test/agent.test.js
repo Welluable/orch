@@ -6,6 +6,7 @@ import path from 'node:path';
 import { AgentCursor } from '../lib/agent-cursor.js';
 import { AgentClaude } from '../lib/agent-claude.js';
 import { AgentAgn } from '../lib/agent-agn.js';
+import { AgentOpencode } from '../lib/agent-opencode.js';
 import { Agent, formatElapsed, maybePrintModelLine, modelPrintState } from '../lib/agent.js';
 import { FileTracker } from '../lib/file-tracker.js';
 import { formatToolStatus } from '../lib/tool-status.js';
@@ -106,6 +107,21 @@ describe('parseVerdict', () => {
   });
 });
 
+
+describe('Agent.handleProcessClose', () => {
+  it('defaults to finishing with exited N before result', () => {
+    const agent = new Agent('research', 'instr', 'prompt');
+    agent.spinner = fakeSpinner();
+    agent.startedAt = Date.now();
+    const finish = mock.fn();
+
+    agent.handleProcessClose(0, finish);
+
+    assert.equal(finish.mock.calls.length, 1);
+    const [err] = finish.mock.calls[0].arguments;
+    assert.match(String(err), /\[research\] exited 0 before result/);
+  });
+});
 
 describe('AgentCursor', () => {
   it('builds Cursor spawn config', () => {
@@ -442,6 +458,274 @@ describe('AgentAgn', () => {
 
     assert.deepEqual(statuses, []);
     assert.equal(finish.mock.calls.length, 0);
+  });
+});
+
+describe('AgentOpencode', () => {
+  const DENY_PERMISSION = '{"edit":"deny","bash":"deny"}';
+
+  it('builds write-mode spawn config with exact args, prompt last', () => {
+    const agent = new AgentOpencode('research', 'instr', 'prompt');
+    const { command, args, options } = agent.getSpawnConfig('hello');
+    assert.equal(command, 'opencode');
+    assert.deepEqual(args, ['run', '--format', 'json', '--auto', 'hello']);
+    assert.equal(options.env, process.env);
+  });
+
+  it('read-only mode inserts --agent plan after --auto and denies edit/bash via OPENCODE_PERMISSION', () => {
+    const agent = new AgentOpencode('ask', 'instr', 'prompt', { readOnly: true });
+    const { command, args, options } = agent.getSpawnConfig('hello');
+    assert.equal(command, 'opencode');
+    assert.deepEqual(args, ['run', '--format', 'json', '--auto', '--agent', 'plan', 'hello']);
+    assert.equal(options.env.OPENCODE_PERMISSION, DENY_PERMISSION);
+    assert.notEqual(options.env, process.env);
+    // Spread-inherit parent env (PATH, HOME, …); only OPENCODE_PERMISSION is overridden.
+    assert.equal(options.env.PATH, process.env.PATH);
+    assert.deepEqual(options.env, { ...process.env, OPENCODE_PERMISSION: DENY_PERMISSION });
+  });
+
+  it('does not pass -p, --password, --continue, --attach, --dir, --thinking, or --share', () => {
+    const agent = new AgentOpencode('research', 'instr', 'prompt');
+    const { args } = agent.getSpawnConfig('hello');
+    for (const banned of ['-p', '--password', '--continue', '--attach', '--dir', '--thinking', '--share']) {
+      assert.ok(!args.includes(banned), `unexpected arg ${banned}`);
+    }
+  });
+
+  it('defaults spawn cwd to process.cwd() and uses the shared stdio shape', () => {
+    const agent = new AgentOpencode('research', 'instr', 'prompt');
+    const { options } = agent.getSpawnConfig('hello');
+    assert.equal(options.cwd, process.cwd());
+    assert.deepEqual(options.stdio, ['ignore', 'pipe', 'pipe']);
+  });
+
+  it('uses an explicit cwd option for the spawn config', () => {
+    const agent = new AgentOpencode('code-writer', 'instr', 'prompt', { cwd: '/tmp/some-worktree' });
+    const { options } = agent.getSpawnConfig('hello');
+    assert.equal(options.cwd, '/tmp/some-worktree');
+  });
+
+  it('first step_start sets connected; later ones set thinking… when idle', () => {
+    const agent = new AgentOpencode('research', 'instr', 'prompt');
+    const statuses = [];
+    agent.setStatus = (text) => statuses.push(text);
+    const [stepStart] = loadFixture('opencode-step-start.jsonl');
+
+    agent.handleStreamEvent(stepStart, { verbose: false, finish: mock.fn() });
+    agent.handleStreamEvent(stepStart, { verbose: false, finish: mock.fn() });
+
+    assert.deepEqual(statuses, ['connected', 'thinking…']);
+  });
+
+  it('later step_start does not set thinking… when a tool is active', () => {
+    const agent = new AgentOpencode('research', 'instr', 'prompt');
+    const statuses = [];
+    agent.setStatus = (text) => statuses.push(text);
+    const [stepStart] = loadFixture('opencode-step-start.jsonl');
+
+    agent.handleStreamEvent(stepStart, { verbose: false, finish: mock.fn() });
+    agent.activeTools.set('call_1', { name: 'glob', args: {} });
+    agent.handleStreamEvent(stepStart, { verbose: false, finish: mock.fn() });
+
+    assert.deepEqual(statuses, ['connected']);
+  });
+
+  it('tool_use synthesizes started+completed and leaves no active tools', () => {
+    const agent = new AgentOpencode('code-writer', 'instr', 'prompt');
+    const [toolUse] = loadFixture('opencode-tool-use-glob.jsonl');
+    const baseOnToolEvent = agent.onToolEvent.bind(agent);
+    const onToolEvent = mock.fn((toolEvent) => baseOnToolEvent(toolEvent));
+    agent.onToolEvent = onToolEvent;
+
+    agent.handleStreamEvent(toolUse, { verbose: false, finish: mock.fn() });
+
+    assert.equal(onToolEvent.mock.calls.length, 2);
+    assert.deepEqual(onToolEvent.mock.calls[0].arguments[0], {
+      name: 'glob',
+      args: { pattern: '*.md' },
+      phase: 'started',
+      callId: 'call_1',
+    });
+    assert.deepEqual(onToolEvent.mock.calls[1].arguments[0], {
+      name: 'glob',
+      args: { pattern: '*.md' },
+      phase: 'completed',
+      callId: 'call_1',
+    });
+    assert.equal(agent.activeTools.size, 0);
+  });
+
+  it('step_finish with reason tool-calls does not settle', () => {
+    const agent = new AgentOpencode('code-writer', 'instr', 'prompt');
+    agent.spinner = fakeSpinner();
+    agent.startedAt = Date.now();
+    const finish = mock.fn();
+    const [toolCallsFinish] = loadFixture('opencode-text-and-stop.jsonl');
+
+    agent.handleStreamEvent(toolCallsFinish, { verbose: false, finish });
+
+    assert.equal(finish.mock.calls.length, 0);
+  });
+
+  it('text accumulates across parts; step_finish stop settles with the full buffer', () => {
+    const agent = new AgentOpencode('code-writer', 'instr', 'prompt');
+    agent.spinner = fakeSpinner();
+    agent.startedAt = Date.now();
+    const finish = mock.fn();
+    const events = loadFixture('opencode-text-and-stop.jsonl');
+
+    for (const event of events) {
+      agent.handleStreamEvent(event, { verbose: false, finish });
+    }
+
+    assert.equal(finish.mock.calls.length, 1);
+    const [err, value] = finish.mock.calls[0].arguments;
+    assert.equal(err, null);
+    assert.equal(value.ok, true);
+    assert.equal(value.result, 'There are two markdown files. Done.');
+  });
+
+  it('text in verbose mode writes to stderr instead of setStatus', () => {
+    const agent = new AgentOpencode('research', 'instr', 'prompt');
+    const statuses = [];
+    agent.setStatus = (text) => statuses.push(text);
+    const writes = [];
+    const restore = mock.method(process.stderr, 'write', (chunk) => {
+      writes.push(chunk);
+      return true;
+    });
+
+    agent.handleStreamEvent(
+      { type: 'text', part: { type: 'text', text: 'partial text' } },
+      { verbose: true, finish: mock.fn() },
+    );
+
+    restore.mock.restore();
+    assert.deepEqual(writes, ['partial text']);
+    assert.deepEqual(statuses, []);
+  });
+
+  it('text in non-verbose mode sets composing response… when no tool is active', () => {
+    const agent = new AgentOpencode('research', 'instr', 'prompt');
+    const statuses = [];
+    agent.setStatus = (text) => statuses.push(text);
+
+    agent.handleStreamEvent(
+      { type: 'text', part: { type: 'text', text: 'partial text' } },
+      { verbose: false, finish: mock.fn() },
+    );
+
+    assert.deepEqual(statuses, ['composing response…']);
+  });
+
+  it('error settles ok:false using error.data.message', () => {
+    const agent = new AgentOpencode('code-writer', 'instr', 'prompt');
+    agent.spinner = fakeSpinner();
+    agent.startedAt = Date.now();
+    const finish = mock.fn();
+    const [errorEvent] = loadFixture('opencode-error.jsonl');
+
+    agent.handleStreamEvent(errorEvent, { verbose: false, finish });
+
+    assert.equal(finish.mock.calls.length, 1);
+    const [err, value] = finish.mock.calls[0].arguments;
+    assert.equal(err, null);
+    assert.equal(value.ok, false);
+    assert.equal(value.result, 'provider auth required');
+  });
+
+  it('error falls back to error.name when data.message is absent', () => {
+    const agent = new AgentOpencode('code-writer', 'instr', 'prompt');
+    agent.spinner = fakeSpinner();
+    agent.startedAt = Date.now();
+    const finish = mock.fn();
+
+    agent.handleStreamEvent(
+      { type: 'error', error: { name: 'UnknownError' } },
+      { verbose: false, finish },
+    );
+
+    assert.equal(finish.mock.calls.length, 1);
+    const [err, value] = finish.mock.calls[0].arguments;
+    assert.equal(err, null);
+    assert.equal(value.ok, false);
+    assert.equal(value.result, 'UnknownError');
+  });
+
+  it('step_finish with missing reason settles after text', () => {
+    const agent = new AgentOpencode('code-writer', 'instr', 'prompt');
+    agent.spinner = fakeSpinner();
+    agent.startedAt = Date.now();
+    const finish = mock.fn();
+
+    agent.handleStreamEvent(
+      { type: 'text', part: { type: 'text', text: 'answer' } },
+      { verbose: false, finish },
+    );
+    agent.handleStreamEvent(
+      { type: 'step_finish', part: { type: 'step-finish' } },
+      { verbose: false, finish },
+    );
+
+    assert.equal(finish.mock.calls.length, 1);
+    const [err, value] = finish.mock.calls[0].arguments;
+    assert.equal(err, null);
+    assert.equal(value.ok, true);
+    assert.equal(value.result, 'answer');
+  });
+
+  it('ignores unknown event types (no status change, no finish call)', () => {
+    const agent = new AgentOpencode('research', 'instr', 'prompt');
+    const statuses = [];
+    agent.setStatus = (text) => statuses.push(text);
+    const finish = mock.fn();
+
+    agent.handleStreamEvent({ type: 'session.status' }, { verbose: false, finish });
+
+    assert.deepEqual(statuses, []);
+    assert.equal(finish.mock.calls.length, 0);
+  });
+
+  it('exit 0 with buffered text settles success via handleProcessClose (defensive race)', () => {
+    const agent = new AgentOpencode('code-writer', 'instr', 'prompt');
+    agent.spinner = fakeSpinner();
+    agent.startedAt = Date.now();
+    const finish = mock.fn();
+
+    agent.handleStreamEvent(
+      { type: 'text', part: { type: 'text', text: 'race answer' } },
+      { verbose: false, finish },
+    );
+    agent.handleProcessClose(0, finish);
+
+    assert.equal(finish.mock.calls.length, 1);
+    const [err, value] = finish.mock.calls[0].arguments;
+    assert.equal(err, null);
+    assert.equal(value.ok, true);
+    assert.equal(value.result, 'race answer');
+  });
+
+  it('exit non-zero or empty buffer keeps exited N before result via handleProcessClose', () => {
+    const agent = new AgentOpencode('code-writer', 'instr', 'prompt');
+    agent.spinner = fakeSpinner();
+    agent.startedAt = Date.now();
+
+    const finishEmpty = mock.fn();
+    agent.handleProcessClose(0, finishEmpty);
+    assert.equal(finishEmpty.mock.calls.length, 1);
+    assert.match(String(finishEmpty.mock.calls[0].arguments[0]), /exited 0 before result/);
+
+    const withText = new AgentOpencode('code-writer', 'instr', 'prompt');
+    withText.spinner = fakeSpinner();
+    withText.startedAt = Date.now();
+    const finishFail = mock.fn();
+    withText.handleStreamEvent(
+      { type: 'text', part: { type: 'text', text: 'partial' } },
+      { verbose: false, finish: finishFail },
+    );
+    withText.handleProcessClose(1, finishFail);
+    assert.equal(finishFail.mock.calls.length, 1);
+    assert.match(String(finishFail.mock.calls[0].arguments[0]), /exited 1 before result/);
   });
 });
 
