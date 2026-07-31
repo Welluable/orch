@@ -19,7 +19,7 @@ import { createWorktree } from './lib/worktree.js';
 import { commitWorktree, collectWorktreeChanges, printFilesChanged } from './lib/commit.js';
 import { FileTracker } from './lib/file-tracker.js';
 import { allocateJob } from './lib/job-lifecycle.js';
-import { setJobSlug, exitCodeForSignal, formatElapsed } from './lib/agent.js';
+import { setJobSlug, exitCodeForSignal, formatElapsed, flushFailureLog, beginStageCapture } from './lib/agent.js';
 import {
     jobPaths,
     readJob,
@@ -42,6 +42,11 @@ import {
     snapshotPriorOutcome,
     buildPriorOutcomeText,
 } from './lib/continue.js';
+import {
+    validateResume,
+    reopenForResume,
+    runRecover,
+} from './lib/resume.js';
 import { askAgentArgs } from './agents/ask.js';
 import { triageAgentArgs } from './agents/triage.js';
 import { quickFixAgentArgs } from './agents/quick-fix.js';
@@ -226,6 +231,21 @@ function lastNonEmptyLine(content) {
     return lines[lines.length - 1];
 }
 
+/** Status / list `next:` hint per `.spec/resume.md` decision 28. */
+function nextHintForRecord(record) {
+    if (!record) return null;
+    if (record.state === 'paused' || record.state === 'pausing') {
+        return `orch resume ${record.slug}`;
+    }
+    if (record.state === 'failed' || record.state === 'stopped' || record.state === 'crashed') {
+        return `orch resume ${record.slug}`;
+    }
+    if (record.state === 'done') {
+        return `orch continue ${record.slug} "<follow-up>"`;
+    }
+    return null;
+}
+
 export function formatStatus(cwd, record) {
     const lines = [
         `slug:     ${record.slug}`,
@@ -262,6 +282,9 @@ export function formatStatus(cwd, record) {
         const last = lastNonEmptyLine(fs.readFileSync(statusPath, 'utf8'));
         if (last) lines.push(`status:   ${last}`);
     }
+
+    const nextHint = nextHintForRecord(record);
+    if (nextHint) lines.push(`next:     ${nextHint}`);
 
     // Child view: parent line only — do not expand siblings.
     // Read children from disk without reconcile so status reflects recorded
@@ -323,8 +346,24 @@ function defaultExecFile(command, args, options = {}) {
 
 /** Patch a job to a terminal state and write a matching `lastOutcome` in the same write. */
 function patchTerminalJob(patchJobFn, jobCwd, jobSlug, { state, exitCode, summary = '', error = null, task }) {
-    if (!jobSlug) return;
+    if (!jobSlug) return null;
     const finishedAt = new Date().toISOString();
+    let outcomeError = error;
+    if (state === 'failed') {
+        const pointer = flushFailureLog({
+            cwd: jobCwd,
+            slug: jobSlug,
+            state,
+            exitCode,
+            finishedAt,
+            task,
+            error,
+        });
+        if (pointer) {
+            outcomeError = pointer;
+            console.error(`error:    ${pointer}`);
+        }
+    }
     patchJobFn(jobCwd, jobSlug, (current) => ({
         state,
         exitCode,
@@ -338,9 +377,23 @@ function patchTerminalJob(patchJobFn, jobCwd, jobSlug, { state, exitCode, summar
             finishedAt,
             task: task ?? current.task,
             summary,
-            error,
+            error: outcomeError,
         }),
     }));
+    return outcomeError;
+}
+
+/** Patch live cursor fields and start stage-verbose capture when a job is active. */
+function patchJobCursor(patchJobFn, jobCwd, jobSlug, fields) {
+    if (!jobSlug) return;
+    if ('phase' in fields || 'stage' in fields) {
+        beginStageCapture({
+            phase: fields.phase ?? null,
+            stage: fields.stage ?? null,
+            round: 'round' in fields ? fields.round : null,
+        });
+    }
+    return patchJobFn(jobCwd, jobSlug, fields);
 }
 
 /** The test-writer ⇄ test-critic loop shared by `runPipeline` and `runWorkerPipeline`. */
@@ -355,13 +408,17 @@ async function runTestLoop({
     verbose,
     jobPatch,
     jobCheckpoint,
+    startAt = null,
 }) {
     let testAccepted = null;
     let criticFeedback = null;
     let testRound = 0;
     let testSummary = '';
 
-    for (let round = 1; round <= maxRounds; round++) {
+    // Resume at recorded round; always re-run writer for that round (need output for critic).
+    const startRound = Math.max(1, Number(startAt?.round) || 1);
+
+    for (let round = startRound; round <= maxRounds; round++) {
         testRound = round;
 
         jobPatch({ phase: 'test-loop', stage: 'test-writer', round });
@@ -477,6 +534,7 @@ async function runCodeLoop({
     acceptedVerification,
     runnerFirst = false,
     loopTitle = 'Code loop',
+    startAt = null,
 }) {
     let codeAccepted = null;
     let runnerFeedback = null;
@@ -484,9 +542,14 @@ async function runCodeLoop({
     let codeSummary = '';
     let codeWriterContent = null;
 
-    for (let round = 1; round <= maxRounds; round++) {
+    const startRound = Math.max(1, Number(startAt?.round) || 1);
+    // When resuming at test-runner, skip writer once for that round (runner-first style).
+    let resumeSkipWriter = startAt?.stage === 'test-runner';
+
+    for (let round = startRound; round <= maxRounds; round++) {
         codeRound = round;
-        const skipWriter = runnerFirst && round === 1;
+        const skipWriter = (runnerFirst && round === 1) || (resumeSkipWriter && round === startRound);
+        if (resumeSkipWriter && round === startRound) resumeSkipWriter = false;
 
         if (!skipWriter) {
             jobPatch({ phase: 'code-loop', stage: 'code-writer', round });
@@ -608,7 +671,7 @@ export async function runPipeline(prompt, options) {
 
     const jobPatch = (fields) => {
         if (!jobSlug) return;
-        patchJobFn(jobCwd, jobSlug, fields);
+        return patchJobCursor(patchJobFn, jobCwd, jobSlug, fields);
     };
     const jobCheckpoint = async () => {
         if (!jobSlug) return;
@@ -867,7 +930,7 @@ export async function runPipeline(prompt, options) {
                 // Best-effort: don't let a job-state write failure mask the real error.
             }
         }
-        console.error(`next:   orch continue ${jobSlug ?? '<slug>'} "fix the failure and finish"`);
+        console.error(`next:   orch resume ${jobSlug ?? '<slug>'}`);
         process.exit(1);
     }
 }
@@ -978,7 +1041,7 @@ export async function runContinuePipeline(prompt, options = {}) {
 
     const jobPatch = (fields) => {
         if (!jobSlug) return;
-        patchJobFn(jobCwd, jobSlug, fields);
+        return patchJobCursor(patchJobFn, jobCwd, jobSlug, fields);
     };
     const jobCheckpoint = async () => {
         if (!jobSlug) return;
@@ -1260,6 +1323,433 @@ export async function runContinueDetached(slug, prompt, options = {}) {
 }
 
 /**
+ * Failure-resume pipeline: recover → re-enter unfinished stage → remaining phases.
+ * Distinct from `runContinuePipeline` (new-task continue). See `.spec/resume.md`.
+ */
+export async function runResumePipeline(options = {}) {
+    const verbose = Boolean(options.verbose);
+    const maxRounds = options.maxRounds ?? 5;
+    const backend = AGENT_BACKENDS[options.agent];
+    if (!backend) {
+        throw new Error(`Unknown agent backend: ${options.agent}`);
+    }
+    const AgentClass = options.AgentClass ?? backend.AgentClass;
+    const cwd = options.cwd ?? process.cwd();
+    const {
+        slug,
+        priorOutcome,
+        recoverBrief = '',
+    } = options;
+
+    const createRunContextFn = options.createRunContext ?? createRunContext;
+    const createWorktreeFn = options.createWorktree ?? createWorktree;
+    const commitWorktreeFn = options.commitWorktree ?? commitWorktree;
+    const collectWorktreeChangesFn = options.collectWorktreeChanges ?? collectWorktreeChanges;
+    const patchWorkerFn = options.patchWorker ?? patchWorker;
+    const recordChangedFilesFn = options.recordChangedFiles ?? recordChangedFiles;
+    const execFileFn = options.execFile;
+
+    const jobSlug = options.jobSlug ?? slug ?? process.env.ORCH_JOB_SLUG;
+    const jobCwd = options.jobCwd ?? cwd;
+    const patchJobFn = options.patchJob ?? patchJob;
+    const checkpointPauseFn = options.checkpointPause ?? checkpointPause;
+    const pausePollIntervalMs = options.pausePollIntervalMs ?? 500;
+
+    const jobRecord = (jobSlug && readJob(jobCwd, jobSlug)) || null;
+    const worktreePath = options.worktreePath ?? jobRecord?.worktree;
+    const branch = options.branch ?? jobRecord?.branch;
+    const role = options.role ?? jobRecord?.role;
+    const parentSlug = options.parentSlug ?? jobRecord?.parent;
+    const workerId = options.workerId ?? jobRecord?.workerId;
+    const prompt = options.prompt ?? jobRecord?.task ?? priorOutcome?.task ?? '';
+
+    const jobPatch = (fields) => {
+        if (!jobSlug) return;
+        return patchJobCursor(patchJobFn, jobCwd, jobSlug, fields);
+    };
+    const jobCheckpoint = async () => {
+        if (!jobSlug) return;
+        await checkpointPauseFn(jobCwd, jobSlug, { pollIntervalMs: pausePollIntervalMs });
+    };
+
+    if (!options.AgentClass) {
+        ensureBinaryOnPath(backend.binary, options.agent);
+    }
+
+    const prior = priorOutcome ?? {};
+    const phase = prior.phase ?? jobRecord?.phase ?? null;
+    const stage = prior.stage ?? jobRecord?.stage ?? null;
+    const round = prior.round ?? jobRecord?.round ?? null;
+
+    const withRecover = (basePrompt) => (
+        recoverBrief ? `${recoverBrief}\n\n${basePrompt}` : basePrompt
+    );
+
+    try {
+        const runContext = createRunContextFn({ cwd, slug: jobSlug });
+        fs.mkdirSync(path.dirname(runContext.statusPath), { recursive: true });
+
+        const resumeSection = [
+            '',
+            '## Resume',
+            '',
+            `- Started: ${new Date().toISOString()}`,
+            `- Prior state: ${prior.state ?? '(none)'}`,
+            `- Reentry: ${phase ?? '-'}/${stage ?? '-'} (round ${round ?? '-'})`,
+            `- Branch: \`${branch}\``,
+            `- Worktree: \`${worktreePath}\``,
+            '',
+        ].join('\n');
+        fs.appendFileSync(runContext.statusPath, resumeSection);
+
+        const hasResearch = fs.existsSync(runContext.researchPath);
+        const hasTask = fs.existsSync(runContext.taskPath);
+        const skipEarly = ['worktree', 'test-loop', 'code-loop', 'commit'].includes(phase)
+            && hasResearch && hasTask;
+
+        let liveWorktree = worktreePath;
+        let liveBranch = branch;
+        let researchContent = hasResearch
+            ? fs.readFileSync(runContext.researchPath, 'utf8')
+            : '';
+
+        // --- research (only when cursor is research, or early artifacts missing) ---
+        if (phase === 'research' || (!skipEarly && !hasResearch && ['research', 'plan', null].includes(phase))) {
+            jobPatch({ phase: 'research', stage: 'research', round: null });
+            const research = researchAgentArgs({
+                prompt: withRecover(prompt),
+                cwd: liveWorktree || cwd,
+                researchPath: runContext.researchPath,
+            });
+            const researchAgent = new AgentClass(
+                research.name,
+                research.instructions,
+                research.prompt,
+                research.options,
+            );
+            const researchResult = await researchAgent.run({ verbose });
+            await jobCheckpoint();
+            const split = splitStageSummary(researchResult.result);
+            researchContent = split.content;
+            printStageSummary('research', resolveStageSummary('research', split.summary, researchContent));
+        }
+
+        // --- plan ---
+        if (phase === 'plan' || phase === 'research' || (!skipEarly && !hasTask)) {
+            jobPatch({ phase: 'plan', stage: 'planner', round: null });
+            const plannerPrompt = phase === 'plan' ? withRecover(prompt) : prompt;
+            const researchOut = researchContent
+                || (hasResearch ? fs.readFileSync(runContext.researchPath, 'utf8') : '');
+            const planner = plannerAgentArgs({
+                prompt: plannerPrompt,
+                cwd: liveWorktree || cwd,
+                researchPath: runContext.researchPath,
+                taskPath: runContext.taskPath,
+                researchOutput: researchOut,
+            });
+            const plannerAgent = new AgentClass(
+                planner.name,
+                planner.instructions,
+                planner.prompt,
+                planner.options,
+            );
+            const plannerResult = await plannerAgent.run({ verbose });
+            await jobCheckpoint();
+            const { content: plannerContent, summary: plannerSummary } = splitStageSummary(plannerResult.result);
+            printStageSummary('planner', resolveStageSummary('planner', plannerSummary, plannerContent));
+        }
+
+        // --- worktree ensure ---
+        if (!liveWorktree || !fs.existsSync(liveWorktree) || phase === 'worktree') {
+            if (liveWorktree && fs.existsSync(liveWorktree) && liveBranch) {
+                jobPatch({ phase: 'worktree', stage: 'worktree', round: null, branch: liveBranch, worktree: liveWorktree });
+            } else {
+                jobPatch({ phase: 'worktree', stage: 'worktree', round: null });
+                const wt = createWorktreeFn({ cwd, slug: jobSlug });
+                liveWorktree = wt.worktreePath;
+                liveBranch = wt.branch;
+                jobPatch({ branch: liveBranch, worktree: liveWorktree });
+            }
+        }
+
+        let acceptedVerification = '';
+        const enterTest = !phase || ['research', 'plan', 'worktree', 'test-loop'].includes(phase);
+        const enterCode = !phase || ['research', 'plan', 'worktree', 'test-loop', 'code-loop'].includes(phase);
+        const enterCommit = true;
+
+        if (enterTest && phase !== 'code-loop' && phase !== 'commit') {
+            const testStartAt = phase === 'test-loop'
+                ? { stage: stage ?? 'test-writer', round: round ?? 1 }
+                : null;
+            const testPrompt = phase === 'test-loop' ? withRecover(prompt) : prompt;
+            const testAccepted = await runTestLoop({
+                prompt: testPrompt,
+                worktreePath: liveWorktree,
+                branch: liveBranch,
+                taskPath: runContext.taskPath,
+                statusPath: runContext.statusPath,
+                maxRounds,
+                AgentClass,
+                verbose,
+                jobPatch,
+                jobCheckpoint,
+                startAt: testStartAt,
+            });
+            acceptedVerification = [testAccepted.verdict.summary, testAccepted.writerContent]
+                .filter(Boolean)
+                .join('\n');
+        } else if (hasTask) {
+            // Code-loop / commit reentry: best-effort verification from task.md
+            acceptedVerification = fs.readFileSync(runContext.taskPath, 'utf8').slice(0, 2000);
+        }
+
+        if (enterCode && phase !== 'commit') {
+            const codeStartAt = phase === 'code-loop'
+                ? { stage: stage ?? 'code-writer', round: round ?? 1 }
+                : null;
+            const codePrompt = phase === 'code-loop' ? withRecover(prompt) : prompt;
+            const codeAccepted = await runCodeLoop({
+                prompt: codePrompt,
+                worktreePath: liveWorktree,
+                branch: liveBranch,
+                taskPath: runContext.taskPath,
+                statusPath: runContext.statusPath,
+                maxRounds,
+                AgentClass,
+                verbose,
+                jobPatch,
+                jobCheckpoint,
+                acceptedVerification,
+                startAt: codeStartAt,
+            });
+
+            if (enterCommit) {
+                jobPatch({ phase: 'commit', stage: 'commit', round: null });
+                const message = `orch: ${jobSlug} (resume): ${String(prompt).split('\n')[0]}`;
+                const worktreeChanges = await collectWorktreeChangesFn({ worktreePath: liveWorktree });
+                printFilesChanged(worktreeChanges);
+                const commitResult = await commitWorktreeFn({
+                    worktreePath: liveWorktree,
+                    branch: liveBranch,
+                    message,
+                });
+
+                if (commitResult.committed) {
+                    fs.appendFileSync(
+                        runContext.statusPath,
+                        `\n## Commit\n\n- SHA: \`${commitResult.sha}\`\n- Branch: \`${commitResult.branch}\`\n`,
+                    );
+                    console.log(`commit: ${commitResult.sha.slice(0, 7)} on ${commitResult.branch}`);
+                    console.log(`merge:  git merge ${commitResult.branch}`);
+                    console.log(`next:   orch continue ${jobSlug} "…"`);
+                } else {
+                    fs.appendFileSync(
+                        runContext.statusPath,
+                        `\n## Commit\n\n- No changes to commit on \`${commitResult.branch}\`.\n`,
+                    );
+                    console.log(`commit: no changes on ${commitResult.branch}`);
+                }
+
+                if (role === 'worker' && parentSlug && workerId) {
+                    let changedFiles = [];
+                    try {
+                        changedFiles = recordChangedFilesFn({
+                            repoRoot: cwd,
+                            base: undefined,
+                            branch: liveBranch,
+                            execFile: execFileFn,
+                        });
+                    } catch {
+                        // Best-effort.
+                    }
+                    const seqDoc = readSeq(cwd, parentSlug);
+                    if (seqDoc) {
+                        const patchUnitFn = options.patchUnit ?? patchUnit;
+                        patchUnitFn(cwd, parentSlug, workerId, {
+                            state: 'done',
+                            sha: commitResult.sha,
+                            changedFiles,
+                            slug: jobSlug,
+                        });
+                        console.log(`next:   orch --seq-continue ${parentSlug}`);
+                    } else if (commitResult.committed) {
+                        patchWorkerFn(cwd, parentSlug, workerId, {
+                            state: 'done',
+                            sha: commitResult.sha,
+                            changedFiles,
+                        });
+                        console.log(`next:   orch --integrate ${parentSlug}`);
+                    }
+                }
+
+                patchTerminalJob(patchJobFn, jobCwd, jobSlug, {
+                    state: 'done',
+                    exitCode: 0,
+                    summary: codeAccepted?.verdict?.summary ?? '',
+                    error: null,
+                    task: prompt,
+                });
+            }
+            return;
+        }
+
+        // commit-only reentry
+        if (phase === 'commit') {
+            jobPatch({ phase: 'commit', stage: 'commit', round: null });
+            const message = `orch: ${jobSlug} (resume): ${String(prompt).split('\n')[0]}`;
+            const worktreeChanges = await collectWorktreeChangesFn({ worktreePath: liveWorktree });
+            printFilesChanged(worktreeChanges);
+            const commitResult = await commitWorktreeFn({
+                worktreePath: liveWorktree,
+                branch: liveBranch,
+                message,
+            });
+            if (commitResult.committed) {
+                console.log(`commit: ${commitResult.sha.slice(0, 7)} on ${commitResult.branch}`);
+                console.log(`next:   orch continue ${jobSlug} "…"`);
+            } else {
+                console.log(`commit: no changes on ${commitResult.branch}`);
+            }
+            if (role === 'worker' && parentSlug && workerId && commitResult.committed) {
+                const seqDoc = readSeq(cwd, parentSlug);
+                if (seqDoc) {
+                    const patchUnitFn = options.patchUnit ?? patchUnit;
+                    patchUnitFn(cwd, parentSlug, workerId, {
+                        state: 'done',
+                        sha: commitResult.sha,
+                        changedFiles: [],
+                        slug: jobSlug,
+                    });
+                } else {
+                    patchWorkerFn(cwd, parentSlug, workerId, {
+                        state: 'done',
+                        sha: commitResult.sha,
+                        changedFiles: [],
+                    });
+                }
+            }
+            patchTerminalJob(patchJobFn, jobCwd, jobSlug, {
+                state: 'done',
+                exitCode: 0,
+                summary: '',
+                error: null,
+                task: prompt,
+            });
+        }
+    } catch (err) {
+        console.error(`Error: ${err.message}`);
+        if (role === 'worker' && parentSlug && workerId) {
+            try {
+                const seqDoc = readSeq(cwd, parentSlug);
+                if (seqDoc) {
+                    const patchUnitFn = options.patchUnit ?? patchUnit;
+                    patchUnitFn(cwd, parentSlug, workerId, { state: 'failed' });
+                } else {
+                    patchWorkerFn(cwd, parentSlug, workerId, { state: 'failed' });
+                }
+            } catch {
+                // Best-effort.
+            }
+        }
+        if (jobSlug) {
+            try {
+                patchTerminalJob(patchJobFn, jobCwd, jobSlug, {
+                    state: 'failed',
+                    exitCode: 1,
+                    summary: '',
+                    error: err.message,
+                    task: prompt,
+                });
+            } catch {
+                // Best-effort.
+            }
+        }
+        console.error(`next:   orch resume ${jobSlug ?? '<slug>'}`);
+        process.exit(1);
+    }
+}
+
+/**
+ * Detach-parent path for failure `orch resume`: spawn background child with
+ * ORCH_JOB_SLUG, reopen with child pid, print resumed, exit.
+ */
+export async function runResumeDetached(slug, options = {}) {
+    const {
+        agent,
+        maxRounds = 5,
+        verbose,
+        cwd = process.cwd(),
+        spawn: spawnFn = spawn,
+        exit = (code) => process.exit(code),
+        validateResume: validateResumeFn = validateResume,
+        reopenForResume: reopenForResumeFn = reopenForResume,
+        snapshotPriorOutcome: snapshotPriorOutcomeFn = snapshotPriorOutcome,
+    } = options;
+
+    const backend = AGENT_BACKENDS[agent];
+    if (!backend) {
+        throw new Error(`Unknown agent backend: ${agent}`);
+    }
+
+    let validated;
+    try {
+        validated = validateResumeFn(cwd, slug, {});
+    } catch (err) {
+        console.error(`Error: ${err.message}`);
+        exit(1);
+        return;
+    }
+
+    if (validated.mode !== 'failure') {
+        console.error(`Error: --detach only applies to failure resume (got mode ${validated.mode})`);
+        exit(1);
+        return;
+    }
+
+    if (!isBinaryOnPath(backend.binary)) {
+        console.error(binaryMissingHint(agent));
+        exit(1);
+        return;
+    }
+
+    const record = validated.record;
+    const prior = snapshotPriorOutcomeFn(cwd, slug, record);
+    const { logPath } = jobPaths(cwd, slug);
+    fs.mkdirSync(path.dirname(logPath), { recursive: true });
+    const logFd = fs.openSync(logPath, 'a');
+
+    const childArgs = [
+        __filename,
+        'resume',
+        slug,
+        '--agent',
+        agent,
+        '--max-rounds',
+        String(maxRounds),
+    ];
+    if (verbose) childArgs.push('--verbose');
+
+    const child = spawnFn(process.execPath, childArgs, {
+        cwd,
+        env: { ...process.env, ORCH_JOB_SLUG: slug, ORCH_DETACHED: '1' },
+        detached: true,
+        stdio: ['ignore', logFd, logFd],
+    });
+    child.unref();
+
+    reopenForResumeFn(cwd, slug, {
+        agent,
+        maxRounds,
+        pid: child.pid,
+        prior,
+    });
+
+    // Recover runs in the child; parent only prints the resume line.
+    console.log(`resumed ${slug} (pid ${child.pid})`);
+    exit(0);
+}
+
+/**
  * The `--worker <parent>:<workerId>` driver: skips triage and runs research → planner →
  * worktree (from the fan-out's recorded `base`) → test loop → code loop (writer-first) →
  * commit, exactly like `runPipeline` minus triage. `prompt` is the worker's subtask text
@@ -1294,7 +1784,7 @@ export async function runWorkerPipeline(prompt, options = {}) {
 
     const jobPatch = (fields) => {
         if (!jobSlug) return;
-        patchJobFn(jobCwd, jobSlug, fields);
+        return patchJobCursor(patchJobFn, jobCwd, jobSlug, fields);
     };
     const jobCheckpoint = async () => {
         if (!jobSlug) return;
@@ -1449,7 +1939,7 @@ export async function runWorkerPipeline(prompt, options = {}) {
                 // Best-effort: don't let a job-state write failure mask the real error.
             }
         }
-        console.error(`next:   orch continue ${jobSlug ?? '<slug>'} "fix the failure and finish"`);
+        console.error(`next:   orch resume ${jobSlug ?? '<slug>'}`);
         if (parentSlug) console.error(`        orch --integrate ${parentSlug}`);
         process.exit(1);
     }
@@ -1488,7 +1978,7 @@ export async function runUnitPipeline(prompt, options = {}) {
 
     const jobPatch = (fields) => {
         if (!jobSlug) return;
-        patchJobFn(jobCwd, jobSlug, fields);
+        return patchJobCursor(patchJobFn, jobCwd, jobSlug, fields);
     };
     const jobCheckpoint = async () => {
         if (!jobSlug) return;
@@ -1647,7 +2137,7 @@ export async function runUnitPipeline(prompt, options = {}) {
                 // Best-effort.
             }
         }
-        console.error(`next:   orch continue ${jobSlug ?? '<slug>'} "fix the failure and finish"`);
+        console.error(`next:   orch resume ${jobSlug ?? '<slug>'}`);
         if (parentSlug) console.error(`        orch --seq-continue ${parentSlug}`);
         exitFn(1);
     }
@@ -1690,7 +2180,7 @@ export async function mergeOneUnit(options = {}) {
 
     const jobPatch = (fields) => {
         if (!jobSlug) return;
-        patchJobFn(jobCwd, jobSlug, fields);
+        return patchJobCursor(patchJobFn, jobCwd, jobSlug, fields);
     };
     const jobCheckpoint = async () => {
         if (!jobSlug) return;
@@ -1884,7 +2374,7 @@ export async function runIntegratePipeline(options = {}) {
 
     const jobPatch = (fields) => {
         if (!jobSlug) return;
-        patchJobFn(jobCwd, jobSlug, fields);
+        return patchJobCursor(patchJobFn, jobCwd, jobSlug, fields);
     };
     const jobCheckpoint = async () => {
         if (!jobSlug) return;
@@ -2209,7 +2699,7 @@ export async function runSeqPipeline(prompt, options = {}) {
 
     const jobPatch = (fields) => {
         if (!jobSlug) return;
-        patchJobFn(jobCwd, jobSlug, fields);
+        return patchJobCursor(patchJobFn, jobCwd, jobSlug, fields);
     };
     const jobCheckpoint = async () => {
         if (!jobSlug) return;
@@ -2761,7 +3251,7 @@ export async function runSeqContinuePipeline(options = {}) {
 
     const jobPatch = (fields) => {
         if (!jobSlug) return;
-        patchJobFn(jobCwd, jobSlug, fields);
+        return patchJobCursor(patchJobFn, jobCwd, jobSlug, fields);
     };
     const jobCheckpoint = async () => {
         if (!jobSlug) return;
@@ -3007,7 +3497,7 @@ export async function runFanoutPipeline(prompt, options = {}) {
 
     const jobPatch = (fields) => {
         if (!jobSlug) return;
-        patchJobFn(jobCwd, jobSlug, fields);
+        return patchJobCursor(patchJobFn, jobCwd, jobSlug, fields);
     };
     const jobCheckpoint = async () => {
         if (!jobSlug) return;
@@ -3885,8 +4375,8 @@ Headless runs:
   $ orch list                                          # show all tracked runs
   $ orch status [slug]                                 # show full status (defaults to most recent)
   $ orch pause <slug>                                  # request a pause at the next stage boundary
-  $ orch resume <slug>                                 # unpause a paused/pausing run
-  $ orch continue <slug> "new task"                    # new work on a finished run's worktree
+  $ orch resume <slug>                                 # unpause live pause, or recover failed/stopped/crashed
+  $ orch continue <slug> "new task"                    # new work on a done run's worktree
                                                        # (workers: same command; then re-integrate the parent)
   $ orch stop <slug>                                   # send SIGTERM to a running job
   $ orch logs <slug> [-f]                              # print (or follow) a run's log file
@@ -4092,7 +4582,7 @@ Sequential (--seq):
 program
     .command('continue')
     .description(
-        'Start new complex work on a finished run\'s existing worktree (not the same as resume, which only unpauses). Workers: continue the worker slug, then re-integrate the parent',
+        'Start new complex work on a done run\'s existing worktree (not crash recovery — use orch resume for failed/stopped/crashed). Workers: continue the worker slug, then re-integrate the parent',
     )
     .argument('<slug>', 'Existing run slug under .orch/')
     .argument('<task...>', 'New task prompt for this continue iteration')
@@ -4325,23 +4815,160 @@ program
 program
     .command('resume')
     .argument('<slug>', 'Run slug to resume')
-    .description('Resume a paused (or pausing) job')
-    .action((slug) => {
+    .description(
+        'Unpause a live paused/pausing job, or recover a failed/stopped/crashed complex job at its unfinished stage',
+    )
+    .option('-v, --verbose', 'Stream agent thinking/output deltas to stderr as the pipeline runs')
+    .option('--dry-run', 'Validate eligibility only; do not unpause, reopen, or run agents')
+    .option('--ask', 'Rejected: resume does not support --ask')
+    .option('--quick', 'Rejected: resume does not support --quick')
+    .option('--detach', 'Run failure resume in the background under the same slug')
+    .option('--max-rounds <n>', 'Max writer⇄critic and writer⇄runner iterations per implementer loop', positiveIntParser('--max-rounds'), 5)
+    .addOption(
+        new Option('--agent <agent>', 'Agent backend: "cursor", "claude", "agn", or "opencode". Omitting uses local then global config, else cursor')
+            .choices(['cursor', 'claude', 'agn', 'opencode']),
+    )
+    .action(async (slug, options, command) => {
+        const opts = typeof command.optsWithGlobals === 'function'
+            ? command.optsWithGlobals()
+            : { ...program.opts(), ...options };
         const cwd = process.cwd();
+        opts.agent = resolveAgentOrExit(opts.agent, cwd);
+
+        let validated;
         try {
-            const record = readJob(cwd, slug);
-            if (!record) throw new Error(`requestResume: unknown job ${slug}`);
-            if (isCascadeParent(cwd, record)) {
-                cascadeResume(cwd, slug);
-                console.log(`resumed ${slug}`);
-            } else {
-                requestResume(cwd, slug);
-                console.log(`resumed ${slug}`);
-            }
+            validated = validateResume(cwd, slug, {
+                ask: opts.ask,
+                quick: opts.quick,
+            });
         } catch (err) {
             console.error(`Error: ${err.message}`);
             process.exit(1);
+            return;
         }
+
+        const { mode, record } = validated;
+
+        if (opts.dryRun) {
+            if (mode === 'failure') {
+                const backend = AGENT_BACKENDS[opts.agent];
+                if (!isBinaryOnPath(backend.binary)) {
+                    console.error(binaryMissingHint(opts.agent));
+                    process.exit(1);
+                    return;
+                }
+            }
+            console.log(`dry-run: resume ${slug} ok (${mode})`);
+            return;
+        }
+
+        if (mode === 'unpause') {
+            try {
+                if (isCascadeParent(cwd, record)) {
+                    cascadeResume(cwd, slug);
+                    console.log(`resumed ${slug}`);
+                } else {
+                    requestResume(cwd, slug);
+                    console.log(`resumed ${slug}`);
+                }
+            } catch (err) {
+                console.error(`Error: ${err.message}`);
+                process.exit(1);
+            }
+            return;
+        }
+
+        if (mode === 'noop') {
+            console.log(`resumed ${slug}`);
+            return;
+        }
+
+        // mode === 'failure'
+        if (opts.detach) {
+            await runResumeDetached(slug, {
+                agent: opts.agent,
+                maxRounds: opts.maxRounds,
+                verbose: opts.verbose,
+                cwd,
+            });
+            return;
+        }
+
+        const alreadyReopened = Boolean(process.env.ORCH_JOB_SLUG);
+        let priorOutcome;
+        let worktreePath = record.worktree;
+        let branch = record.branch;
+        let role = record.role;
+        let parentSlug = record.parent;
+        let workerId = record.workerId;
+        let recoverBrief = '';
+
+        if (!alreadyReopened) {
+            priorOutcome = snapshotPriorOutcome(cwd, slug, record);
+            reopenForResume(cwd, slug, {
+                agent: opts.agent,
+                maxRounds: opts.maxRounds,
+                pid: process.pid,
+                prior: priorOutcome,
+            });
+            setJobSlug(slug);
+            const recovered = runRecover(cwd, slug, {
+                prior: priorOutcome,
+                worktreePath,
+            });
+            console.log(`orch: [recover] ${recovered.oneLiner}`);
+            recoverBrief = recovered.brief;
+        } else {
+            const live = readJob(cwd, slug) ?? record;
+            const entries = Array.isArray(live.resumes) ? live.resumes : [];
+            const last = entries[entries.length - 1];
+            priorOutcome = last?.prior ?? snapshotPriorOutcome(cwd, slug, live);
+            worktreePath = live.worktree ?? worktreePath;
+            branch = live.branch ?? branch;
+            role = live.role ?? role;
+            parentSlug = live.parent ?? parentSlug;
+            workerId = live.workerId ?? workerId;
+            setJobSlug(slug);
+            const recoverPath = path.join(jobPaths(cwd, slug).dir, 'recover.md');
+            if (!fs.existsSync(recoverPath)) {
+                const recovered = runRecover(cwd, slug, {
+                    prior: priorOutcome,
+                    worktreePath,
+                });
+                console.log(`orch: [recover] ${recovered.oneLiner}`);
+                recoverBrief = recovered.brief;
+            } else {
+                recoverBrief = fs.readFileSync(recoverPath, 'utf8');
+                const orient = recoverBrief.match(/^- Orientation: (.+)$/m)
+                    || recoverBrief.match(/^([^\n]+)$/m);
+                console.log(`orch: [recover] ${orient?.[1] ?? 'resuming from recover.md'}`);
+            }
+        }
+
+        const backend = AGENT_BACKENDS[opts.agent];
+        if (!isBinaryOnPath(backend.binary)) {
+            console.error(binaryMissingHint(opts.agent));
+            process.exit(1);
+            return;
+        }
+
+        console.log(`resumed ${slug} (pid ${process.pid})`);
+        await runResumePipeline({
+            agent: opts.agent,
+            maxRounds: opts.maxRounds,
+            verbose: opts.verbose,
+            cwd,
+            slug,
+            jobSlug: slug,
+            priorOutcome,
+            recoverBrief,
+            worktreePath,
+            branch,
+            role,
+            parentSlug,
+            workerId,
+            prompt: priorOutcome?.task ?? record.task,
+        });
     });
 
 program

@@ -169,24 +169,24 @@ function seedEligibleJob(cwd, overrides = {}) {
   }
   const record = baseRecord({
     slug,
-    state: 'failed',
+    state: 'done',
     phase: 'code-loop',
     stage: 'test-runner',
     round: 3,
     finishedAt: new Date().toISOString(),
-    exitCode: 1,
+    exitCode: 0,
     branch: `orch/${slug}`,
     worktree: worktreePath,
     lastOutcome: {
-      state: 'failed',
+      state: 'done',
       phase: 'code-loop',
       stage: 'test-runner',
       round: 3,
-      exitCode: 1,
+      exitCode: 0,
       finishedAt: new Date().toISOString(),
       task: 'do the thing',
-      summary: 'tests failed on round 3',
-      error: 'test-runner failed; stopping before commit',
+      summary: 'all good',
+      error: null,
     },
     ...overrides,
   });
@@ -233,7 +233,7 @@ describe('validateContinue — eligibility gate', () => {
     });
   }
 
-  for (const state of ['done', 'failed', 'stopped', 'crashed']) {
+  for (const state of ['done']) {
     it(`accepts terminal state "${state}" with a worktree present on disk`, () => {
       const cwd = makeTmpCwd();
       const { slug, record } = seedEligibleJob(cwd, { state });
@@ -245,9 +245,32 @@ describe('validateContinue — eligibility gate', () => {
     });
   }
 
+  for (const state of ['failed', 'stopped', 'crashed']) {
+    it(`refuses terminal failure "${state}" with a resume hint`, () => {
+      const cwd = makeTmpCwd();
+      const { slug, record } = seedEligibleJob(cwd, { state });
+      assert.throws(
+        () => validateContinue(cwd, slug, { task: 'keep going' }),
+        new RegExp(`${slug} is ${state} at ${record.phase}/${record.stage}`),
+      );
+      assert.match(
+        (() => {
+          try {
+            validateContinue(cwd, slug, { task: 'keep going' });
+            return '';
+          } catch (err) {
+            return err.message;
+          }
+        })(),
+        new RegExp(`use: orch resume ${slug}`),
+      );
+      assert.deepEqual(readJob(cwd, slug), record);
+    });
+  }
+
   it('refuses when record.worktree/record.branch are unset (e.g. --ask or triage->quick-fix runs)', () => {
     const cwd = makeTmpCwd();
-    const { slug } = seedEligibleJob(cwd, { worktree: null, branch: null });
+    const { slug } = seedEligibleJob(cwd, { state: 'done', worktree: null, branch: null });
     assert.throws(
       () => validateContinue(cwd, slug, { task: 'keep going' }),
       new RegExp(`${slug} has no worktree; continue only applies to complex runs`),
@@ -257,7 +280,7 @@ describe('validateContinue — eligibility gate', () => {
   it('refuses when the worktree directory no longer exists on disk, without recreating it', () => {
     const cwd = makeTmpCwd();
     const missingPath = path.join(os.tmpdir(), 'orch-continue-missing-worktree-does-not-exist');
-    const { slug } = seedEligibleJob(cwd, { worktree: missingPath });
+    const { slug } = seedEligibleJob(cwd, { state: 'done', worktree: missingPath });
     assert.throws(
       () => validateContinue(cwd, slug, { task: 'keep going' }),
       new RegExp(`worktree missing at ${missingPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}; cannot continue ${slug}`),
@@ -267,7 +290,7 @@ describe('validateContinue — eligibility gate', () => {
 
   it('refuses role:"coordinator" pointing at worker-continue + --integrate', () => {
     const cwd = makeTmpCwd();
-    const { slug } = seedEligibleJob(cwd, { role: 'coordinator' });
+    const { slug } = seedEligibleJob(cwd, { state: 'done', role: 'coordinator' });
     assert.throws(
       () => validateContinue(cwd, slug, { task: 'keep going' }),
       new RegExp(`cannot continue coordinator ${slug}; continue each failed worker slug, then orch --integrate ${slug}`),
@@ -276,7 +299,7 @@ describe('validateContinue — eligibility gate', () => {
 
   it('refuses role:"integration" pointing at --integrate <parent>', () => {
     const cwd = makeTmpCwd();
-    const { slug } = seedEligibleJob(cwd, { role: 'integration', parent: 'wise-pine-e904' });
+    const { slug } = seedEligibleJob(cwd, { state: 'done', role: 'integration', parent: 'wise-pine-e904' });
     assert.throws(
       () => validateContinue(cwd, slug, { task: 'keep going' }),
       /cannot continue integration .*; use orch --integrate wise-pine-e904/,
@@ -285,7 +308,7 @@ describe('validateContinue — eligibility gate', () => {
 
   it('accepts role:"worker" the same as an ordinary complex slug', () => {
     const cwd = makeTmpCwd();
-    const { slug } = seedEligibleJob(cwd, { role: 'worker', parent: 'wise-pine-e904', workerId: '02-invoices' });
+    const { slug } = seedEligibleJob(cwd, { state: 'done', role: 'worker', parent: 'wise-pine-e904', workerId: '02-invoices' });
     const result = validateContinue(cwd, slug, { task: 'fix the failing invoice tests' });
     assert.equal(result.role, 'worker');
   });
@@ -298,7 +321,7 @@ describe('validateContinue — eligibility gate', () => {
       workerId: '03-skipped',
       worktree: null,
       branch: null,
-      state: 'crashed',
+      state: 'done',
     });
     assert.throws(
       () => validateContinue(cwd, slug, { task: 'do it anyway' }),
@@ -306,7 +329,7 @@ describe('validateContinue — eligibility gate', () => {
     );
   });
 
-  it('reconciles a dead-pid "running" record to crashed first, then treats it as eligible', async () => {
+  it('reconciles a dead-pid "running" record to crashed first, then refuses with resume hint', async () => {
     const cwd = makeTmpCwd();
     const { spawn: nodeSpawn } = await import('node:child_process');
     const child = nodeSpawn(process.execPath, ['-e', 'process.exit(0)']);
@@ -314,8 +337,10 @@ describe('validateContinue — eligibility gate', () => {
     await new Promise((resolve) => child.on('close', resolve));
 
     const { slug } = seedEligibleJob(cwd, { state: 'running', pid: deadPid, finishedAt: null, exitCode: null, lastOutcome: null });
-    const result = validateContinue(cwd, slug, { task: 'keep going' });
-    assert.equal(result.state, 'crashed');
+    assert.throws(
+      () => validateContinue(cwd, slug, { task: 'keep going' }),
+      /use: orch resume/,
+    );
     assert.equal(readJob(cwd, slug).state, 'crashed');
   });
 });
@@ -587,25 +612,41 @@ describe('formatStatus — lastOutcome block', () => {
   });
 });
 
-describe('orch resume — never starts a continue', () => {
-  for (const state of ['done', 'failed', 'stopped', 'crashed']) {
-    it(`requestResume still rejects a terminal "${state}" job and leaves run.json byte-for-byte unchanged (no reopen, no continuation bump)`, () => {
-      const cwd = makeTmpCwd();
-      const { slug, record: before } = seedEligibleJob(cwd, { state });
-      assert.throws(() => requestResume(cwd, slug), /terminal state/);
-      assert.deepEqual(readJob(cwd, slug), before);
-      assert.equal(readJob(cwd, slug).continuation, undefined);
-    });
+describe('orch resume — never starts a continue; failure resume is separate', () => {
+  it('requestResume still rejects a terminal "failed" job and leaves run.json byte-for-byte unchanged (no continue reopen)', () => {
+    const cwd = makeTmpCwd();
+    const { slug, record: before } = seedEligibleJob(cwd, { state: 'failed' });
+    assert.throws(() => requestResume(cwd, slug), /terminal state/);
+    assert.deepEqual(readJob(cwd, slug), before);
+    assert.equal(readJob(cwd, slug).continuation, undefined);
+  });
 
-    it(`CLI: "orch resume" on a terminal "${state}" job exits non-zero and does not reopen/continue it`, async () => {
-      const cwd = makeTmpCwd();
-      const { slug, record: before } = seedEligibleJob(cwd, { state });
-      const { code, stderr } = await runCli(['resume', slug], { cwd });
-      assert.notEqual(code, 0);
-      assert.match(stderr, /terminal state/);
-      assert.deepEqual(readJob(cwd, slug), before, 'a refused resume must not touch run.json at all, let alone reopen it');
+  it('CLI: "orch resume" on done refuses with continue hint and does not reopen as continue', async () => {
+    const cwd = makeTmpCwd();
+    const { slug, record: before } = seedEligibleJob(cwd, { state: 'done' });
+    const { code, stderr } = await runCli(['resume', slug], { cwd });
+    assert.notEqual(code, 0);
+    assert.match(stderr, /nothing to resume/);
+    assert.match(stderr, /orch continue/);
+    assert.deepEqual(readJob(cwd, slug), before);
+    assert.equal(readJob(cwd, slug).continuation, undefined);
+  });
+
+  it('CLI: "orch resume --dry-run" on stopped validates failure resume without mutating run.json', async () => {
+    const cwd = makeTmpCwd();
+    const { slug, record: before } = seedEligibleJob(cwd, {
+      state: 'stopped',
+      phase: 'test-loop',
+      stage: 'test-writer',
+      round: 1,
     });
-  }
+    const { code, stdout, stderr } = await runCli(['resume', slug, '--dry-run'], { cwd });
+    assert.equal(code, 0, stderr);
+    assert.match(stdout, /dry-run: resume/);
+    assert.match(stdout, /failure/);
+    assert.deepEqual(readJob(cwd, slug), before);
+    assert.equal(readJob(cwd, slug).continuation, undefined);
+  });
 
   it('CLI: resuming a genuinely paused job still works exactly as before, and never touches continuation/continuations', async () => {
     const cwd = makeTmpCwd();
@@ -627,7 +668,7 @@ describe('orch resume — never starts a continue', () => {
     const record = readJob(cwd, slug);
     assert.equal(record.state, 'running');
     assert.equal(record.pauseRequested, false);
-    // Resume is a pure unpause: it must never introduce continue's bookkeeping.
+    // Resume unpause must never introduce continue's bookkeeping.
     assert.equal(record.continuation, undefined);
     assert.equal(record.continuations, undefined);
     assert.equal(record.phase, null);

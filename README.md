@@ -457,7 +457,7 @@ decomposer: 5 units
 adjust: rewrote 02-api against tip; dropped 05-legacy-path
 [02-api …] done — merged
 [03-ui …] failed at code-loop / test-runner (round 3)
-stopped: 2/5 merged; next: orch continue <unit-slug> "fix …"
+stopped: 2/5 merged; next: orch resume <unit-slug>
 ```
 
 The flow, in order:
@@ -470,8 +470,9 @@ The flow, in order:
    tip → wait → on failure stop the chain → on success merge into
    `orch/<parent-slug>`, runner-first verify, advance tip, hybrid-adjust the
    next 1–2 pending units (or drop obsolete ones), continue.
-4. **Continue / resume.** Fix a failed unit with `orch continue <unit-slug>`,
+4. **Continue / resume.** Fix a failed unit with `orch resume <unit-slug>`,
    then `orch --seq-continue <parent>` (or `orch resume <parent>` when paused).
+   Use `orch continue <unit-slug>` only for new follow-up work on a done unit.
    Do not `orch continue` the coordinator.
 
 `--max-units` (default `8`) caps both the initial backlog and adjust growth.
