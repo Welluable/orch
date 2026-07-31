@@ -42,7 +42,7 @@ describe('lib/config helpers', () => {
     assert.deepEqual(loadConfig(path.join(dir, 'config')), {});
   });
 
-  it('loadConfig returns {} for {} or omitted agent', () => {
+  it('loadConfig returns {} for {} or omitted agent/notify', () => {
     const dir = makeTmp('orch-cfg-empty-');
     const p = path.join(dir, 'config');
     fs.writeFileSync(p, '{}\n');
@@ -58,6 +58,25 @@ describe('lib/config helpers', () => {
     assert.deepEqual(loadConfig(p), { agent: 'claude' });
     fs.writeFileSync(p, '{"agent":"opencode"}\n');
     assert.deepEqual(loadConfig(p), { agent: 'opencode' });
+  });
+
+  it('loadConfig returns notify boolean alone or with agent', () => {
+    const dir = makeTmp('orch-cfg-notify-');
+    const p = path.join(dir, 'config');
+    fs.writeFileSync(p, '{"notify":false}\n');
+    assert.deepEqual(loadConfig(p), { notify: false });
+    fs.writeFileSync(p, '{"agent":"claude","notify":true}\n');
+    assert.deepEqual(loadConfig(p), { agent: 'claude', notify: true });
+  });
+
+  it('loadConfig throws on invalid (non-boolean) notify', () => {
+    const dir = makeTmp('orch-cfg-badnotify-');
+    const p = path.join(dir, 'config');
+    fs.writeFileSync(p, '{"notify":"yes"}\n');
+    assert.throws(
+      () => loadConfig(p, '.orch/config'),
+      /invalid notify in \.orch\/config/,
+    );
   });
 
   it('loadConfig throws on bad JSON', () => {
@@ -97,6 +116,36 @@ describe('lib/config helpers', () => {
     assert.equal(fs.readFileSync(p, 'utf8'), '{\n  "agent": "cursor"\n}\n');
   });
 
+  it('writeConfig merges notify with existing agent (and vice versa)', () => {
+    const dir = makeTmp('orch-cfg-merge-');
+    const p = path.join(dir, '.orch', 'config');
+    writeConfig(p, { agent: 'claude' });
+    writeConfig(p, { notify: false });
+    assert.deepEqual(JSON.parse(fs.readFileSync(p, 'utf8')), {
+      agent: 'claude',
+      notify: false,
+    });
+    writeConfig(p, { agent: 'agn' });
+    assert.deepEqual(JSON.parse(fs.readFileSync(p, 'utf8')), {
+      agent: 'agn',
+      notify: false,
+    });
+    writeConfig(p, { notify: true });
+    assert.deepEqual(JSON.parse(fs.readFileSync(p, 'utf8')), {
+      agent: 'agn',
+      notify: true,
+    });
+  });
+
+  it('writeConfig rejects non-boolean notify', () => {
+    const dir = makeTmp('orch-cfg-write-badnotify-');
+    const p = path.join(dir, '.orch', 'config');
+    assert.throws(
+      () => writeConfig(p, { notify: 'yes' }),
+      /invalid notify/,
+    );
+  });
+
   it('resolveAgent prefers cli > local > global > cursor', () => {
     const home = makeTmp('orch-cfg-home-');
     const cwd = makeTmp('orch-cfg-cwd-');
@@ -111,6 +160,36 @@ describe('lib/config helpers', () => {
     assert.equal(resolveAgent({ cliAgent: 'cursor', cwd, homedir: home }), 'cursor');
   });
 
+  it('resolveNotify defaults true; CLI > local > global > true', async () => {
+    const { resolveNotify } = await import('../lib/config.js');
+    assert.equal(typeof resolveNotify, 'function', 'lib/config.js must export resolveNotify');
+
+    const home = makeTmp('orch-notify-home-');
+    const cwd = makeTmp('orch-notify-cwd-');
+    assert.equal(resolveNotify({ cwd, homedir: home }), true);
+    assert.equal(resolveNotify({ cliNotify: false, cwd, homedir: home }), false);
+    assert.equal(resolveNotify({ cliNotify: true, cwd, homedir: home }), true);
+
+    const globalPath = globalConfigPath({ homedir: home });
+    const localPath = localConfigPath(cwd);
+    fs.mkdirSync(path.dirname(globalPath), { recursive: true });
+    fs.mkdirSync(path.dirname(localPath), { recursive: true });
+    fs.writeFileSync(globalPath, '{"notify":true}\n');
+    fs.writeFileSync(localPath, '{"notify":false}\n');
+    assert.equal(resolveNotify({ cwd, homedir: home }), false);
+    assert.equal(resolveNotify({ cliNotify: true, cwd, homedir: home }), true);
+
+    fs.writeFileSync(localPath, '{"notify":true}\n');
+    assert.equal(resolveNotify({ cliNotify: false, cwd, homedir: home }), false);
+
+    fs.writeFileSync(localPath, '{"notify":false}\n');
+    assert.equal(resolveNotify({ cliNotify: true, cwd, homedir: home }), true);
+
+    fs.rmSync(localPath, { force: true });
+    fs.writeFileSync(globalPath, '{"notify":false}\n');
+    assert.equal(resolveNotify({ cwd, homedir: home }), false);
+  });
+
   it('printConfig reports default when no files exist', () => {
     const home = makeTmp('orch-cfg-print-home-');
     const cwd = makeTmp('orch-cfg-print-cwd-');
@@ -120,6 +199,10 @@ describe('lib/config helpers', () => {
     assert.equal(lines[1], 'source=default (builtin)');
     assert.match(lines[2], /^global=unset /);
     assert.match(lines[3], /^local=unset /);
+    assert.match(lines.join('\n'), /^notify=true$/m);
+    assert.match(lines.join('\n'), /^notifySource=default \(builtin\)$/m);
+    assert.match(lines.join('\n'), /^notifyGlobal=unset /m);
+    assert.match(lines.join('\n'), /^notifyLocal=unset /m);
   });
 
   it('printConfig shows local as effective when both are set', () => {
@@ -133,6 +216,24 @@ describe('lib/config helpers', () => {
     assert.match(lines[1], /^source=local /);
     assert.match(lines[2], /^global=agn /);
     assert.match(lines[3], /^local=claude /);
+  });
+
+  it('printConfig reports effective notify from local over global', () => {
+    const home = makeTmp('orch-cfg-notify-print-home-');
+    const cwd = makeTmp('orch-cfg-notify-print-cwd-');
+    const globalPath = globalConfigPath({ homedir: home });
+    const localPath = localConfigPath(cwd);
+    fs.mkdirSync(path.dirname(globalPath), { recursive: true });
+    fs.mkdirSync(path.dirname(localPath), { recursive: true });
+    fs.writeFileSync(globalPath, '{"notify":true}\n');
+    fs.writeFileSync(localPath, '{"notify":false}\n');
+    const lines = [];
+    printConfig({ cwd, homedir: home, log: (line) => lines.push(line) });
+    const out = lines.join('\n');
+    assert.match(out, /^notify=false$/m);
+    assert.match(out, /^notifySource=local /m);
+    assert.match(out, /^notifyGlobal=true /m);
+    assert.match(out, /^notifyLocal=false /m);
   });
 });
 
@@ -269,11 +370,11 @@ describe('orch config CLI', () => {
     assert.match(stderr, /mutually exclusive/);
   });
 
-  it('--local without --agent → exit 1', async () => {
+  it('--local without --agent/--notify/--no-notify → exit 1', async () => {
     const env = freshEnv();
     const { code, stderr } = await runCli(['config', '--local'], { cwd, env });
     assert.equal(code, 1);
-    assert.match(stderr, /--global\/--local require --agent/);
+    assert.match(stderr, /--global\/--local require/);
   });
 
   it('--agent foo is still rejected by Commander', async () => {
@@ -298,5 +399,85 @@ describe('orch config CLI', () => {
     const { code, stdout } = await runCli(['--help'], { cwd: makeTmp('orch-help-'), env: freshEnv() });
     assert.equal(code, 0);
     assert.match(stdout, /config/);
+  });
+
+  it('orch config prints effective notify=true by default', async () => {
+    const env = freshEnv();
+    const { code, stdout, stderr } = await runCli(['config'], { cwd, env });
+    assert.equal(code, 0, stderr);
+    assert.match(stdout, /^notify=true$/m);
+    assert.match(stdout, /^notifySource=default \(builtin\)$/m);
+    assert.match(stdout, /^notifyGlobal=unset /m);
+    assert.match(stdout, /^notifyLocal=unset /m);
+  });
+
+  it('orch config --no-notify --local writes notify:false without wiping agent', async () => {
+    const env = freshEnv();
+    await runCli(['config', '--agent', 'claude', '--local'], { cwd, env });
+    const { code, stdout, stderr } = await runCli(
+      ['config', '--no-notify', '--local'],
+      { cwd, env },
+    );
+    assert.equal(code, 0, stderr);
+    const localPath = path.join(cwd, '.orch', 'config');
+    assert.match(stdout, /^wrote /m);
+    assert.deepEqual(JSON.parse(fs.readFileSync(localPath, 'utf8')), {
+      agent: 'claude',
+      notify: false,
+    });
+
+    const printed = await runCli(['config'], { cwd, env });
+    assert.equal(printed.code, 0);
+    assert.match(printed.stdout, /^notify=false$/m);
+    assert.match(printed.stdout, /^notifySource=local /m);
+  });
+
+  it('orch config --notify writes global notify:true by default', async () => {
+    const env = freshEnv();
+    const { code, stdout, stderr } = await runCli(['config', '--notify'], { cwd, env });
+    assert.equal(code, 0, stderr);
+    const globalPath = path.join(home, '.orch', 'config');
+    assert.match(stdout, /^wrote /m);
+    assert.equal(JSON.parse(fs.readFileSync(globalPath, 'utf8')).notify, true);
+    assert.equal(fs.existsSync(path.join(cwd, '.orch', 'config')), false);
+  });
+
+  it('orch config --agent claude --notify merges both keys', async () => {
+    const env = freshEnv();
+    const { code, stderr } = await runCli(
+      ['config', '--agent', 'claude', '--notify'],
+      { cwd, env },
+    );
+    assert.equal(code, 0, stderr);
+    assert.deepEqual(
+      JSON.parse(fs.readFileSync(path.join(home, '.orch', 'config'), 'utf8')),
+      { agent: 'claude', notify: true },
+    );
+  });
+
+  it('--notify and --no-notify together → exit 1', async () => {
+    const env = freshEnv();
+    const { code, stderr } = await runCli(
+      ['config', '--notify', '--no-notify'],
+      { cwd, env },
+    );
+    assert.equal(code, 1);
+    assert.match(stderr, /mutually exclusive|notify/i);
+  });
+
+  it('invalid notify in local config → exit 1 mentioning the path', async () => {
+    const env = freshEnv();
+    fs.mkdirSync(path.join(cwd, '.orch'), { recursive: true });
+    fs.writeFileSync(path.join(cwd, '.orch', 'config'), '{"notify":"yes"}\n');
+    const { code, stderr } = await runCli(['noop', '--dry-run'], { cwd, env });
+    assert.equal(code, 1);
+    assert.match(stderr, /invalid notify in \.orch\/config/);
+  });
+
+  it('help lists --notify / --no-notify', async () => {
+    const { code, stdout } = await runCli(['--help'], { cwd: makeTmp('orch-help-notify-'), env: freshEnv() });
+    assert.equal(code, 0);
+    assert.match(stdout, /--notify/);
+    assert.match(stdout, /--no-notify/);
   });
 });

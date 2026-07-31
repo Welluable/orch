@@ -95,11 +95,13 @@ import {
 } from './lib/integrate.js';
 import {
     resolveAgent,
+    resolveNotify,
     writeConfig,
     printConfig,
     globalConfigPath,
     localConfigPath,
 } from './lib/config.js';
+import { setNotifyEnabled } from './lib/notify.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -950,6 +952,7 @@ export async function runDetached(prompt, options = {}) {
         cwd = process.cwd(),
         seq = false,
         maxUnits = 8,
+        notify,
         createRunContext: createRunContextFn = createRunContext,
         spawn: spawnFn = spawn,
         exit = (code) => process.exit(code),
@@ -984,6 +987,7 @@ export async function runDetached(prompt, options = {}) {
     if (seq) {
         childArgs.push('--seq', '--max-units', String(maxUnits));
     }
+    appendNotifyArgs(childArgs, notify);
 
     const child = spawnFn(process.execPath, childArgs, {
         cwd,
@@ -1301,6 +1305,7 @@ export async function runContinueDetached(slug, prompt, options = {}) {
         String(maxRounds),
     ];
     if (verbose) childArgs.push('--verbose');
+    appendNotifyArgs(childArgs, options.notify);
 
     const child = spawnFn(process.execPath, childArgs, {
         cwd,
@@ -1728,6 +1733,7 @@ export async function runResumeDetached(slug, options = {}) {
         String(maxRounds),
     ];
     if (verbose) childArgs.push('--verbose');
+    appendNotifyArgs(childArgs, options.notify);
 
     const child = spawnFn(process.execPath, childArgs, {
         cwd,
@@ -4327,6 +4333,52 @@ function resolveAgentOrExit(cliAgent, cwd = process.cwd()) {
     }
 }
 
+/**
+ * Resolve CLI `--notify` / `--no-notify` to `true` | `false` | `undefined`.
+ * Commander stores both on `opts.notify` (negatable); detect both-via-argv
+ * for the mutual-exclusion error.
+ */
+function cliNotifyFromOptions(options, argv = process.argv) {
+    const hasNotify = argv.includes('--notify');
+    const hasNoNotify = argv.includes('--no-notify');
+    if (hasNotify && hasNoNotify) {
+        console.error('Error: --notify and --no-notify are mutually exclusive');
+        process.exit(1);
+        return undefined;
+    }
+    if (options.notify === true) return true;
+    if (options.notify === false) return false;
+    return undefined;
+}
+
+function resolveNotifyOrExit(cliNotify, cwd = process.cwd()) {
+    try {
+        return resolveNotify({ cliNotify, cwd });
+    } catch (err) {
+        console.error(`Error: ${err.message}`);
+        process.exit(1);
+        return undefined;
+    }
+}
+
+/** Apply process-level notify gate from CLI flags + config (skip for dry-run). */
+function applyNotifyEnabled(options, { cwd = process.cwd(), dryRun = false } = {}) {
+    if (dryRun) {
+        setNotifyEnabled(false);
+        return false;
+    }
+    const cliNotify = cliNotifyFromOptions(options);
+    const enabled = resolveNotifyOrExit(cliNotify, cwd);
+    setNotifyEnabled(enabled);
+    return enabled;
+}
+
+/** Append `--notify` / `--no-notify` to child argv when the parent had an explicit flag. */
+function appendNotifyArgs(args, notify) {
+    if (notify === true) args.push('--notify');
+    else if (notify === false) args.push('--no-notify');
+}
+
 const program = new Command();
 
 program
@@ -4345,6 +4397,8 @@ program
     .option('--max-workers <n>', 'Max number of parallel fan-out workers (only meaningful with --fan-out)', positiveIntParser('--max-workers'), 4)
     .option('--max-units <n>', 'Max number of sequential units (only meaningful with --seq)', positiveIntParser('--max-units'), 8)
     .option('--max-concurrency <n>', 'Optional hard ceiling on in-flight fan-out workers at once (only meaningful with --fan-out; default: coordinator chooses)', positiveIntParser('--max-concurrency'))
+    .option('--notify', 'Enable desktop notification when a job reaches a terminal state (default: on)')
+    .option('--no-notify', 'Disable desktop notifications for this run')
     .addOption(
         new Option('--agent <agent>', 'Agent backend to run the pipeline with: "cursor" (Cursor Agent CLI), "claude" (Claude Code CLI), "agn" (agn CLI), or "opencode" (OpenCode CLI). Omitting uses local then global config, else cursor')
             .choices(['cursor', 'claude', 'agn', 'opencode']),
@@ -4394,6 +4448,7 @@ Sequential (--seq):
         const prompt = (Array.isArray(task) ? task : []).join(' ').trim();
 
         options.agent = resolveAgentOrExit(options.agent);
+        applyNotifyEnabled(options, { dryRun: Boolean(options.dryRun) });
 
         if (options.seqContinue) {
             const cwd = process.cwd();
@@ -4461,6 +4516,7 @@ Sequential (--seq):
                     ...options,
                     seq: true,
                     maxUnits: options.maxUnits,
+                    notify: cliNotifyFromOptions(options),
                 });
                 return;
             }
@@ -4559,7 +4615,10 @@ Sequential (--seq):
                 process.exit(1);
                 return;
             }
-            await runDetached(prompt, options);
+            await runDetached(prompt, {
+                ...options,
+                notify: cliNotifyFromOptions(options),
+            });
             return;
         }
 
@@ -4592,6 +4651,8 @@ program
     .option('--quick', 'Rejected: continue does not support --quick')
     .option('--detach', 'Run the continue in the background under the same slug')
     .option('--max-rounds <n>', 'Max writer⇄critic and writer⇄runner iterations per implementer loop', positiveIntParser('--max-rounds'), 5)
+    .option('--notify', 'Enable desktop notification when the continue job reaches a terminal state')
+    .option('--no-notify', 'Disable desktop notifications for this continue')
     .addOption(
         new Option('--agent <agent>', 'Agent backend: "cursor", "claude", "agn", or "opencode". Omitting uses local then global config, else cursor')
             .choices(['cursor', 'claude', 'agn', 'opencode']),
@@ -4607,6 +4668,7 @@ program
         const cwd = process.cwd();
 
         opts.agent = resolveAgentOrExit(opts.agent, cwd);
+        applyNotifyEnabled(opts, { cwd, dryRun: Boolean(opts.dryRun) });
 
         let record;
         try {
@@ -4627,6 +4689,7 @@ program
                 maxRounds: opts.maxRounds,
                 verbose: opts.verbose,
                 cwd,
+                notify: cliNotifyFromOptions(opts),
             });
             return;
         }
@@ -4700,16 +4763,18 @@ program
 
 program
     .command('config')
-    .description('Print or set the default agent (global ~/.orch/config or local .orch/config)')
+    .description('Print or set default agent / notify (global ~/.orch/config or local .orch/config)')
     .addOption(
         new Option('--agent <agent>', 'Set the default agent backend')
             .choices(['cursor', 'claude', 'agn', 'opencode']),
     )
-    .option('--global', 'Write the global config (~/.orch/config); default when --agent is set')
+    .option('--notify', 'Set notify: true in the target config')
+    .option('--no-notify', 'Set notify: false in the target config')
+    .option('--global', 'Write the global config (~/.orch/config); default when setting a value')
     .option('--local', 'Write the project-local config (.orch/config)')
     .action((options, command) => {
-        // Parent also defines --agent; flags after `config` may land on the
-        // parent. Merge so either placement works.
+        // Parent also defines --agent/--notify/--no-notify; flags after `config`
+        // may land on the parent. Merge so either placement works.
         const opts = typeof command.optsWithGlobals === 'function'
             ? command.optsWithGlobals()
             : { ...program.opts(), ...options };
@@ -4721,25 +4786,41 @@ program
             return;
         }
 
-        if ((opts.global || opts.local) && !opts.agent) {
-            console.error('Error: --global/--local require --agent (omit flags to print config)');
+        const hasNotify = process.argv.includes('--notify');
+        const hasNoNotify = process.argv.includes('--no-notify');
+        if (hasNotify && hasNoNotify) {
+            console.error('Error: --notify and --no-notify are mutually exclusive');
             process.exit(1);
             return;
         }
 
-        if (opts.agent) {
+        const settingNotify = hasNotify || hasNoNotify;
+        const settingAgent = Boolean(opts.agent);
+        const writing = settingAgent || settingNotify;
+
+        if ((opts.global || opts.local) && !writing) {
+            console.error('Error: --global/--local require --agent, --notify, or --no-notify (omit flags to print config)');
+            process.exit(1);
+            return;
+        }
+
+        if (writing) {
             const targetPath = opts.local
                 ? localConfigPath(cwd)
                 : globalConfigPath();
+            const patch = {};
+            if (settingAgent) patch.agent = opts.agent;
+            if (hasNotify) patch.notify = true;
+            if (hasNoNotify) patch.notify = false;
             try {
-                writeConfig(targetPath, { agent: opts.agent });
+                writeConfig(targetPath, patch);
             } catch (err) {
                 console.error(`Error: ${err.message}`);
                 process.exit(1);
                 return;
             }
             console.log(`wrote ${targetPath}`);
-            process.stdout.write(`${JSON.stringify({ agent: opts.agent }, null, 2)}\n`);
+            process.stdout.write(`${JSON.stringify(patch, null, 2)}\n`);
             return;
         }
 
@@ -4755,6 +4836,7 @@ program
     .command('list')
     .description('List all runs (active and finished) tracked under .orch/ in this directory')
     .action(() => {
+        applyNotifyEnabled({});
         const jobs = listJobs(process.cwd());
         if (jobs.length === 0) {
             console.log('no runs');
@@ -4769,6 +4851,7 @@ program
     .description('Show full status for a run')
     .action((slug) => {
         const cwd = process.cwd();
+        applyNotifyEnabled({}, { cwd });
         let record;
         if (slug) {
             record = readJob(cwd, slug);
@@ -4834,6 +4917,7 @@ program
             : { ...program.opts(), ...options };
         const cwd = process.cwd();
         opts.agent = resolveAgentOrExit(opts.agent, cwd);
+        applyNotifyEnabled(opts, { cwd, dryRun: Boolean(opts.dryRun) });
 
         let validated;
         try {
@@ -4890,6 +4974,7 @@ program
                 maxRounds: opts.maxRounds,
                 verbose: opts.verbose,
                 cwd,
+                notify: cliNotifyFromOptions(opts),
             });
             return;
         }
@@ -4977,6 +5062,7 @@ program
     .description('Send SIGTERM to a running job (or reconcile a dead one to crashed)')
     .action((slug) => {
         const cwd = process.cwd();
+        applyNotifyEnabled({}, { cwd });
         try {
             const record = readJob(cwd, slug);
             if (!record) throw new Error(`stopJob: unknown job ${slug}`);

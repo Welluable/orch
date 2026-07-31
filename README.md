@@ -223,15 +223,21 @@ Usage: orch [options] [command] <task...>
 - `--agent <cursor|claude|agn|opencode>` — selects the backend for the whole pipeline;
   when omitted, uses local `.orch/config`, then global `~/.orch/config`, else
   `cursor`.
+- `--notify` / `--no-notify` — enable or disable a desktop notification when a
+  job reaches a terminal state (`done` / `failed` / `stopped` / `crashed`).
+  Default is on; config key `notify` and these flags share precedence
+  CLI > local > global > on. Dry-run never notifies.
 - `-h, --help` — displays help for the command.
 
 Config:
 
-- `orch config` — prints the effective agent and which file(s) contributed
-  (local / global / default). Does not prompt.
+- `orch config` — prints the effective agent and notify settings and which
+  file(s) contributed (local / global / default). Does not prompt.
 - `orch config --agent <cursor|claude|agn|opencode> [--global|--local]` — writes the
   default agent. Bare `--agent` (and `--global`) write `~/.orch/config`;
   `--local` writes `<cwd>/.orch/config`. There is no `orch init`.
+- `orch config --notify` / `--no-notify` `[--local|--global]` — set desktop
+  notify on or off without wiping `agent` (keys merge on write).
 
 Job-control subcommands (see [Headless runs](#headless-runs)):
 
