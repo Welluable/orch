@@ -549,6 +549,49 @@ describe('orch jobs clean', () => {
       fs.rmSync(tmpCwd, { recursive: true, force: true });
     }
   });
+
+  it('refuses before the confirm prompt when a live-pid job exists (non-zero, dirs untouched)', async () => {
+    const tmpCwd = makeTmpCwd('orch-jobs-clean-live-');
+    try {
+      writeJob(tmpCwd, 'live-clean-0000', {
+        slug: 'live-clean-0000',
+        task: 'still running',
+        agent: 'claude',
+        state: 'running',
+        startedAt: new Date().toISOString(),
+        finishedAt: null,
+        exitCode: null,
+        pid: process.pid,
+      });
+      writeJob(tmpCwd, 'done-clean-0001', {
+        slug: 'done-clean-0001',
+        task: 'finished',
+        agent: 'claude',
+        state: 'done',
+        startedAt: new Date().toISOString(),
+        finishedAt: new Date().toISOString(),
+        exitCode: 0,
+        pid: process.pid,
+      });
+
+      const { code, stdout, stderr } = await runCli(['jobs', 'clean'], {
+        cwd: tmpCwd,
+        stdin: 'y\n',
+      });
+
+      assert.notEqual(code, 0);
+      const combined = `${stdout}\n${stderr}`;
+      assert.match(combined, /live-clean-0000/);
+      assert.match(combined, /orch stop/);
+      // Live-job check must run before the confirm prompt so we never ask
+      // to wipe dirs that we are about to refuse to delete.
+      assert.equal(/Are you sure\? \[y\/N\]/.test(stdout), false);
+      assert.equal(fs.existsSync(path.join(tmpCwd, '.orch', 'live-clean-0000', 'run.json')), true);
+      assert.equal(fs.existsSync(path.join(tmpCwd, '.orch', 'done-clean-0001', 'run.json')), true);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('runPipeline job phase tracking (ORCH_JOB_SLUG present)', () => {

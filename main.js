@@ -33,6 +33,7 @@ import {
     cascadeResume,
     stopJob,
     cleanJobs,
+    liveSlugsBlockingClean,
     isPidAlive,
     reopenJob,
     buildLastOutcome,
@@ -212,9 +213,9 @@ export function formatJobsTable(jobs) {
     }
 
     const rows = ordered.map(({ job, indent }) => [
-        `${indent}${job.slug}`,
+        `${indent}${job.slug ?? '-'}`,
         displayJobRole(job.role),
-        job.state,
+        job.state ?? '-',
         job.phase ?? '-',
         job.agent ?? '-',
         formatRelativeTime(job.startedAt),
@@ -5005,12 +5006,23 @@ const jobsCmd = program
 
 jobsCmd
     .command('clean')
-    .description('Delete all orch jobs from the .orch folder')
+    .description('Delete all orch jobs from .orch/ (refuses while live jobs are running; orch stop <slug> first)')
     .action(async () => {
         const cwd = process.cwd();
         const orchDir = path.join(cwd, '.orch');
         if (!fs.existsSync(orchDir) || fs.readdirSync(orchDir).length === 0) {
             console.log('no jobs to clean');
+            return;
+        }
+
+        // Refuse before prompting so we never ask to wipe dirs we will not delete.
+        const live = liveSlugsBlockingClean(cwd);
+        if (live.length > 0) {
+            console.error(
+                `Error: cannot clean while live jobs exist: ${live.join(', ')}. ` +
+                `Stop them first with: orch stop <slug>`,
+            );
+            process.exit(1);
             return;
         }
 
@@ -5027,8 +5039,13 @@ jobsCmd
             return;
         }
 
-        const removed = cleanJobs(cwd);
-        console.log(`deleted ${removed.length} job${removed.length === 1 ? '' : 's'} from .orch/`);
+        try {
+            const removed = cleanJobs(cwd);
+            console.log(`deleted ${removed.length} job${removed.length === 1 ? '' : 's'} from .orch/`);
+        } catch (err) {
+            console.error(`Error: ${err.message}`);
+            process.exit(1);
+        }
     });
 
 program

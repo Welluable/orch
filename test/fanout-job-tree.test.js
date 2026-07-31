@@ -504,6 +504,29 @@ describe('formatJobsTable — job tree rendering', () => {
     assert.equal(lines.length, 2);
     assert.match(lines[1], /^lonely-bay-0001\s+-\s+running\s+research\s+agn\s+.+\s+42$/);
   });
+
+  it('never prints the literal string "undefined" for a missing slug or state', () => {
+    const table = formatJobsTable([
+      {
+        // Corrupt skeletal stub — the shape patchJob used to write after
+        // run.json was deleted under a live process.
+        slug: undefined,
+        state: undefined,
+        role: null,
+        parent: null,
+        phase: null,
+        agent: undefined,
+        startedAt: '2026-07-26T12:00:00.000Z',
+        finishedAt: null,
+        pid: 4242,
+      },
+    ]);
+
+    assert.equal(table.includes('undefined'), false);
+    // Defense-in-depth fallbacks render as "-" rather than coercing undefined.
+    const body = table.split('\n').slice(1).join('\n');
+    assert.match(body, /-/);
+  });
 });
 
 // ---------------------------------------------------------------------------

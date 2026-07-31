@@ -28,10 +28,13 @@ import {
  * - patchUnit(cwd, parentSlug, unitId, patchFnOrObject) -> locks, re-reads,
  *   shallow-merges the patch (object, or `(currentUnit) => partialPatch`)
  *   onto the matching entry in `units[]` only, atomically writes back,
- *   unlocks, returns the updated full document.
+ *   unlocks, returns the updated full document. Throws
+ *   `unknown parent <slug> (no seq.json)` when `readSeq` returns null
+ *   (instead of crashing on `.units`).
  * - patchTip(cwd, parentSlug, tipSha) -> locks and sets top-level `tip`.
+ *   Same null-seq error as patchUnit.
  * - appendAdjustment(cwd, parentSlug, entry) -> locks and pushes onto
- *   `adjustments[]` (creating the array if absent).
+ *   `adjustments[]` (creating the array if absent). Same null-seq error.
  * - validateSeqDecomposition(decomposition, { maxUnits }) -> violation
  *   strings (empty = valid). Rules: ≥2 units; ≤ maxUnits; unique non-empty
  *   slug-safe `id` (`/^[a-z0-9]+(?:-[a-z0-9]+)*$/`); non-empty `title` /
@@ -184,6 +187,22 @@ describe('patchUnit', () => {
     const lockLeftovers = fs.readdirSync(dir).filter((name) => name.includes('lock'));
     assert.deepEqual(lockLeftovers, []);
   });
+
+  it('throws a clear error when seq.json is missing (not a TypeError on .units)', () => {
+    const cwd = makeTmpCwd();
+    const parentSlug = 'missing-parent-0000';
+
+    assert.throws(
+      () => patchUnit(cwd, parentSlug, '01-types', { state: 'done' }),
+      (err) => {
+        assert.ok(err instanceof Error);
+        assert.equal(err.name !== 'TypeError', true);
+        assert.match(err.message, /unknown parent.*no seq\.json/);
+        assert.match(err.message, new RegExp(parentSlug));
+        return true;
+      },
+    );
+  });
 });
 
 describe('patchTip / appendAdjustment', () => {
@@ -215,6 +234,38 @@ describe('patchTip / appendAdjustment', () => {
     assert.equal(updated.adjustments.length, 2);
     assert.equal(updated.adjustments[1].afterUnitId, '02-api');
     assert.deepEqual(readSeq(cwd, doc.parentSlug).adjustments, updated.adjustments);
+  });
+
+  it('patchTip throws a clear error when seq.json is missing', () => {
+    const cwd = makeTmpCwd();
+    const parentSlug = 'missing-tip-parent-0000';
+
+    assert.throws(
+      () => patchTip(cwd, parentSlug, 'abc1234'),
+      (err) => {
+        assert.ok(err instanceof Error);
+        assert.equal(err.name !== 'TypeError', true);
+        assert.match(err.message, /unknown parent.*no seq\.json/);
+        assert.match(err.message, new RegExp(parentSlug));
+        return true;
+      },
+    );
+  });
+
+  it('appendAdjustment throws a clear error when seq.json is missing', () => {
+    const cwd = makeTmpCwd();
+    const parentSlug = 'missing-adj-parent-0000';
+
+    assert.throws(
+      () => appendAdjustment(cwd, parentSlug, { afterUnitId: '01-types', tip: 'x', summary: 'y' }),
+      (err) => {
+        assert.ok(err instanceof Error);
+        assert.equal(err.name !== 'TypeError', true);
+        assert.match(err.message, /unknown parent.*no seq\.json/);
+        assert.match(err.message, new RegExp(parentSlug));
+        return true;
+      },
+    );
   });
 });
 

@@ -36,10 +36,14 @@ import { allocateJob } from '../lib/job-lifecycle.js';
  *   create), retries briefly on contention, removes a stale lock (dead
  *   owner pid), re-reads the latest record, shallow-merges the patch
  *   (object, or a function `(current) => partialPatch`) over it, atomic
- *   writes, releases the lock, and returns the updated record.
+ *   writes, releases the lock, and returns the updated record. When
+ *   `run.json` is missing, rehydrates a minimal valid base (always includes
+ *   `slug` from the directory-name arg plus safe defaults) before merging;
+ *   never writes a record that lacks `slug` (forces `updated.slug = slug`).
  * - listJobs(cwd) -> every run.json record found under `.orch`, most-recent-first by
  *   `startedAt`, each passed through reconcileJob; dirs without run.json
- *   are skipped.
+ *   are skipped. After `readJob`, normalizes `slug` from the directory name
+ *   so corrupt/incomplete records never surface with a missing slug.
  * - isPidAlive(pid) -> boolean, via `process.kill(pid, 0)`.
  * - reconcileJob(cwd, slug, record) -> if state is running/pausing/paused
  *   and the pid is dead, atomically rewrites to crashed (finishedAt set,
@@ -55,7 +59,10 @@ import { allocateJob } from '../lib/job-lifecycle.js';
  * - stopJob(cwd, slug, { kill }) -> the pure operation behind `orch stop`:
  *   signals a live pid, or reconciles+reports a dead one to crashed.
  * - cleanJobs(cwd) -> removes every entry under `.orch/` and returns the
- *   deleted names (empty when `.orch` is missing or already empty).
+ *   deleted names (empty when `.orch` is missing or already empty). Before
+ *   deleting, refuses (throws) if any job is in an active live state
+ *   (`running`/`pausing`/`paused`) with an alive pid — caller must
+ *   `orch stop <slug>` first. Dead-pid "live" states may still be cleaned.
  */
 
 function makeTmpCwd() {
@@ -201,6 +208,25 @@ describe('listJobs', () => {
 
     // The reconciliation must be persisted to disk, not just returned.
     assert.equal(readJob(tmpCwd, record.slug).state, 'crashed');
+  });
+
+  it('normalizes slug from the directory name when run.json omits slug', () => {
+    const tmpCwd = makeTmpCwd();
+    const dirSlug = 'orphan-dir-0000';
+    writeJob(tmpCwd, dirSlug, {
+      // Intentionally omit `slug` — the corruption shape after a skeletal
+      // patchJob stub (or a hand-edited run.json).
+      task: 'broken',
+      agent: 'claude',
+      state: 'done',
+      startedAt: '2026-01-01T00:00:00.000Z',
+      finishedAt: '2026-01-01T00:01:00.000Z',
+      exitCode: 0,
+      pid: null,
+    });
+
+    const [job] = listJobs(tmpCwd);
+    assert.equal(job.slug, dirSlug);
   });
 });
 
@@ -432,11 +458,52 @@ describe('patchJob', () => {
     assert.equal(fs.existsSync(lockPath), false);
   });
 
-  it('creates the job directory and run.json if patching a job that was never writeJob-ed', () => {
+  it('rehydrates a minimal valid record (always including slug) when patching a job that was never writeJob-ed', () => {
     const tmpCwd = makeTmpCwd();
-    const updated = patchJob(tmpCwd, 'never-written-0000', { state: 'starting' });
+    const slug = 'never-written-0000';
+    const updated = patchJob(tmpCwd, slug, { state: 'starting' });
+
     assert.equal(updated.state, 'starting');
-    assert.deepEqual(readJob(tmpCwd, 'never-written-0000'), updated);
+    assert.equal(updated.slug, slug);
+    assert.equal(typeof updated.slug, 'string');
+    assert.notEqual(updated.slug, 'undefined');
+    // Rehydrated base must carry safe defaults (mirroring allocateJob), not
+    // just the patched fields — a skeletal `{ state }` stub is the bug.
+    assert.equal(updated.pauseRequested, false);
+    assert.equal(updated.finishedAt, null);
+    assert.equal(updated.exitCode, null);
+    assert.ok(updated.startedAt);
+    assert.deepEqual(readJob(tmpCwd, slug), updated);
+  });
+
+  it('after run.json is deleted, patchJob does not write a slug-less stub that list renders as "undefined"', () => {
+    const tmpCwd = makeTmpCwd();
+    const slug = 'deleted-run-0000';
+    writeJob(tmpCwd, slug, baseRecord({
+      slug,
+      state: 'running',
+      pid: process.pid,
+      role: 'worker',
+      agent: 'claude',
+    }));
+    fs.unlinkSync(jobPaths(tmpCwd, slug).runJsonPath);
+    assert.equal(readJob(tmpCwd, slug), null);
+
+    // Simulates a live process calling patchJob after `orch jobs clean`
+    // deleted run.json out from under it.
+    const updated = patchJob(tmpCwd, slug, { state: 'failed', exitCode: 1 });
+
+    assert.equal(updated.slug, slug);
+    assert.notEqual(updated.slug, undefined);
+    assert.equal(readJob(tmpCwd, slug).slug, slug);
+
+    const jobs = listJobs(tmpCwd);
+    assert.equal(jobs.length, 1);
+    assert.equal(jobs[0].slug, slug);
+    // Guard the list → table path: String(undefined) === "undefined" is the
+    // corruption that showed up in `orch list`. formatJobsTable itself is
+    // pinned in fanout-job-tree.test.js.
+    assert.notEqual(String(jobs[0].slug), 'undefined');
   });
 
   it('serializes concurrent patches from two real processes without losing any increment', async () => {
@@ -695,6 +762,62 @@ describe('cleanJobs', () => {
     const tmpCwd = makeTmpCwd();
     fs.mkdirSync(path.join(tmpCwd, '.orch'), { recursive: true });
     assert.deepEqual(cleanJobs(tmpCwd), []);
+  });
+
+  for (const state of ['running', 'pausing', 'paused']) {
+    it(`refuses when a ${state} job has an alive pid (job dirs untouched)`, () => {
+      const tmpCwd = makeTmpCwd();
+      const liveSlug = `live-${state}-0000`;
+      writeJob(tmpCwd, liveSlug, baseRecord({
+        slug: liveSlug,
+        state,
+        pid: process.pid,
+      }));
+      writeJob(tmpCwd, 'done-job-0001', baseRecord({
+        slug: 'done-job-0001',
+        state: 'done',
+        finishedAt: new Date().toISOString(),
+        exitCode: 0,
+      }));
+
+      assert.throws(
+        () => cleanJobs(tmpCwd),
+        (err) => {
+          assert.ok(err instanceof Error);
+          assert.match(err.message, new RegExp(liveSlug));
+          assert.match(err.message, /orch stop/);
+          return true;
+        },
+      );
+
+      assert.equal(fs.existsSync(jobPaths(tmpCwd, liveSlug).runJsonPath), true);
+      assert.equal(fs.existsSync(jobPaths(tmpCwd, 'done-job-0001').runJsonPath), true);
+      assert.deepEqual(
+        fs.readdirSync(path.join(tmpCwd, '.orch')).sort(),
+        ['done-job-0001', liveSlug].sort(),
+      );
+    });
+  }
+
+  it('still cleans when a live-state job has a dead pid', async () => {
+    const tmpCwd = makeTmpCwd();
+    const pid = await deadPid();
+    writeJob(tmpCwd, 'dead-running-0000', baseRecord({
+      slug: 'dead-running-0000',
+      state: 'running',
+      pid,
+    }));
+    writeJob(tmpCwd, 'done-job-0001', baseRecord({
+      slug: 'done-job-0001',
+      state: 'done',
+      finishedAt: new Date().toISOString(),
+      exitCode: 0,
+    }));
+
+    const removed = cleanJobs(tmpCwd).sort();
+
+    assert.deepEqual(removed, ['dead-running-0000', 'done-job-0001']);
+    assert.deepEqual(fs.readdirSync(path.join(tmpCwd, '.orch')), []);
   });
 });
 

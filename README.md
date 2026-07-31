@@ -252,7 +252,9 @@ Job-control subcommands (see [Headless runs](#headless-runs)):
 - `orch logs <slug> [-f]` — prints a run's `orch.log`; `-f` follows it until
   the job reaches a terminal state.
 - `orch jobs clean` — deletes every run tracked under `.orch/` in the current
-  directory, after a `y/N` confirmation prompt.
+  directory, after a `y/N` confirmation prompt. Refuses (without prompting)
+  if any job is still live (`running`/`pausing`/`paused` with an alive pid);
+  run `orch stop <slug>` first, then clean.
 
 Examples:
 
@@ -297,7 +299,7 @@ orch resume swift-lagoon-49ea # unpause, or recover failed/stopped/crashed
 orch continue swift-lagoon-49ea "follow-up polish"  # new work on a done run
 orch logs swift-lagoon-49ea -f # follow orch.log until the run finishes
 orch stop swift-lagoon-49ea   # SIGTERM the run
-orch jobs clean                # delete every tracked run under .orch/ (asks to confirm)
+orch jobs clean                # delete every tracked run under .orch/ (asks to confirm; refuses if live)
 ```
 
 Pausing is cooperative and happens at stage boundaries (before the first
