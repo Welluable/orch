@@ -258,11 +258,20 @@ describe('worker continue — CLI role gate + acceptance', () => {
     const doc = baseFanout();
     writeFanout(cwd, doc.parentSlug, doc);
     const workerSlug = 'merry-elk-r4b1';
-    seedWorkerJob(cwd, workerSlug);
+    seedWorkerJob(cwd, workerSlug, {
+      state: 'done',
+      exitCode: 0,
+      lastOutcome: {
+        state: 'done', phase: 'commit', stage: 'commit', round: null, exitCode: 0,
+        finishedAt: new Date().toISOString(),
+        task: 'Implement create and list invoice endpoints.',
+        summary: 'done', error: null,
+      },
+    });
     const before = readJob(cwd, workerSlug);
 
     const { code } = await runCli(
-      ['continue', workerSlug, 'fix the failing invoice tests and finish', '--dry-run', '--agent', 'claude'],
+      ['continue', workerSlug, 'follow-up polish on invoices', '--dry-run', '--agent', 'claude'],
       { cwd },
     );
 
@@ -270,18 +279,22 @@ describe('worker continue — CLI role gate + acceptance', () => {
     assert.deepEqual(readJob(cwd, workerSlug), before);
   });
 
-  it('refuses a skipped worker (no worktree ever allocated) with the no-worktree error, and does not create one', async () => {
+  it('refuses a skipped worker (no worktree ever allocated) with the no-worktree error when state is done, and does not create one', async () => {
     const cwd = makeTmpCwd();
     const doc = baseFanout();
     writeFanout(cwd, doc.parentSlug, doc);
     const skippedSlug = 'tidy-heron-m2p9';
     seedWorkerJob(cwd, skippedSlug, {
       worktree: null,
-      state: 'crashed',
+      branch: null,
+      state: 'done',
+      exitCode: 0,
       workerId: '03-charges',
-      finishedAt: null,
-      exitCode: null,
-      lastOutcome: null,
+      lastOutcome: {
+        state: 'done', phase: null, stage: null, round: null, exitCode: 0,
+        finishedAt: new Date().toISOString(), task: 'skipped',
+        summary: '', error: null,
+      },
     });
 
     assert.throws(
