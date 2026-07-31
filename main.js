@@ -54,6 +54,8 @@ import { testRunnerAgentArgs } from './agents/test-runner.js';
 import { integratorAgentArgs } from './agents/integrator.js';
 import { boundariesAgentArgs } from './agents/boundaries.js';
 import { decomposerAgentArgs } from './agents/decomposer.js';
+import { seqDecomposerAgentArgs } from './agents/seq-decomposer.js';
+import { adjustAgentArgs } from './agents/adjust.js';
 import {
     readFanout,
     writeFanout,
@@ -68,6 +70,17 @@ import {
     detectOverlaps,
     ensureScaffoldSubtask,
 } from './lib/fanout.js';
+import {
+    readSeq,
+    writeSeq,
+    patchUnit,
+    patchTip,
+    appendAdjustment,
+    validateSeqDecomposition,
+    buildUnitEnvelope,
+    validateAdjustResult,
+    applyAdjustResult,
+} from './lib/seq.js';
 import { parseDecomposition } from './lib/parse-decomposition.js';
 import {
     mergeBranches,
@@ -866,6 +879,8 @@ export async function runDetached(prompt, options = {}) {
         maxRounds = 5,
         verbose,
         cwd = process.cwd(),
+        seq = false,
+        maxUnits = 8,
         createRunContext: createRunContextFn = createRunContext,
         spawn: spawnFn = spawn,
         exit = (code) => process.exit(code),
@@ -889,6 +904,7 @@ export async function runDetached(prompt, options = {}) {
         maxRounds,
         state: 'starting',
         createRunContext: createRunContextFn,
+        role: seq ? 'coordinator' : null,
     });
     const { logPath } = jobPaths(cwd, slug);
 
@@ -896,6 +912,9 @@ export async function runDetached(prompt, options = {}) {
 
     const childArgs = [__filename, prompt, '--agent', agent, '--max-rounds', String(maxRounds)];
     if (verbose) childArgs.push('--verbose');
+    if (seq) {
+        childArgs.push('--seq', '--max-units', String(maxUnits));
+    }
 
     const child = spawnFn(process.execPath, childArgs, {
         cwd,
@@ -927,11 +946,6 @@ export async function runContinuePipeline(prompt, options = {}) {
     const cwd = options.cwd ?? process.cwd();
     const {
         slug,
-        worktreePath,
-        branch,
-        role,
-        parentSlug,
-        workerId,
         priorOutcome,
         continuation,
     } = options;
@@ -948,6 +962,13 @@ export async function runContinuePipeline(prompt, options = {}) {
     const patchJobFn = options.patchJob ?? patchJob;
     const checkpointPauseFn = options.checkpointPause ?? checkpointPause;
     const pausePollIntervalMs = options.pausePollIntervalMs ?? 500;
+
+    const jobRecord = (jobSlug && readJob(jobCwd, jobSlug)) || null;
+    const worktreePath = options.worktreePath ?? jobRecord?.worktree;
+    const branch = options.branch ?? jobRecord?.branch;
+    const role = options.role ?? jobRecord?.role;
+    const parentSlug = options.parentSlug ?? jobRecord?.parent;
+    const workerId = options.workerId ?? jobRecord?.workerId;
 
     const jobPatch = (fields) => {
         if (!jobSlug) return;
@@ -1063,9 +1084,9 @@ export async function runContinuePipeline(prompt, options = {}) {
 
         jobPatch({ phase: 'commit', stage: 'commit', round: null });
         const message = `orch: ${slug} (continue ${continuation}): ${prompt.split('\n')[0]}`;
-        const worktreeChanges = collectWorktreeChangesFn({ worktreePath });
+        const worktreeChanges = await collectWorktreeChangesFn({ worktreePath });
         printFilesChanged(worktreeChanges);
-        const commitResult = commitWorktreeFn({
+        const commitResult = await commitWorktreeFn({
             worktreePath,
             branch,
             message,
@@ -1098,7 +1119,17 @@ export async function runContinuePipeline(prompt, options = {}) {
             } catch {
                 // Best-effort.
             }
-            if (commitResult.committed) {
+            const seqDoc = readSeq(cwd, parentSlug);
+            if (seqDoc) {
+                const patchUnitFn = options.patchUnit ?? patchUnit;
+                patchUnitFn(cwd, parentSlug, workerId, {
+                    state: 'done',
+                    sha: commitResult.sha,
+                    changedFiles,
+                    slug,
+                });
+                console.log(`next:   orch --seq-continue ${parentSlug}`);
+            } else if (commitResult.committed) {
                 patchWorkerFn(cwd, parentSlug, workerId, {
                     state: 'done',
                     sha: commitResult.sha,
@@ -1119,7 +1150,13 @@ export async function runContinuePipeline(prompt, options = {}) {
         console.error(`Error: ${err.message}`);
         if (role === 'worker' && parentSlug && workerId) {
             try {
-                patchWorkerFn(cwd, parentSlug, workerId, { state: 'failed' });
+                const seqDoc = readSeq(cwd, parentSlug);
+                if (seqDoc) {
+                    const patchUnitFn = options.patchUnit ?? patchUnit;
+                    patchUnitFn(cwd, parentSlug, workerId, { state: 'failed' });
+                } else {
+                    patchWorkerFn(cwd, parentSlug, workerId, { state: 'failed' });
+                }
             } catch {
                 // Best-effort.
             }
@@ -1413,6 +1450,399 @@ export async function runWorkerPipeline(prompt, options = {}) {
 }
 
 /**
+ * The `--unit <parent>:<unitId>` driver: skips triage and runs research → planner →
+ * worktree (from the seq tip) → test loop → code loop → commit. On success patches
+ * `seq.json.units[]` to `done` with sha/changedFiles/slug; on failure, `failed` then exit 1.
+ */
+export async function runUnitPipeline(prompt, options = {}) {
+    const verbose = Boolean(options.verbose);
+    const maxRounds = options.maxRounds ?? 5;
+    const backend = AGENT_BACKENDS[options.agent];
+    if (!backend) {
+        throw new Error(`Unknown agent backend: ${options.agent}`);
+    }
+    const AgentClass = options.AgentClass ?? backend.AgentClass;
+    const cwd = options.cwd ?? process.cwd();
+    const { parentSlug, unitId, base } = options;
+    const exitFn = options.exit ?? ((code) => process.exit(code));
+
+    const createRunContextFn = options.createRunContext ?? createRunContext;
+    const createWorktreeFn = options.createWorktree ?? createWorktree;
+    const commitWorktreeFn = options.commitWorktree ?? commitWorktree;
+    const collectWorktreeChangesFn = options.collectWorktreeChanges ?? collectWorktreeChanges;
+    const patchUnitFn = options.patchUnit ?? patchUnit;
+    const recordChangedFilesFn = options.recordChangedFiles ?? recordChangedFiles;
+    const execFileFn = options.execFile;
+
+    const jobSlug = options.jobSlug ?? process.env.ORCH_JOB_SLUG;
+    const jobCwd = options.jobCwd ?? cwd;
+    const patchJobFn = options.patchJob ?? patchJob;
+    const checkpointPauseFn = options.checkpointPause ?? checkpointPause;
+    const pausePollIntervalMs = options.pausePollIntervalMs ?? 500;
+
+    const jobPatch = (fields) => {
+        if (!jobSlug) return;
+        patchJobFn(jobCwd, jobSlug, fields);
+    };
+    const jobCheckpoint = async () => {
+        if (!jobSlug) return;
+        await checkpointPauseFn(jobCwd, jobSlug, { pollIntervalMs: pausePollIntervalMs });
+    };
+
+    if (!options.AgentClass) {
+        ensureBinaryOnPath(backend.binary, options.agent);
+    }
+
+    try {
+        const runContext = createRunContextFn(jobSlug ? { cwd, slug: jobSlug } : { cwd });
+
+        jobPatch({ phase: 'research', stage: 'research', round: null });
+        const research = researchAgentArgs({ prompt, cwd, researchPath: runContext.researchPath });
+        const researchAgent = new AgentClass(
+            research.name,
+            research.instructions,
+            research.prompt,
+            research.options,
+        );
+        const researchResult = await researchAgent.run({ verbose });
+        if (!researchResult.ok) throw researchResult.error ?? new Error('research failed');
+        await jobCheckpoint();
+        const { content: researchContent, summary: researchSummary } = splitStageSummary(researchResult.result);
+        printStageSummary('research', researchSummary);
+
+        jobPatch({ phase: 'plan', stage: 'planner', round: null });
+        const planner = plannerAgentArgs({
+            prompt,
+            cwd,
+            researchPath: runContext.researchPath,
+            taskPath: runContext.taskPath,
+            researchOutput: researchContent,
+        });
+        const plannerAgent = new AgentClass(
+            planner.name,
+            planner.instructions,
+            planner.prompt,
+            planner.options,
+        );
+        const plannerResult = await plannerAgent.run({ verbose });
+        await jobCheckpoint();
+        const { summary: plannerSummary } = splitStageSummary(plannerResult.result);
+        printStageSummary('planner', plannerSummary);
+
+        jobPatch({ phase: 'worktree', stage: 'worktree', round: null });
+        const worktree = await createWorktreeFn({ cwd, slug: runContext.slug, base });
+        jobPatch({ branch: worktree.branch, worktree: worktree.worktreePath });
+
+        fs.mkdirSync(path.dirname(runContext.statusPath), { recursive: true });
+        fs.writeFileSync(
+            runContext.statusPath,
+            `# Status\n\n- Slug: \`${runContext.slug}\`\n- Branch: \`${worktree.branch}\`\n- Worktree: \`${worktree.worktreePath}\`\n- Parent: \`${parentSlug}\`\n- Worker: \`${unitId}\`\n`,
+        );
+
+        const testAccepted = await runTestLoop({
+            prompt,
+            worktreePath: worktree.worktreePath,
+            branch: worktree.branch,
+            taskPath: runContext.taskPath,
+            statusPath: runContext.statusPath,
+            maxRounds,
+            AgentClass,
+            verbose,
+            jobPatch,
+            jobCheckpoint,
+        });
+
+        const acceptedVerification = [testAccepted.verdict.summary, testAccepted.writerContent]
+            .filter(Boolean)
+            .join('\n');
+
+        const codeAccepted = await runCodeLoop({
+            prompt,
+            worktreePath: worktree.worktreePath,
+            branch: worktree.branch,
+            taskPath: runContext.taskPath,
+            statusPath: runContext.statusPath,
+            maxRounds,
+            AgentClass,
+            verbose,
+            jobPatch,
+            jobCheckpoint,
+            acceptedVerification,
+        });
+
+        jobPatch({ phase: 'commit', stage: 'commit', round: null });
+        const message = `orch: ${runContext.slug} ${prompt.split('\n')[0]}`;
+        const worktreeChanges = await collectWorktreeChangesFn({ worktreePath: worktree.worktreePath });
+        printFilesChanged(worktreeChanges);
+        const commitResult = await commitWorktreeFn({
+            worktreePath: worktree.worktreePath,
+            branch: worktree.branch,
+            message,
+        });
+
+        if (commitResult.committed) {
+            fs.appendFileSync(
+                runContext.statusPath,
+                `\n## Commit\n\n- SHA: \`${commitResult.sha}\`\n- Branch: \`${commitResult.branch}\`\n`,
+            );
+            console.log(`commit: ${commitResult.sha.slice(0, 7)} on ${commitResult.branch}`);
+        } else if (commitResult.sha) {
+            console.log(`commit: ${String(commitResult.sha).slice(0, 7)} on ${worktree.branch}`);
+        } else {
+            fs.appendFileSync(
+                runContext.statusPath,
+                `\n## Commit\n\n- No changes to commit on \`${worktree.branch}\`.\n`,
+            );
+            console.log(`commit: no changes on ${worktree.branch}`);
+        }
+
+        let changedFiles = [];
+        try {
+            changedFiles = recordChangedFilesFn({
+                repoRoot: worktree.repoRoot ?? cwd,
+                base,
+                branch: worktree.branch,
+                execFile: execFileFn,
+            });
+        } catch {
+            // Best-effort: changedFiles is informational only.
+        }
+
+        patchUnitFn(cwd, parentSlug, unitId, {
+            state: 'done',
+            sha: commitResult.sha,
+            changedFiles,
+            slug: runContext.slug,
+        });
+        patchTerminalJob(patchJobFn, jobCwd, jobSlug, {
+            state: 'done',
+            exitCode: 0,
+            summary: codeAccepted?.verdict?.summary ?? '',
+            error: null,
+            task: prompt,
+        });
+    } catch (err) {
+        console.error(`Error: ${err.message}`);
+        try {
+            patchUnitFn(cwd, parentSlug, unitId, { state: 'failed' });
+        } catch {
+            // Best-effort.
+        }
+        if (jobSlug) {
+            try {
+                patchTerminalJob(patchJobFn, jobCwd, jobSlug, {
+                    state: 'failed',
+                    exitCode: 1,
+                    summary: '',
+                    error: err.message,
+                    task: prompt,
+                });
+            } catch {
+                // Best-effort.
+            }
+        }
+        console.error(`next:   orch continue ${jobSlug ?? '<slug>'} "fix the failure and finish"`);
+        if (parentSlug) console.error(`        orch --seq-continue ${parentSlug}`);
+        exitFn(1);
+    }
+}
+
+/**
+ * Merge one unit branch into `orch/<parentSlug>`, repair conflicts once via
+ * integrator, runner-first verify, then advance `seq.tip`. Merge/verify failure
+ * marks the unit `failed` and exits non-zero.
+ */
+export async function mergeOneUnit(options = {}) {
+    const verbose = Boolean(options.verbose);
+    const maxRounds = options.maxRounds ?? 5;
+    const backend = AGENT_BACKENDS[options.agent];
+    if (!backend) {
+        throw new Error(`Unknown agent backend: ${options.agent}`);
+    }
+    const AgentClass = options.AgentClass ?? backend.AgentClass;
+    const cwd = options.cwd ?? process.cwd();
+    const { parentSlug, unitId, unitBranch } = options;
+    const exitFn = options.exit ?? ((code) => process.exit(code));
+    const logFn = options.log ?? ((line) => console.log(line));
+
+    const createWorktreeFn = options.createWorktree ?? createWorktree;
+    const commitWorktreeFn = options.commitWorktree ?? commitWorktree;
+    const readSeqFn = options.readSeq ?? readSeq;
+    const patchUnitFn = options.patchUnit ?? patchUnit;
+    const patchTipFn = options.patchTip ?? patchTip;
+    const mergeBranchesFn = options.mergeBranches ?? mergeBranches;
+    const abortMergeFn = options.abortMerge ?? abortMerge;
+    const conflictedFilesFn = options.conflictedFiles ?? conflictedFiles;
+    const hasConflictMarkersFn = options.hasConflictMarkers ?? hasConflictMarkers;
+    const execFileFn = options.execFile ?? defaultExecFile;
+
+    const jobSlug = options.jobSlug ?? process.env.ORCH_JOB_SLUG;
+    const jobCwd = options.jobCwd ?? cwd;
+    const patchJobFn = options.patchJob ?? patchJob;
+    const checkpointPauseFn = options.checkpointPause ?? checkpointPause;
+    const pausePollIntervalMs = options.pausePollIntervalMs ?? 500;
+
+    const jobPatch = (fields) => {
+        if (!jobSlug) return;
+        patchJobFn(jobCwd, jobSlug, fields);
+    };
+    const jobCheckpoint = async () => {
+        if (!jobSlug) return;
+        await checkpointPauseFn(jobCwd, jobSlug, { pollIntervalMs: pausePollIntervalMs });
+    };
+
+    const failUnit = async (message) => {
+        if (message) console.error(`Error: ${message}`);
+        try {
+            patchUnitFn(cwd, parentSlug, unitId, { state: 'failed' });
+        } catch {
+            // Best-effort.
+        }
+        exitFn(1);
+    };
+
+    try {
+        const seq = readSeqFn(cwd, parentSlug);
+        if (!seq) {
+            await failUnit(`unknown parent ${parentSlug} (no seq.json found)`);
+            return;
+        }
+
+        jobPatch({ phase: 'merge', stage: 'merge', round: null });
+
+        const reuseWorktreePath = `${cwd}-${parentSlug}`;
+        const expectedBranch = `orch/${parentSlug}`;
+        let worktree = null;
+
+        if (fs.existsSync(reuseWorktreePath)) {
+            try {
+                const currentBranch = execFileFn('git', ['-C', reuseWorktreePath, 'rev-parse', '--abbrev-ref', 'HEAD']).trim();
+                if (currentBranch === expectedBranch) {
+                    worktree = { repoRoot: cwd, worktreePath: reuseWorktreePath, branch: expectedBranch };
+                }
+            } catch {
+                // Fall through to create.
+            }
+        }
+
+        if (!worktree) {
+            worktree = await createWorktreeFn({
+                cwd,
+                slug: parentSlug,
+                base: seq.tip || seq.base,
+            });
+        }
+
+        jobPatch({ branch: worktree.branch, worktree: worktree.worktreePath });
+
+        const mergeResult = await mergeBranchesFn({
+            cwd: worktree.worktreePath,
+            candidates: [unitBranch],
+            merged: [],
+            overlappingFiles: [],
+            execFile: execFileFn,
+        });
+
+        let conflicts = [];
+        let mergedOk = false;
+        let mergeOutput = '';
+        if (Array.isArray(mergeResult)) {
+            conflicts = mergeResult.filter((r) => r.status === 'conflict').map((r) => r.branch);
+            mergedOk = mergeResult.some((r) => r.status === 'merged');
+            mergeOutput = mergeResult.find((r) => r.status === 'conflict')?.output ?? '';
+        } else {
+            conflicts = mergeResult?.conflicts ?? [];
+            mergedOk = (mergeResult?.merged ?? []).includes(unitBranch) || (mergeResult?.merged ?? []).length > 0;
+        }
+
+        if (conflicts.length > 0) {
+            jobPatch({ phase: 'merge', stage: 'integrator', round: null });
+            const conflicted = conflictedFilesFn({ cwd: worktree.worktreePath, execFile: execFileFn });
+            const integratorArgs = integratorAgentArgs({
+                prompt: `Resolve the merge conflict from combining \`${unitBranch}\` into the seq integration branch for "${seq.task}".`,
+                cwd: worktree.worktreePath,
+                conflictedFiles: conflicted,
+                mergeOutput,
+                involvedWorkers: [{ id: unitId, title: unitId, subtask: unitId, area: '' }],
+            });
+            const integratorAgent = new AgentClass(
+                'integrator',
+                integratorArgs.instructions,
+                integratorArgs.prompt,
+                integratorArgs.options,
+            );
+
+            let integratorOk = false;
+            try {
+                const integratorOut = await integratorAgent.run({ verbose });
+                await jobCheckpoint();
+                integratorOk = Boolean(integratorOut.ok);
+            } catch {
+                integratorOk = false;
+            }
+
+            const stillConflicted = integratorOk
+                ? hasConflictMarkersFn({ cwd: worktree.worktreePath, execFile: execFileFn })
+                : true;
+
+            if (!stillConflicted) {
+                try {
+                    execFileFn('git', ['-C', worktree.worktreePath, 'commit']);
+                } catch {
+                    // May already be committed by integrator.
+                }
+                mergedOk = true;
+            } else {
+                try {
+                    abortMergeFn({ cwd: worktree.worktreePath, execFile: execFileFn });
+                } catch {
+                    // Best-effort.
+                }
+                await failUnit(`merge conflict for ${unitId} could not be repaired`);
+                return;
+            }
+        }
+
+        if (!mergedOk && conflicts.length === 0) {
+            await failUnit(`failed to merge ${unitBranch}`);
+            return;
+        }
+
+        const artifactDir = path.join(jobCwd, '.orch', parentSlug);
+        await runCodeLoop({
+            prompt: seq.task,
+            worktreePath: worktree.worktreePath,
+            branch: worktree.branch,
+            taskPath: path.join(artifactDir, 'task.md'),
+            statusPath: path.join(artifactDir, 'status.md'),
+            maxRounds,
+            AgentClass,
+            verbose,
+            jobPatch,
+            jobCheckpoint,
+            acceptedVerification: '',
+            runnerFirst: true,
+            loopTitle: 'Verify loop',
+        });
+
+        const commitResult = await commitWorktreeFn({
+            worktreePath: worktree.worktreePath,
+            branch: worktree.branch,
+            message: `orch: merge ${unitId} into ${parentSlug}`,
+        });
+
+        let tipSha = commitResult?.sha;
+        if (!tipSha) {
+            tipSha = execFileFn('git', ['-C', worktree.worktreePath, 'rev-parse', 'HEAD']).trim();
+        }
+        patchTipFn(cwd, parentSlug, tipSha);
+        logFn(`merged ${unitId} → tip ${String(tipSha).slice(0, 7)}`);
+    } catch (err) {
+        await failUnit(err.message);
+    }
+}
+
+/**
  * The `--integrate <parent>` driver: reuses (or creates) the integration worktree keyed
  * by the parent slug, merges `fanout.integration.candidates` in order (repairing conflicts
  * via the `integrator` agent, one conflict at a time), then runs a runner-first verify
@@ -1701,9 +2131,28 @@ export function cascadeStopFanoutChildren(cwd, parentSlug, { kill = (pid, signal
 }
 
 /**
+ * SIGINT/SIGHUP/SIGTERM cascade for seq: reads `seq.json` unit slugs and SIGTERMs
+ * live non-terminal children. Never touches worktrees.
+ */
+export function cascadeStopSeqChildren(cwd, parentSlug, { kill = (pid, signal) => process.kill(pid, signal), isPidAlive: isPidAliveFn = isPidAlive } = {}) {
+    const seq = readSeq(cwd, parentSlug);
+    if (!seq) return;
+
+    const slugs = (seq.units || []).filter((unit) => unit.slug).map((unit) => unit.slug);
+    for (const slug of slugs) {
+        const record = readJob(cwd, slug);
+        if (!record) continue;
+        if (TERMINAL_JOB_STATES.includes(record.state)) continue;
+        if (isPidAliveFn(record.pid)) {
+            kill(record.pid, 'SIGTERM');
+        }
+    }
+}
+
+/**
  * CLI / management cascade stop: SIGTERM the parent pid if alive, then every
- * live child pid (via `cascadeStopFanoutChildren`). The coordinator signal
- * handler keeps calling the child-only helper so it does not re-signal itself.
+ * live child pid (via fan-out and/or seq helpers). The coordinator signal
+ * handler keeps calling the child-only helpers so it does not re-signal itself.
  */
 export function cascadeStop(cwd, parentSlug, { kill = (pid, signal) => process.kill(pid, signal), isPidAlive: isPidAliveFn = isPidAlive } = {}) {
     const parent = readJob(cwd, parentSlug);
@@ -1711,6 +2160,803 @@ export function cascadeStop(cwd, parentSlug, { kill = (pid, signal) => process.k
         kill(parent.pid, 'SIGTERM');
     }
     cascadeStopFanoutChildren(cwd, parentSlug, { kill, isPidAlive: isPidAliveFn });
+    cascadeStopSeqChildren(cwd, parentSlug, { kill, isPidAlive: isPidAliveFn });
+}
+
+/**
+ * The `--seq` coordinator: triage → seq-decomposer (no boundaries) → schedule
+ * units concurrency 1 → merge+verify after each → hybrid adjust. Decline falls
+ * through to the single-worktree pipeline with no seq.json.
+ */
+export async function runSeqPipeline(prompt, options = {}) {
+    const verbose = Boolean(options.verbose);
+    const maxRounds = options.maxRounds ?? 5;
+    const maxUnits = options.maxUnits ?? 8;
+    const backend = AGENT_BACKENDS[options.agent];
+    if (!backend) {
+        throw new Error(`Unknown agent backend: ${options.agent}`);
+    }
+    const AgentClass = options.AgentClass ?? backend.AgentClass;
+    const invocationCwd = options.cwd ?? process.cwd();
+
+    const createRunContextFn = options.createRunContext ?? createRunContext;
+    const createWorktreeFn = options.createWorktree ?? createWorktree;
+    const commitWorktreeFn = options.commitWorktree ?? commitWorktree;
+    const collectWorktreeChangesFn = options.collectWorktreeChanges ?? collectWorktreeChanges;
+    const spawnFn = options.spawn ?? spawn;
+    const execFileFn = options.execFile ?? defaultExecFile;
+    const allocateJobFn = options.allocateJob ?? allocateJob;
+    const reconcileJobFn = options.reconcileJob ?? reconcileJob;
+    const readSeqFn = options.readSeq ?? readSeq;
+    const writeSeqFn = options.writeSeq ?? writeSeq;
+    const patchUnitFn = options.patchUnit ?? patchUnit;
+    const appendAdjustmentFn = options.appendAdjustment ?? appendAdjustment;
+    const mergeOneUnitFn = options.mergeOneUnit ?? mergeOneUnit;
+    const exitFn = options.exit ?? ((code) => process.exit(code));
+    const pollIntervalMs = options.pollIntervalMs ?? 500;
+
+    const jobSlug = options.jobSlug ?? process.env.ORCH_JOB_SLUG;
+    const jobCwd = options.jobCwd ?? invocationCwd;
+    const patchJobFn = options.patchJob ?? patchJob;
+    const checkpointPauseFn = options.checkpointPause ?? checkpointPause;
+    const pausePollIntervalMs = options.pausePollIntervalMs ?? 500;
+
+    const jobPatch = (fields) => {
+        if (!jobSlug) return;
+        patchJobFn(jobCwd, jobSlug, fields);
+    };
+    const jobCheckpoint = async () => {
+        if (!jobSlug) return;
+        await checkpointPauseFn(jobCwd, jobSlug, { pollIntervalMs: pausePollIntervalMs });
+    };
+
+    if (!options.AgentClass) {
+        ensureBinaryOnPath(backend.binary, options.agent);
+    }
+
+    console.log(`cwd:   ${invocationCwd}`);
+    console.log(`agent: ${options.agent}`);
+    console.log();
+
+    let interrupted = false;
+    const onSignal = (signal) => {
+        interrupted = true;
+        try {
+            cascadeStopSeqChildren(invocationCwd, jobSlug);
+        } catch {
+            // Best-effort.
+        }
+        if (jobSlug) {
+            try {
+                const exitCode = exitCodeForSignal(signal);
+                const finishedAt = new Date().toISOString();
+                patchJobFn(jobCwd, jobSlug, (current) => ({
+                    state: 'stopped',
+                    exitCode,
+                    finishedAt,
+                    lastOutcome: buildLastOutcome({
+                        state: 'stopped',
+                        phase: current.phase,
+                        stage: current.stage,
+                        round: current.round,
+                        exitCode,
+                        finishedAt,
+                        task: prompt,
+                        summary: '',
+                        error: null,
+                    }),
+                }));
+            } catch {
+                // Best-effort.
+            }
+        }
+        exitFn(exitCodeForSignal(signal));
+    };
+    process.on('SIGINT', () => onSignal('SIGINT'));
+    process.on('SIGTERM', () => onSignal('SIGTERM'));
+    process.on('SIGHUP', () => onSignal('SIGHUP'));
+
+    const runDeclinePipeline = async () => {
+        const runContext = createRunContextFn(jobSlug ? { cwd: invocationCwd, slug: jobSlug } : { cwd: invocationCwd });
+
+        jobPatch({ phase: 'research', stage: 'research', round: null });
+        const research = researchAgentArgs({ prompt, cwd: invocationCwd, researchPath: runContext.researchPath });
+        const researchAgent = new AgentClass(research.name, research.instructions, research.prompt, research.options);
+        const researchResult = await researchAgent.run({ verbose });
+        await jobCheckpoint();
+        const { content: researchContent, summary: researchSummary } = splitStageSummary(researchResult.result);
+        printStageSummary('research', researchSummary);
+
+        jobPatch({ phase: 'plan', stage: 'planner', round: null });
+        const planner = plannerAgentArgs({
+            prompt, cwd: invocationCwd, researchPath: runContext.researchPath, taskPath: runContext.taskPath, researchOutput: researchContent,
+        });
+        const plannerAgent = new AgentClass(planner.name, planner.instructions, planner.prompt, planner.options);
+        const plannerResult = await plannerAgent.run({ verbose });
+        await jobCheckpoint();
+        const { summary: plannerSummary } = splitStageSummary(plannerResult.result);
+        printStageSummary('planner', plannerSummary);
+
+        jobPatch({ phase: 'worktree', stage: 'worktree', round: null });
+        const worktree = await createWorktreeFn({ cwd: invocationCwd, slug: runContext.slug });
+        jobPatch({ branch: worktree.branch, worktree: worktree.worktreePath });
+
+        fs.mkdirSync(path.dirname(runContext.statusPath), { recursive: true });
+        fs.writeFileSync(
+            runContext.statusPath,
+            `# Status\n\n- Slug: \`${runContext.slug}\`\n- Branch: \`${worktree.branch}\`\n- Worktree: \`${worktree.worktreePath}\`\n`,
+        );
+
+        const testAccepted = await runTestLoop({
+            prompt,
+            worktreePath: worktree.worktreePath,
+            branch: worktree.branch,
+            taskPath: runContext.taskPath,
+            statusPath: runContext.statusPath,
+            maxRounds,
+            AgentClass,
+            verbose,
+            jobPatch,
+            jobCheckpoint,
+        });
+
+        const acceptedVerification = [testAccepted.verdict.summary, testAccepted.writerContent].filter(Boolean).join('\n');
+
+        await runCodeLoop({
+            prompt,
+            worktreePath: worktree.worktreePath,
+            branch: worktree.branch,
+            taskPath: runContext.taskPath,
+            statusPath: runContext.statusPath,
+            maxRounds,
+            AgentClass,
+            verbose,
+            jobPatch,
+            jobCheckpoint,
+            acceptedVerification,
+        });
+
+        jobPatch({ phase: 'commit', stage: 'commit', round: null });
+        const message = `orch: ${runContext.slug} ${prompt.split('\n')[0]}`;
+        const worktreeChanges = await collectWorktreeChangesFn({ worktreePath: worktree.worktreePath });
+        printFilesChanged(worktreeChanges);
+        const commitResult = await commitWorktreeFn({ worktreePath: worktree.worktreePath, branch: worktree.branch, message });
+
+        if (commitResult.committed) {
+            fs.appendFileSync(
+                runContext.statusPath,
+                `\n## Commit\n\n- SHA: \`${commitResult.sha}\`\n- Branch: \`${commitResult.branch}\`\n`,
+            );
+            console.log(`commit: ${commitResult.sha.slice(0, 7)} on ${commitResult.branch}`);
+            console.log(`merge:  git merge ${commitResult.branch}`);
+        } else {
+            fs.appendFileSync(
+                runContext.statusPath,
+                `\n## Commit\n\n- No changes to commit on \`${commitResult.branch}\`.\n`,
+            );
+            console.log(`commit: no changes on ${commitResult.branch}`);
+        }
+
+        jobPatch({ state: 'done', exitCode: 0, finishedAt: new Date().toISOString() });
+        exitFn(0);
+    };
+
+    const runAdjust = async (seqDoc) => {
+        const doneUnits = seqDoc.units.filter((u) => u.state === 'done');
+        const pendingUnits = seqDoc.units.filter((u) => u.state === 'pending');
+        if (pendingUnits.length === 0) return seqDoc;
+
+        let feedback;
+        for (let attempt = 1; attempt <= 3; attempt += 1) {
+            jobPatch({ phase: 'adjust', stage: 'adjust', round: attempt });
+            const adjust = adjustAgentArgs({
+                originalTask: prompt,
+                doneUnits,
+                pendingUnits,
+                tip: seqDoc.tip,
+                cwd: invocationCwd,
+                maxUnits,
+                feedback,
+            });
+            const adjustAgent = new AgentClass(adjust.name, adjust.instructions, adjust.prompt, adjust.options);
+            const adjustResult = await adjustAgent.run({ verbose });
+            await jobCheckpoint();
+            const { content: adjustContent, summary: adjustSummary } = splitStageSummary(adjustResult.result);
+            printStageSummary('adjust', adjustSummary);
+
+            const parsed = parseDecomposition(adjustContent);
+            if (!parsed) {
+                feedback = ['adjust output was not valid JSON'];
+                continue;
+            }
+            const violations = validateAdjustResult(parsed, { units: seqDoc.units, maxUnits });
+            if (violations.length === 0) {
+                const applied = applyAdjustResult(seqDoc, parsed);
+                writeSeqFn(invocationCwd, jobSlug, applied);
+                const rewriteIds = (parsed.rewrites || []).map((r) => r.id);
+                const dropIds = parsed.drops || [];
+                const summaryParts = [];
+                if (rewriteIds.length) summaryParts.push(`rewrote ${rewriteIds.join(', ')}`);
+                if (dropIds.length) summaryParts.push(`dropped ${dropIds.join(', ')}`);
+                const summary = summaryParts.join('; ') || 'no changes';
+                appendAdjustmentFn(invocationCwd, jobSlug, {
+                    afterUnitId: doneUnits[doneUnits.length - 1]?.id ?? null,
+                    tip: applied.tip,
+                    summary,
+                });
+                console.log(`adjust: ${summary}`);
+                return applied;
+            }
+            feedback = violations;
+        }
+        console.log('adjust: validation failed after repairs — keeping previous pending list');
+        return seqDoc;
+    };
+
+    const spawnUnitChild = async (unit, tip) => {
+        const envelope = buildUnitEnvelope({
+            id: unit.id,
+            title: unit.title,
+            subtask: unit.subtask,
+            originalTask: prompt,
+        });
+        const unitPrompt = `${unit.subtask}\n\n${envelope}`;
+
+        const allocated = await allocateJobFn({
+            cwd: invocationCwd,
+            prompt: unitPrompt,
+            agent: options.agent,
+            maxRounds,
+            state: 'starting',
+            parent: jobSlug,
+            role: 'worker',
+            workerId: unit.id,
+        });
+        const unitSlug = allocated.slug;
+        patchUnitFn(invocationCwd, jobSlug, unit.id, {
+            slug: unitSlug,
+            state: 'running',
+        });
+
+        const { logPath } = jobPaths(invocationCwd, unitSlug);
+        const logFd = fs.openSync(logPath, 'a');
+        const childArgs = [
+            __filename, unitPrompt,
+            '--agent', options.agent,
+            '--max-rounds', String(maxRounds),
+            '--unit', `${jobSlug}:${unit.id}`,
+        ];
+        const child = spawnFn(process.execPath, childArgs, {
+            cwd: invocationCwd,
+            env: {
+                ...process.env,
+                ORCH_JOB_SLUG: unitSlug,
+                ORCH_DETACHED: '1',
+                ORCH_SEQ_DEPTH: '1',
+                ORCH_FANOUT_DEPTH: '1',
+            },
+            detached: true,
+            stdio: ['ignore', logFd, logFd],
+        });
+        child.unref();
+        patchJobFn(invocationCwd, unitSlug, { pid: child.pid, state: 'running' });
+        console.log(`[${unit.id} ${unitSlug}] running (base ${String(tip).slice(0, 7)})`);
+        return unitSlug;
+    };
+
+    const waitForUnit = async (unitId, unitSlug) => {
+        const spawnedAt = Date.now();
+        for (;;) {
+            if (interrupted) return 'interrupted';
+            await sleep(pollIntervalMs);
+            await jobCheckpoint();
+
+            const seq = readSeqFn(invocationCwd, jobSlug);
+            const unit = seq?.units?.find((u) => u.id === unitId);
+            if (unit && (unit.state === 'done' || unit.state === 'failed' || unit.state === 'skipped')) {
+                return unit.state;
+            }
+
+            const job = reconcileJobFn(invocationCwd, unitSlug);
+            if (job && TERMINAL_JOB_STATES.includes(job.state)) {
+                if (unit && unit.state !== 'done' && unit.state !== 'failed') {
+                    const nextState = job.state === 'done' ? 'done' : 'failed';
+                    patchUnitFn(invocationCwd, jobSlug, unitId, {
+                        state: nextState,
+                        sha: job.sha ?? null,
+                    });
+                    return nextState;
+                }
+                return job.state === 'done' ? 'done' : 'failed';
+            }
+
+            // Grace period before treating a dead pid as a crash (mirrors fan-out).
+            if (job && !job.pid && Date.now() - spawnedAt > Math.max(pollIntervalMs * 4, 2000)) {
+                patchUnitFn(invocationCwd, jobSlug, unitId, { state: 'failed' });
+                return 'failed';
+            }
+        }
+    };
+
+    try {
+        jobPatch({ phase: 'triage', stage: 'triage', round: null });
+        const triage = triageAgentArgs({ prompt, cwd: invocationCwd });
+        const triageAgent = new AgentClass(triage.name, triage.instructions, triage.prompt, triage.options);
+        const triageResult = await triageAgent.run({ verbose });
+        await jobCheckpoint();
+        const { content: triageContent, summary: triageSummary } = splitStageSummary(triageResult.result);
+        printStageSummary('triage', triageSummary);
+        const parsed = parseTriageJson(triageContent);
+
+        if (parsed?.simple === true) {
+            console.log('triage: simple — seq skipped (quick-fix)');
+            jobPatch({ phase: 'quick-fix', stage: 'quick-fix', round: null });
+            const quickFix = quickFixAgentArgs({ prompt, cwd: invocationCwd, fix_plan: parsed.fix_plan });
+            const quickFixTracker = new FileTracker({ cwd: invocationCwd });
+            const quickFixAgent = new AgentClass(
+                quickFix.name,
+                quickFix.instructions,
+                quickFix.prompt,
+                { ...quickFix.options, fileTracker: quickFixTracker },
+            );
+            const quickFixResult = await quickFixAgent.run({ verbose });
+            await jobCheckpoint();
+            const { summary: quickFixSummary } = splitStageSummary(quickFixResult.result);
+            printStageSummary('quick-fix', quickFixSummary, quickFixTracker.getFiles());
+            jobPatch({ state: 'done', exitCode: 0, finishedAt: new Date().toISOString() });
+            exitFn(0);
+            return;
+        }
+
+        console.log('triage: complex — seq requested');
+
+        let feedback;
+        let decision = null;
+        for (let attempt = 1; attempt <= 3; attempt += 1) {
+            jobPatch({ phase: 'decompose', stage: 'seq-decomposer', round: attempt });
+            const decomposer = seqDecomposerAgentArgs({
+                prompt, cwd: invocationCwd, maxUnits, feedback,
+            });
+            const decomposerAgent = new AgentClass(decomposer.name, decomposer.instructions, decomposer.prompt, decomposer.options);
+            const decomposerResult = await decomposerAgent.run({ verbose });
+            await jobCheckpoint();
+            const { content: decomposerContent, summary: decomposerSummary } = splitStageSummary(decomposerResult.result);
+            printStageSummary('seq-decomposer', decomposerSummary);
+
+            const parsedDecomposition = parseDecomposition(decomposerContent);
+            if (!parsedDecomposition) {
+                feedback = ['decomposer output was not valid JSON'];
+                if (attempt === 3) decision = { decline: true, why: 'decomposer did not return valid JSON after repair attempts' };
+                continue;
+            }
+            if (parsedDecomposition.decomposable === false) {
+                decision = { decline: true, why: parsedDecomposition.why };
+                break;
+            }
+
+            const violations = validateSeqDecomposition(parsedDecomposition, { maxUnits });
+            if (violations.length === 0) {
+                decision = { decline: false, decomposition: parsedDecomposition };
+                break;
+            }
+            feedback = violations;
+            if (attempt === 3) {
+                decision = { decline: true, why: `decomposition still invalid after repairs: ${violations.join('; ')}` };
+            }
+        }
+
+        if (decision.decline) {
+            console.log(`decomposer: declined — ${decision.why}`);
+            console.log('falling through to the single-worktree pipeline');
+            await runDeclinePipeline();
+            return;
+        }
+
+        const { decomposition } = decision;
+        const base = execFileFn('git', ['-C', invocationCwd, 'rev-parse', 'HEAD']).trim();
+
+        await createWorktreeFn({ cwd: invocationCwd, slug: jobSlug, base });
+
+        const units = decomposition.units.map((unit) => ({
+            id: unit.id,
+            title: unit.title,
+            subtask: unit.subtask,
+            state: 'pending',
+            slug: null,
+            sha: null,
+            changedFiles: null,
+        }));
+
+        writeSeqFn(invocationCwd, jobSlug, {
+            version: 1,
+            parentSlug: jobSlug,
+            task: prompt,
+            base,
+            tip: base,
+            maxUnits,
+            units,
+            adjustments: [],
+            state: 'running',
+            startedAt: new Date().toISOString(),
+            finishedAt: null,
+        });
+
+        console.log(`decomposer: ${units.length} units`);
+        jobPatch({ phase: 'schedule', stage: null, round: null });
+
+        for (;;) {
+            if (interrupted) {
+                exitFn(exitCodeForSignal('SIGINT'));
+                return;
+            }
+
+            await jobCheckpoint();
+
+            let seq = readSeqFn(invocationCwd, jobSlug);
+            const firstPending = seq.units.find((u) => u.state === 'pending');
+            if (!firstPending) {
+                const failed = seq.units.some((u) => u.state === 'failed');
+                writeSeqFn(invocationCwd, jobSlug, {
+                    ...seq,
+                    state: failed ? 'failed' : 'done',
+                    finishedAt: new Date().toISOString(),
+                });
+                jobPatch({
+                    state: failed ? 'failed' : 'done',
+                    exitCode: failed ? 1 : 0,
+                    finishedAt: new Date().toISOString(),
+                });
+                if (failed) {
+                    exitFn(1);
+                } else {
+                    console.log(`seq complete: ${seq.units.filter((u) => u.state === 'done').length}/${seq.units.length} merged`);
+                    console.log(`merge:  git merge orch/${jobSlug}`);
+                    exitFn(0);
+                }
+                return;
+            }
+
+            // Re-attach to a live running unit instead of spawning a duplicate.
+            const live = seq.units.find((u) => u.state === 'running' && u.slug);
+            if (live) {
+                const terminal = await waitForUnit(live.id, live.slug);
+                if (terminal === 'interrupted') {
+                    exitFn(exitCodeForSignal('SIGINT'));
+                    return;
+                }
+                if (terminal !== 'done') {
+                    console.log(`[${live.id} …] ${terminal}`);
+                    const liveSlug = live.slug;
+                    console.log(`stopped: chain halted; next: orch continue ${liveSlug} "fix …"`);
+                    writeSeqFn(invocationCwd, jobSlug, {
+                        ...readSeqFn(invocationCwd, jobSlug),
+                        state: 'failed',
+                        finishedAt: new Date().toISOString(),
+                    });
+                    jobPatch({ state: 'failed', exitCode: 1, finishedAt: new Date().toISOString() });
+                    exitFn(1);
+                    return;
+                }
+                console.log(`[${live.id} …] done — merging`);
+                await mergeOneUnitFn({
+                    cwd: invocationCwd,
+                    parentSlug: jobSlug,
+                    unitId: live.id,
+                    unitBranch: `orch/${live.slug}`,
+                    agent: options.agent,
+                    AgentClass,
+                    maxRounds,
+                    verbose,
+                    jobSlug,
+                    jobCwd,
+                    createWorktree: createWorktreeFn,
+                    commitWorktree: commitWorktreeFn,
+                    execFile: execFileFn,
+                    exit: exitFn,
+                });
+                seq = readSeqFn(invocationCwd, jobSlug);
+                await runAdjust(seq);
+                continue;
+            }
+
+            const tip = seq.tip;
+            const unitSlug = await spawnUnitChild(firstPending, tip);
+            const terminal = await waitForUnit(firstPending.id, unitSlug);
+            if (terminal === 'interrupted') {
+                exitFn(exitCodeForSignal('SIGINT'));
+                return;
+            }
+            if (terminal !== 'done') {
+                console.log(`[${firstPending.id} …] ${terminal}`);
+                console.log(`stopped: chain halted; next: orch continue ${unitSlug} "fix …"`);
+                writeSeqFn(invocationCwd, jobSlug, {
+                    ...readSeqFn(invocationCwd, jobSlug),
+                    state: 'failed',
+                    finishedAt: new Date().toISOString(),
+                });
+                jobPatch({ state: 'failed', exitCode: 1, finishedAt: new Date().toISOString() });
+                exitFn(1);
+                return;
+            }
+
+            console.log(`[${firstPending.id} …] done — merging`);
+            await mergeOneUnitFn({
+                cwd: invocationCwd,
+                parentSlug: jobSlug,
+                unitId: firstPending.id,
+                unitBranch: `orch/${unitSlug}`,
+                agent: options.agent,
+                AgentClass,
+                maxRounds,
+                verbose,
+                jobSlug,
+                jobCwd,
+                createWorktree: createWorktreeFn,
+                commitWorktree: commitWorktreeFn,
+                execFile: execFileFn,
+                exit: exitFn,
+            });
+            seq = readSeqFn(invocationCwd, jobSlug);
+            await runAdjust(seq);
+        }
+    } catch (err) {
+        console.error(`Error: ${err.message}`);
+        if (jobSlug) {
+            try {
+                patchTerminalJob(patchJobFn, jobCwd, jobSlug, {
+                    state: 'failed',
+                    exitCode: 1,
+                    summary: '',
+                    error: err.message,
+                    task: prompt,
+                });
+            } catch {
+                // Best-effort.
+            }
+        }
+        exitFn(1);
+    }
+}
+
+/**
+ * Hidden `--seq-continue <parent>`: merge any done-but-unmerged units, adjust,
+ * then continue the pending schedule loop.
+ */
+export async function runSeqContinuePipeline(options = {}) {
+    const verbose = Boolean(options.verbose);
+    const maxRounds = options.maxRounds ?? 5;
+    const backend = AGENT_BACKENDS[options.agent];
+    if (!backend) {
+        throw new Error(`Unknown agent backend: ${options.agent}`);
+    }
+    const AgentClass = options.AgentClass ?? backend.AgentClass;
+    const invocationCwd = options.cwd ?? process.cwd();
+    const parentSlug = options.parentSlug;
+    const exitFn = options.exit ?? ((code) => process.exit(code));
+    const pollIntervalMs = options.pollIntervalMs ?? 500;
+
+    const createWorktreeFn = options.createWorktree ?? createWorktree;
+    const commitWorktreeFn = options.commitWorktree ?? commitWorktree;
+    const spawnFn = options.spawn ?? spawn;
+    const execFileFn = options.execFile ?? defaultExecFile;
+    const allocateJobFn = options.allocateJob ?? allocateJob;
+    const reconcileJobFn = options.reconcileJob ?? reconcileJob;
+    const readSeqFn = options.readSeq ?? readSeq;
+    const writeSeqFn = options.writeSeq ?? writeSeq;
+    const patchUnitFn = options.patchUnit ?? patchUnit;
+    const appendAdjustmentFn = options.appendAdjustment ?? appendAdjustment;
+    const mergeOneUnitFn = options.mergeOneUnit ?? mergeOneUnit;
+
+    const jobSlug = options.jobSlug ?? parentSlug ?? process.env.ORCH_JOB_SLUG;
+    const jobCwd = options.jobCwd ?? invocationCwd;
+    const patchJobFn = options.patchJob ?? patchJob;
+    const checkpointPauseFn = options.checkpointPause ?? checkpointPause;
+    const pausePollIntervalMs = options.pausePollIntervalMs ?? 500;
+
+    const jobPatch = (fields) => {
+        if (!jobSlug) return;
+        patchJobFn(jobCwd, jobSlug, fields);
+    };
+    const jobCheckpoint = async () => {
+        if (!jobSlug) return;
+        await checkpointPauseFn(jobCwd, jobSlug, { pollIntervalMs: pausePollIntervalMs });
+    };
+
+    const seq = readSeqFn(invocationCwd, parentSlug);
+    if (!seq) {
+        console.error(`Error: unknown parent ${parentSlug} (no seq.json found)`);
+        exitFn(1);
+        return;
+    }
+
+    const maxUnits = seq.maxUnits ?? 8;
+    const prompt = seq.task;
+
+    const runAdjust = async (seqDoc) => {
+        const doneUnits = seqDoc.units.filter((u) => u.state === 'done');
+        const pendingUnits = seqDoc.units.filter((u) => u.state === 'pending');
+        if (pendingUnits.length === 0) return seqDoc;
+
+        let feedback;
+        for (let attempt = 1; attempt <= 3; attempt += 1) {
+            const adjust = adjustAgentArgs({
+                originalTask: prompt,
+                doneUnits,
+                pendingUnits,
+                tip: seqDoc.tip,
+                cwd: invocationCwd,
+                maxUnits,
+                feedback,
+            });
+            const adjustAgent = new AgentClass(adjust.name, adjust.instructions, adjust.prompt, adjust.options);
+            const adjustResult = await adjustAgent.run({ verbose });
+            await jobCheckpoint();
+            const { content: adjustContent } = splitStageSummary(adjustResult.result);
+            const parsed = parseDecomposition(adjustContent);
+            if (!parsed) {
+                feedback = ['adjust output was not valid JSON'];
+                continue;
+            }
+            const violations = validateAdjustResult(parsed, { units: seqDoc.units, maxUnits });
+            if (violations.length === 0) {
+                const applied = applyAdjustResult(seqDoc, parsed);
+                writeSeqFn(invocationCwd, parentSlug, applied);
+                appendAdjustmentFn(invocationCwd, parentSlug, {
+                    afterUnitId: doneUnits[doneUnits.length - 1]?.id ?? null,
+                    tip: applied.tip,
+                    summary: 'seq-continue adjust',
+                });
+                return applied;
+            }
+            feedback = violations;
+        }
+        return seqDoc;
+    };
+
+    const spawnUnitChild = async (unit) => {
+        const envelope = buildUnitEnvelope({
+            id: unit.id,
+            title: unit.title,
+            subtask: unit.subtask,
+            originalTask: prompt,
+        });
+        const unitPrompt = `${unit.subtask}\n\n${envelope}`;
+        const allocated = await allocateJobFn({
+            cwd: invocationCwd,
+            prompt: unitPrompt,
+            agent: options.agent,
+            maxRounds,
+            state: 'starting',
+            parent: parentSlug,
+            role: 'worker',
+            workerId: unit.id,
+        });
+        const unitSlug = allocated.slug;
+        patchUnitFn(invocationCwd, parentSlug, unit.id, { slug: unitSlug, state: 'running' });
+        const { logPath } = jobPaths(invocationCwd, unitSlug);
+        const logFd = fs.openSync(logPath, 'a');
+        const childArgs = [
+            __filename, unitPrompt,
+            '--agent', options.agent,
+            '--max-rounds', String(maxRounds),
+            '--unit', `${parentSlug}:${unit.id}`,
+        ];
+        const child = spawnFn(process.execPath, childArgs, {
+            cwd: invocationCwd,
+            env: {
+                ...process.env,
+                ORCH_JOB_SLUG: unitSlug,
+                ORCH_DETACHED: '1',
+                ORCH_SEQ_DEPTH: '1',
+                ORCH_FANOUT_DEPTH: '1',
+            },
+            detached: true,
+            stdio: ['ignore', logFd, logFd],
+        });
+        child.unref();
+        patchJobFn(invocationCwd, unitSlug, { pid: child.pid, state: 'running' });
+        return unitSlug;
+    };
+
+    const waitForUnit = async (unitId, unitSlug) => {
+        for (;;) {
+            await sleep(pollIntervalMs);
+            await jobCheckpoint();
+            const current = readSeqFn(invocationCwd, parentSlug);
+            const unit = current?.units?.find((u) => u.id === unitId);
+            if (unit && (unit.state === 'done' || unit.state === 'failed')) return unit.state;
+            const job = reconcileJobFn(invocationCwd, unitSlug);
+            if (job && TERMINAL_JOB_STATES.includes(job.state)) {
+                return job.state === 'done' ? 'done' : 'failed';
+            }
+        }
+    };
+
+    try {
+        jobPatch({ state: 'running', phase: 'schedule', finishedAt: null, exitCode: null });
+        writeSeqFn(invocationCwd, parentSlug, { ...seq, state: 'running', finishedAt: null });
+
+        // Merge any done units whose tip may not yet include them (done-but-unmerged).
+        let current = readSeqFn(invocationCwd, parentSlug);
+        for (const unit of current.units) {
+            if (unit.state === 'done' && unit.slug) {
+                // Heuristic: merge if unit sha is set and tip still looks like an earlier base,
+                // or always attempt merge of the most recent done unit that hasn't been adjusted after.
+                const alreadyAdjusted = (current.adjustments || []).some((a) => a.afterUnitId === unit.id);
+                if (!alreadyAdjusted) {
+                    await mergeOneUnitFn({
+                        cwd: invocationCwd,
+                        parentSlug,
+                        unitId: unit.id,
+                        unitBranch: `orch/${unit.slug}`,
+                        agent: options.agent,
+                        AgentClass,
+                        maxRounds,
+                        verbose,
+                        jobSlug,
+                        jobCwd,
+                        createWorktree: createWorktreeFn,
+                        commitWorktree: commitWorktreeFn,
+                        execFile: execFileFn,
+                        exit: (code) => {
+                            if (code !== 0) throw new Error(`merge of ${unit.id} failed`);
+                        },
+                    });
+                    current = await runAdjust(readSeqFn(invocationCwd, parentSlug));
+                }
+            }
+        }
+
+        for (;;) {
+            await jobCheckpoint();
+            current = readSeqFn(invocationCwd, parentSlug);
+            const pending = current.units.find((u) => u.state === 'pending');
+            if (!pending) {
+                writeSeqFn(invocationCwd, parentSlug, {
+                    ...current,
+                    state: 'done',
+                    finishedAt: new Date().toISOString(),
+                });
+                jobPatch({ state: 'done', exitCode: 0, finishedAt: new Date().toISOString() });
+                exitFn(0);
+                return;
+            }
+
+            const unitSlug = await spawnUnitChild(pending);
+            const terminal = await waitForUnit(pending.id, unitSlug);
+            if (terminal !== 'done') {
+                writeSeqFn(invocationCwd, parentSlug, {
+                    ...readSeqFn(invocationCwd, parentSlug),
+                    state: 'failed',
+                    finishedAt: new Date().toISOString(),
+                });
+                jobPatch({ state: 'failed', exitCode: 1, finishedAt: new Date().toISOString() });
+                exitFn(1);
+                return;
+            }
+
+            await mergeOneUnitFn({
+                cwd: invocationCwd,
+                parentSlug,
+                unitId: pending.id,
+                unitBranch: `orch/${unitSlug}`,
+                agent: options.agent,
+                AgentClass,
+                maxRounds,
+                verbose,
+                jobSlug,
+                jobCwd,
+                createWorktree: createWorktreeFn,
+                commitWorktree: commitWorktreeFn,
+                execFile: execFileFn,
+                exit: exitFn,
+            });
+            await runAdjust(readSeqFn(invocationCwd, parentSlug));
+        }
+    } catch (err) {
+        console.error(`Error: ${err.message}`);
+        exitFn(1);
+    }
 }
 
 /**
@@ -2454,6 +3700,72 @@ async function runWorkerFromCli(options) {
     });
 }
 
+/** CLI glue for `--unit`: resolves the parent seq/unit record, builds the unit
+ * envelope, allocates (or reuses) the job record, then calls `runUnitPipeline`. */
+async function runUnitFromCli(options) {
+    const cwd = process.cwd();
+    const { parentSlug, workerId: unitId } = splitParentWorker(options.unit);
+    if (!parentSlug || !unitId) {
+        console.error(`Error: --unit must be in the form <parent-slug>:<unit-id>, got "${options.unit}"`);
+        process.exit(1);
+        return;
+    }
+
+    process.env.ORCH_SEQ_DEPTH = '1';
+    process.env.ORCH_FANOUT_DEPTH = '1';
+
+    const seq = readSeq(cwd, parentSlug);
+    if (!seq) {
+        console.error(`Error: unknown parent ${parentSlug} (no seq.json found)`);
+        process.exit(1);
+        return;
+    }
+
+    const unit = seq.units.find((u) => u.id === unitId);
+    if (!unit) {
+        console.error(`Error: unknown unit ${unitId} in ${parentSlug}`);
+        process.exit(1);
+        return;
+    }
+
+    const envelope = buildUnitEnvelope({
+        id: unit.id,
+        title: unit.title,
+        subtask: unit.subtask,
+        originalTask: seq.task,
+    });
+    const unitPrompt = `${unit.subtask}\n\n${envelope}`;
+
+    let jobSlug = process.env.ORCH_JOB_SLUG;
+    if (!jobSlug) {
+        const alloc = allocateJob({
+            cwd,
+            prompt: unitPrompt,
+            agent: options.agent,
+            maxRounds: options.maxRounds,
+            state: 'running',
+            pid: process.pid,
+            parent: parentSlug,
+            role: 'worker',
+            workerId: unitId,
+        });
+        jobSlug = alloc.slug;
+    }
+    setJobSlug(jobSlug);
+
+    await runUnitPipeline(unitPrompt, {
+        agent: options.agent,
+        maxRounds: options.maxRounds,
+        verbose: options.verbose,
+        cwd,
+        parentSlug,
+        unitId,
+        base: seq.tip,
+        jobSlug,
+        jobCwd: cwd,
+    });
+}
+
 /** CLI glue for `--integrate`: resolves the parent fan-out, allocates (or reuses) the
  * integration job record, then calls `runIntegratePipeline`. */
 async function runIntegrateFromCli(options) {
@@ -2525,22 +3837,26 @@ program
     .name('orch')
     .version(version)
     .description('The Orchestrator: triage → research → plan → implement pipeline against a task')
-    .argument('<task...>', 'Task description to use as the prompt (mention a file path and the agent will read it)')
+    .argument('[task...]', 'Task description to use as the prompt (mention a file path and the agent will read it)')
     .option('-v, --verbose', 'Stream agent thinking/output deltas to stderr as the pipeline runs')
     .option('--dry-run', 'Check that the selected agent CLI is on PATH and exit; do not run the pipeline')
     .option('--ask', 'Ask a read-only question about the codebase; print the reply and exit (skips triage and all write pipelines)')
     .option('--quick', 'Skip triage, run quick-fix directly in the current working tree; create no artifacts, worktrees, or commits')
     .option('--detach', 'Run the pipeline in the background and return immediately; manage it with orch list/status/pause/resume/stop/logs. Cannot be combined with --ask, --quick, or --dry-run')
     .option('--max-rounds <n>', 'Max writer⇄critic and writer⇄runner iterations per implementer loop (ignored with --ask and --quick)', positiveIntParser('--max-rounds'), 5)
-    .option('--fan-out', 'Decompose the task into parallel workers coordinated by this process (see README Fan-out section). Cannot be combined with --ask, --quick, or --dry-run')
+    .option('--fan-out', 'Decompose into parallel workers, then integrate once. Cannot be combined with --ask, --quick, --dry-run, or --seq')
+    .option('--seq', 'Decompose into ordered units; merge each, then adjust the next. Cannot be combined with --fan-out, --ask, --quick, or --dry-run')
     .option('--max-workers <n>', 'Max number of parallel fan-out workers (only meaningful with --fan-out)', positiveIntParser('--max-workers'), 4)
+    .option('--max-units <n>', 'Max number of sequential units (only meaningful with --seq)', positiveIntParser('--max-units'), 8)
     .option('--max-concurrency <n>', 'Optional hard ceiling on in-flight fan-out workers at once (only meaningful with --fan-out; default: coordinator chooses)', positiveIntParser('--max-concurrency'))
     .addOption(
         new Option('--agent <agent>', 'Agent backend to run the pipeline with: "cursor" (Cursor Agent CLI), "claude" (Claude Code CLI), "agn" (agn CLI), or "opencode" (OpenCode CLI). Omitting uses local then global config, else cursor')
             .choices(['cursor', 'claude', 'agn', 'opencode']),
     )
     .addOption(new Option('--worker <value>', 'internal: run a single fan-out worker "<parent-slug>:<worker-id>"').hideHelp())
+    .addOption(new Option('--unit <value>', 'internal: run a single seq unit "<parent-slug>:<unit-id>"').hideHelp())
     .addOption(new Option('--integrate <value>', 'internal: (re)run fan-out integration for "<parent-slug>"').hideHelp())
+    .addOption(new Option('--seq-continue <value>', 'internal: resume a seq coordinator after a fixed unit "<parent-slug>"').hideHelp())
     .addHelpText(
         'after',
         `
@@ -2572,17 +3888,112 @@ Headless runs:
 Fan-out:
   $ orch "implement the billing module" --fan-out --agent claude   # triage, decompose, run parallel workers, integrate
   $ orch "implement X" --fan-out --max-workers 6 --max-concurrency 3
+
+Sequential (--seq):
+  $ orch "implement the billing module" --seq --agent claude
+  $ orch "implement X" --seq --max-units 6
 `,
     )
     .action(async (task, options) => {
-        const prompt = task.join(' ').trim();
+        const prompt = (Array.isArray(task) ? task : []).join(' ').trim();
+
+        options.agent = resolveAgentOrExit(options.agent);
+
+        if (options.seqContinue) {
+            const cwd = process.cwd();
+            const parentSlug = options.seqContinue;
+            const seq = readSeq(cwd, parentSlug);
+            if (!seq) {
+                console.error(`Error: unknown parent ${parentSlug} (no seq.json found)`);
+                process.exit(1);
+                return;
+            }
+            let jobSlug = process.env.ORCH_JOB_SLUG;
+            if (!jobSlug) {
+                jobSlug = parentSlug;
+                setJobSlug(jobSlug);
+            }
+            await runSeqContinuePipeline({
+                agent: options.agent,
+                maxRounds: options.maxRounds,
+                verbose: options.verbose,
+                cwd,
+                parentSlug,
+                jobSlug,
+                jobCwd: cwd,
+            });
+            return;
+        }
+
         if (!prompt) {
-            console.error('Error: task cannot be empty');
+            // `[task...]` stays optional so hidden `--seq-continue` can omit a
+            // positional; still mirror commander's required-arg error when argv
+            // has no task parts at all (vs empty/whitespace → cannot be empty).
+            const taskParts = Array.isArray(task) ? task : [];
+            if (taskParts.length === 0) {
+                console.error("error: missing required argument 'task'");
+            } else {
+                console.error('Error: task cannot be empty');
+            }
             process.exit(1);
             return;
         }
 
-        options.agent = resolveAgentOrExit(options.agent);
+        if (options.seq && options.fanOut) {
+            console.error('Error: --seq cannot be combined with --fan-out');
+            process.exit(1);
+            return;
+        }
+
+        if (options.seq) {
+            const conflicts = ['ask', 'quick', 'dryRun']
+                .filter((key) => options[key])
+                .map((key) => `--${key === 'dryRun' ? 'dry-run' : key}`);
+            if (conflicts.length > 0) {
+                console.error(`Error: --seq cannot be combined with ${conflicts.join(', ')}`);
+                process.exit(1);
+                return;
+            }
+            if (process.env.ORCH_SEQ_DEPTH || process.env.ORCH_FANOUT_DEPTH) {
+                console.error('Error: --seq cannot be used inside a seq/fan-out child (ORCH_SEQ_DEPTH or ORCH_FANOUT_DEPTH is already set)');
+                process.exit(1);
+                return;
+            }
+
+            if (options.detach) {
+                await runDetached(prompt, {
+                    ...options,
+                    seq: true,
+                    maxUnits: options.maxUnits,
+                });
+                return;
+            }
+
+            const cwd = process.cwd();
+            let slug = process.env.ORCH_JOB_SLUG;
+            if (!slug) {
+                const alloc = allocateJob({
+                    cwd,
+                    prompt,
+                    agent: options.agent,
+                    maxRounds: options.maxRounds,
+                    state: 'running',
+                    pid: process.pid,
+                    role: 'coordinator',
+                });
+                slug = alloc.slug;
+            }
+            setJobSlug(slug);
+
+            await runSeqPipeline(prompt, {
+                ...options,
+                cwd,
+                jobSlug: slug,
+                jobCwd: cwd,
+                maxUnits: options.maxUnits,
+            });
+            return;
+        }
 
         if (options.fanOut) {
             const conflicts = ['ask', 'quick', 'dryRun']
@@ -2593,8 +4004,8 @@ Fan-out:
                 process.exit(1);
                 return;
             }
-            if (process.env.ORCH_FANOUT_DEPTH) {
-                console.error('Error: --fan-out cannot be used inside a fan-out child (ORCH_FANOUT_DEPTH is already set)');
+            if (process.env.ORCH_FANOUT_DEPTH || process.env.ORCH_SEQ_DEPTH) {
+                console.error('Error: --fan-out cannot be used inside a fan-out/seq child (ORCH_FANOUT_DEPTH or ORCH_SEQ_DEPTH is already set)');
                 process.exit(1);
                 return;
             }
@@ -2622,8 +4033,8 @@ Fan-out:
             return;
         }
 
-        if (options.worker || options.integrate) {
-            const flagName = options.worker ? '--worker' : '--integrate';
+        if (options.worker || options.integrate || options.unit) {
+            const flagName = options.worker ? '--worker' : options.unit ? '--unit' : '--integrate';
             const conflicts = ['ask', 'quick', 'detach', 'dryRun']
                 .filter((key) => options[key])
                 .map((key) => `--${key === 'dryRun' ? 'dry-run' : key}`);
@@ -2635,6 +4046,8 @@ Fan-out:
 
             if (options.worker) {
                 await runWorkerFromCli(options);
+            } else if (options.unit) {
+                await runUnitFromCli(options);
             } else {
                 await runIntegrateFromCli(options);
             }

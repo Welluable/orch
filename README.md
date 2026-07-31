@@ -208,9 +208,15 @@ Usage: orch [options] [command] <task...>
   implementer loop; defaults to `5`, ignored with `--ask` and `--quick`.
 - `--fan-out` — decomposes the task into parallel workers coordinated by this
   process instead of running the single-worktree pipeline (see
-  [Fan-out](#fan-out)); rejects `--ask`/`--quick`/`--dry-run`.
+  [Fan-out](#fan-out)); rejects `--ask`/`--quick`/`--dry-run`/`--seq`.
+- `--seq` — decomposes into ordered units, merges each into `orch/<slug>`,
+  then adjusts the near-term backlog (see
+  [Sequential multi-unit (`--seq`)](#sequential-multi-unit---seq)); rejects
+  `--fan-out`/`--ask`/`--quick`/`--dry-run`.
 - `--max-workers <n>` — max number of parallel fan-out workers; defaults to
   `4`; only meaningful with `--fan-out`.
+- `--max-units <n>` — max number of sequential units; defaults to `8`; only
+  meaningful with `--seq`.
 - `--max-concurrency <n>` — optional hard ceiling on in-flight fan-out workers
   at once; omit to let the coordinator choose (typically the current layer's
   size); only meaningful with `--fan-out`.
@@ -419,6 +425,57 @@ Depth is capped at 1: every worker and the integration session run with
 `ORCH_FANOUT_DEPTH=1` set, and `--fan-out` is rejected outright when that
 variable is already present — a worker or integration session never fans out
 again.
+
+## Sequential multi-unit (`--seq`)
+
+Big features fail in one context window. orch splits them into units agents
+can finish. `--fan-out` runs independent units in parallel; `--seq` runs
+ordered units one-by-one, merging each into `orch/<slug>` before adjusting
+the next.
+
+| | `--fan-out` | `--seq` |
+|---|---|---|
+| Split reason | Parallel independence | Finishable unit size + order |
+| Boundaries | Yes | **No** |
+| Unit shape | Workers + `dependsOn` / `owns` / layers | **Flat ordered list** |
+| Schedule | Parallel (layers / concurrency) | **Strictly one unit at a time** |
+| Base SHA | One shared base for all workers | **Advances after each merge** |
+| Integrate | One session at the end | **Merge + verify after every unit** |
+| Replan | Frozen after decompose | **Hybrid adjust** after each merge |
+
+```bash
+orch "implement the billing module" --seq --agent claude
+orch "implement X" --seq --max-units 6
+```
+
+```text
+triage: complex — seq requested
+decomposer: 5 units
+[01-types …] done — merged into orch/wise-pine-e904
+adjust: rewrote 02-api against tip; dropped 05-legacy-path
+[02-api …] done — merged
+[03-ui …] failed at code-loop / test-runner (round 3)
+stopped: 2/5 merged; next: orch continue <unit-slug> "fix …"
+```
+
+The flow, in order:
+
+1. **Triage** runs once. If it routes to quick-fix, seq is skipped entirely —
+   triage never opts into `--seq` on its own.
+2. **`seq-decomposer`** (no boundaries agent) emits an ordered `units[]`
+   backlog, or declines → today's single-worktree pipeline with no `seq.json`.
+3. **Schedule** runs concurrency 1: spawn the first pending unit at the current
+   tip → wait → on failure stop the chain → on success merge into
+   `orch/<parent-slug>`, runner-first verify, advance tip, hybrid-adjust the
+   next 1–2 pending units (or drop obsolete ones), continue.
+4. **Continue / resume.** Fix a failed unit with `orch continue <unit-slug>`,
+   then `orch --seq-continue <parent>` (or `orch resume <parent>` when paused).
+   Do not `orch continue` the coordinator.
+
+`--max-units` (default `8`) caps both the initial backlog and adjust growth.
+Unit children set `ORCH_SEQ_DEPTH=1` and `ORCH_FANOUT_DEPTH=1` so they cannot
+nest `--seq` or `--fan-out`. Deliverable stays on `orch/<parent-slug>` until
+you merge it yourself.
 
 ## Project structure
 
