@@ -2463,7 +2463,7 @@ export async function runSeqPipeline(prompt, options = {}) {
                 return unit.state;
             }
 
-            const job = reconcileJobFn(invocationCwd, unitSlug);
+            const job = reconcileJobFn(invocationCwd, unitSlug, readJob(invocationCwd, unitSlug));
             if (job && TERMINAL_JOB_STATES.includes(job.state)) {
                 if (unit && unit.state !== 'done' && unit.state !== 'failed') {
                     const nextState = job.state === 'done' ? 'done' : 'failed';
@@ -2871,7 +2871,7 @@ export async function runSeqContinuePipeline(options = {}) {
             const current = readSeqFn(invocationCwd, parentSlug);
             const unit = current?.units?.find((u) => u.id === unitId);
             if (unit && (unit.state === 'done' || unit.state === 'failed')) return unit.state;
-            const job = reconcileJobFn(invocationCwd, unitSlug);
+            const job = reconcileJobFn(invocationCwd, unitSlug, readJob(invocationCwd, unitSlug));
             if (job && TERMINAL_JOB_STATES.includes(job.state)) {
                 return job.state === 'done' ? 'done' : 'failed';
             }

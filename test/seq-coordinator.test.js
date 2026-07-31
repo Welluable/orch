@@ -581,6 +581,82 @@ describe('runSeqPipeline — successful decompose bootstrap + strict concurrency
   });
 });
 
+describe('runSeqPipeline — waitForUnit reconcileJob arity', () => {
+  it('passes the job record into reconcileJob after unit spawn (avoids record.state crash)', async () => {
+    const cwd = makeTmpCwd('orch-seq-reconcile-arity-');
+    const jobSlug = 'wise-pine-e904';
+    const baseTip = 'basehead00001111222233334444555566667777';
+    fs.mkdirSync(path.join(cwd, '.orch', jobSlug), { recursive: true });
+    writeJob(cwd, jobSlug, {
+      slug: jobSlug,
+      prompt: 'implement the billing module',
+      agent: 'claude',
+      maxRounds: 5,
+      state: 'running',
+      role: 'coordinator',
+      pid: process.pid,
+      startedAt: new Date(0).toISOString(),
+    });
+
+    const AgentClass = createMockAgentClass({
+      triage: TRIAGE_COMPLEX,
+      'seq-decomposer': unitsReply(TWO_UNITS),
+      decomposer: unitsReply(TWO_UNITS),
+      adjust: adjustOk(),
+    });
+
+    const spawnFn = makeSettlingSpawn({
+      settleMs: 40,
+      cwd,
+      parentSlug: jobSlug,
+      outcomes: {
+        '01-types': { state: 'done', sha: 'sha-01' },
+        '02-api': { state: 'done', sha: 'sha-02' },
+      },
+    });
+
+    const reconcileCalls = [];
+    const exit = mock.fn();
+    const { execFile } = makeFakeExecFile([
+      { match: (args) => args.includes('rev-parse'), stdout: `${baseTip}\n` },
+    ]);
+
+    await runSeqPipeline('implement the billing module', {
+      cwd,
+      jobSlug,
+      jobCwd: cwd,
+      agent: 'claude',
+      maxUnits: 8,
+      AgentClass,
+      spawn: spawnFn,
+      allocateJob: async (opts) => realAllocateJob({ ...opts, cwd }),
+      reconcileJob: (c, slug, record) => {
+        // Real reconcileJob(cwd, slug, record) throws if record is missing
+        // (reads record.state). waitForUnit must pass readJob(...) as fan-out does.
+        if (record == null) throw new TypeError("Cannot read properties of undefined (reading 'state')");
+        reconcileCalls.push({ slug, state: record.state });
+        return record;
+      },
+      mergeOneUnit: async ({ unitId }) => {
+        const seq = readSeq(cwd, jobSlug);
+        writeSeq(cwd, jobSlug, { ...seq, tip: `tip-after-${unitId}` });
+      },
+      pollIntervalMs: 20,
+      execFile,
+      createWorktree: async ({ slug }) => ({
+        worktreePath: path.join(cwd, `wt-${slug}`),
+        branch: `orch/${slug}`,
+      }),
+      exit,
+      patchJob: (c, slug, patch) => patchJob(c, slug, patch),
+      checkpointPause: async () => {},
+    });
+
+    assert.ok(reconcileCalls.length > 0, 'waitForUnit must call reconcileJob while the unit is live');
+    assert.equal(exit.mock.calls[0]?.arguments[0], 0);
+  });
+});
+
 describe('runSeqPipeline — parent pauseRequested gates next-unit spawn', () => {
   it('does not spawn the next unit while parent is paused; waits on the live unit; resumes without re-decompose or duplicate spawn', { timeout: 8000 }, async () => {
     const cwd = makeTmpCwd('orch-seq-parent-pause-');
