@@ -240,11 +240,13 @@ Job-control subcommands (see [Headless runs](#headless-runs)):
   recently started run.
 - `orch pause <slug>` — requests a pause at the run's next stage-boundary
   checkpoint.
-- `orch resume <slug>` — unpauses a paused (or pausing) run.
+- `orch resume <slug>` — unpauses a paused/pausing run, or recovers a
+  failed/stopped/crashed complex job at its unfinished stage (thin recover +
+  reentry; see failure resume). Not the same as continue.
 - `orch continue <slug> "new task"` — starts a new complex pipeline on a
-  finished run's existing worktree/branch (same slug). Carries prior
-  stage/failure outcome into research/plan. For fan-out workers, continue the
-  worker slug, then `orch --integrate <parent>`. Not the same as `resume`.
+  **done** run's existing worktree/branch (same slug). Carries prior outcome
+  into research/plan. For crash recovery use `orch resume` instead. For fan-out
+  workers that finished, continue the worker slug, then `orch --integrate <parent>`.
 - `orch stop <slug>` — sends `SIGTERM` to a running job (or reconciles a dead
   one to `crashed`).
 - `orch logs <slug> [-f]` — prints a run's `orch.log`; `-f` follows it until
@@ -291,8 +293,8 @@ directory's `.orch/`:
 orch list                     # SLUG  ROLE  STATE  PHASE  AGENT  STARTED  DURATION  PID
 orch status swift-lagoon-49ea # full record: state, phase, branch, worktree, exit code, ...
 orch pause swift-lagoon-49ea  # request a pause at the next stage-boundary checkpoint
-orch resume swift-lagoon-49ea # unpause a paused/pausing run
-orch continue swift-lagoon-49ea "follow-up polish"  # new work on the same worktree
+orch resume swift-lagoon-49ea # unpause, or recover failed/stopped/crashed
+orch continue swift-lagoon-49ea "follow-up polish"  # new work on a done run
 orch logs swift-lagoon-49ea -f # follow orch.log until the run finishes
 orch stop swift-lagoon-49ea   # SIGTERM the run
 orch jobs clean                # delete every tracked run under .orch/ (asks to confirm)
