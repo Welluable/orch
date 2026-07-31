@@ -5,8 +5,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { runPipeline } from '../main.js';
+import { runPipeline, formatStatus } from '../main.js';
 import { jobPaths, readJob, writeJob, patchJob as realPatchJob } from '../lib/jobs.js';
+import * as agentLib from '../lib/agent.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const mainPath = path.join(__dirname, '..', 'main.js');
@@ -2620,9 +2621,10 @@ describe('runPipeline job-record patching for the plain/full pipeline (universal
  *   - `summary` is best-effort: on a successful `done`, the final
  *     code-loop verdict's summary (`codeAccepted.verdict.summary`, e.g.
  *     "suite green" for the `PASS_RUNNER` fixture used across this suite).
- *   - `error` is the caught `Error.message` on a thrown-stage `failed`
- *     (e.g. "test-runner failed; stopping before commit"); omitted/`null`
- *     on a clean `done`.
+ *   - `error` points at `failure.log` after a successful flush (unit
+ *     01-failure-log); the thrown `Error.message` is preserved in the
+ *     failure.log header instead of dumping stage verbose to the terminal.
+ *     Omitted/`null` on a clean `done`.
  */
 describe('runPipeline lastOutcome capture on terminal states', () => {
   it('writes lastOutcome.state:"done" with the final code-loop verdict summary on a clean success', async () => {
@@ -2708,7 +2710,289 @@ describe('runPipeline lastOutcome capture on terminal states', () => {
       assert.equal(record.lastOutcome.stage, 'test-runner');
       assert.equal(record.lastOutcome.task, 'do something complex');
       assert.equal(typeof record.lastOutcome.error, 'string');
-      assert.match(record.lastOutcome.error, /test-runner/);
+      assert.match(
+        record.lastOutcome.error,
+        /failure\.log/,
+        'failed lastOutcome.error should be a pointer to failure.log, not a verbose dump',
+      );
+      assert.equal(record.failureLogPath, jobPaths(tmpCwd, slug).failureLogPath);
+      assert.equal(fs.existsSync(record.failureLogPath), true);
+      const failureBody = fs.readFileSync(record.failureLogPath, 'utf8');
+      assert.match(failureBody, /=== orch failure ===/);
+      assert.match(failureBody, /test-runner/);
+      // Durable forensic header keeps the real reason; lastOutcome.error is only a pointer.
+      assert.match(
+        failureBody,
+        /error:\s*test-runner failed; stopping before commit/,
+        'failure.log header error: must retain err.message for recover',
+      );
+      assert.match(failureBody, /task:\s*do something complex/);
+      assert.match(failureBody, /finishedAt:\s*\d{4}-\d{2}-\d{2}T/);
+      assert.equal(record.lastOutcome.finishedAt, record.finishedAt);
+      assert.doesNotMatch(
+        record.lastOutcome.error,
+        /test-runner failed; stopping before commit/,
+        'lastOutcome.error must not duplicate the durable header reason',
+      );
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * Contract for unit 01-failure-log (.spec/resume.md § Failure log): a
+ * pipeline `failed` write without `-v` still flushes `.orch/<slug>/failure.log`
+ * (header + stage verbose buffer), sets `run.json.failureLogPath`, prints a
+ * one-line pointer (not stage verbose), and appends on a later failure.
+ */
+describe('runPipeline failure.log persistence without -v', () => {
+  function requireBufferApis() {
+    assert.equal(typeof agentLib.beginStageCapture, 'function', 'beginStageCapture must be exported');
+    assert.equal(typeof agentLib.appendVerbose, 'function', 'appendVerbose must be exported');
+    assert.equal(typeof agentLib.setJobSlug, 'function');
+    assert.equal(typeof agentLib.resetShutdownState, 'function');
+  }
+
+  it('writes failure.log with header + stage verbose and prints a pointer, not verbose, on failed', async () => {
+    requireBufferApis();
+    const tmpCwd = makeTmpCwd('orch-failure-log-failed-');
+    try {
+      const slug = 'failure-log-failed-0000';
+      seedForegroundJob(tmpCwd, slug, 'do something complex');
+      agentLib.resetShutdownState();
+      if (typeof agentLib.resetFailureLogState === 'function') {
+        agentLib.resetFailureLogState();
+      }
+      agentLib.setJobSlug(slug);
+
+      const runContext = fakeRunContext(tmpCwd);
+      const worktree = fakeWorktree(tmpCwd);
+
+      // Mock that seeds the stage buffer during the failing test-runner stage.
+      const BaseMock = createMockAgentClass(complexPassBehaviors({
+        'test-runner': { ok: false, result: 'test runner crashed' },
+      }));
+      class BufferingMock extends BaseMock {
+        async run(opts) {
+          if (agentRole(this.name) === 'test-runner') {
+            agentLib.beginStageCapture({
+              phase: 'code-loop',
+              stage: 'test-runner',
+              round: 1,
+            });
+            agentLib.appendVerbose('pipeline-stage-verbose-without-v\n');
+          }
+          return super.run(opts);
+        }
+      }
+
+      const patchCalls = [];
+      const patchJobMock = realDiskPatchJobSpy(patchCalls);
+      const logSpy = mock.method(console, 'log', () => {});
+      const errorLines = [];
+      const errorSpy = mock.method(console, 'error', (...args) => {
+        errorLines.push(args.map(String).join(' '));
+      });
+      const exitSpy = mock.method(process, 'exit', () => {});
+      try {
+        await runPipeline('do something complex', {
+          agent: 'claude',
+          AgentClass: BufferingMock,
+          createRunContext: mock.fn(() => runContext),
+          createWorktree: mock.fn(() => worktree),
+          commitWorktree: mock.fn(() => {
+            throw new Error('commitWorktree must not be called after a failed code loop');
+          }),
+          jobSlug: slug,
+          jobCwd: tmpCwd,
+          patchJob: patchJobMock,
+          verbose: false,
+        });
+      } finally {
+        logSpy.mock.restore();
+        errorSpy.mock.restore();
+        exitSpy.mock.restore();
+        agentLib.resetShutdownState();
+      }
+
+      const record = readJob(tmpCwd, slug);
+      assert.equal(record.state, 'failed');
+      const expectedPath = jobPaths(tmpCwd, slug).failureLogPath;
+      assert.equal(record.failureLogPath, expectedPath);
+      assert.equal(fs.existsSync(expectedPath), true);
+
+      const body = fs.readFileSync(expectedPath, 'utf8');
+      assert.match(body, /=== orch failure ===/);
+      assert.match(body, new RegExp(`slug:\\s*${slug}`));
+      assert.match(body, /state:\s*failed/);
+      assert.match(body, /phase:\s*code-loop/);
+      assert.match(body, /stage:\s*test-runner/);
+      assert.match(body, /exitCode:\s*1/);
+      assert.match(body, /finishedAt:\s*\d{4}-\d{2}-\d{2}T/);
+      assert.match(body, /task:\s*do something complex/);
+      // Locked shape: real err.message lives in the header; lastOutcome.error is the pointer.
+      assert.match(
+        body,
+        /error:\s*test-runner failed; stopping before commit/,
+        'failure.log header must keep err.message after lastOutcome.error became a pointer',
+      );
+      assert.match(body, /=== stage verbose/);
+      assert.match(body, /pipeline-stage-verbose-without-v/);
+      assert.match(body, /test-runner/);
+
+      assert.match(String(record.lastOutcome?.error ?? ''), /failure\.log/);
+      assert.doesNotMatch(
+        String(record.lastOutcome?.error ?? ''),
+        /test-runner failed; stopping before commit/,
+      );
+      const joinedErrors = errorLines.join('\n');
+      assert.match(joinedErrors, /failure\.log/);
+      assert.doesNotMatch(joinedErrors, /pipeline-stage-verbose-without-v/);
+
+      const statusText = formatStatus(tmpCwd, record);
+      assert.match(statusText, /failure\.log/);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('appends a second failure section when the same slug fails again', async () => {
+    requireBufferApis();
+    const tmpCwd = makeTmpCwd('orch-failure-log-append-');
+    try {
+      const slug = 'failure-log-append-0000';
+      seedForegroundJob(tmpCwd, slug, 'do something complex');
+      agentLib.resetShutdownState();
+      if (typeof agentLib.resetFailureLogState === 'function') {
+        agentLib.resetFailureLogState();
+      }
+      agentLib.setJobSlug(slug);
+
+      const runContext = fakeRunContext(tmpCwd);
+      const worktree = fakeWorktree(tmpCwd);
+      const BaseMock = createMockAgentClass(complexPassBehaviors({
+        'test-runner': { ok: false, result: 'test runner crashed' },
+      }));
+      let failGeneration = 0;
+      class BufferingMock extends BaseMock {
+        async run(opts) {
+          if (agentRole(this.name) === 'test-runner') {
+            failGeneration += 1;
+            agentLib.beginStageCapture({
+              phase: 'code-loop',
+              stage: 'test-runner',
+              round: 1,
+            });
+            agentLib.appendVerbose(`pipeline-fail-generation-${failGeneration}\n`);
+          }
+          return super.run(opts);
+        }
+      }
+
+      const runOnce = async () => {
+        const patchCalls = [];
+        const patchJobMock = realDiskPatchJobSpy(patchCalls);
+        const logSpy = mock.method(console, 'log', () => {});
+        const errorSpy = mock.method(console, 'error', () => {});
+        const exitSpy = mock.method(process, 'exit', () => {});
+        try {
+          await runPipeline('do something complex', {
+            agent: 'claude',
+            AgentClass: BufferingMock,
+            createRunContext: mock.fn(() => runContext),
+            createWorktree: mock.fn(() => worktree),
+            commitWorktree: mock.fn(() => {
+              throw new Error('commitWorktree must not be called after a failed code loop');
+            }),
+            jobSlug: slug,
+            jobCwd: tmpCwd,
+            patchJob: patchJobMock,
+            verbose: false,
+          });
+        } finally {
+          logSpy.mock.restore();
+          errorSpy.mock.restore();
+          exitSpy.mock.restore();
+        }
+      };
+
+      await runOnce();
+      const failurePath = jobPaths(tmpCwd, slug).failureLogPath;
+      assert.equal([...fs.readFileSync(failurePath, 'utf8').matchAll(/=== orch failure ===/g)].length, 1);
+
+      // Simulate resume reopen: clear terminal fields, keep failure.log on disk.
+      writeJob(tmpCwd, slug, {
+        ...readJob(tmpCwd, slug),
+        state: 'running',
+        finishedAt: null,
+        exitCode: null,
+        lastOutcome: null,
+        phase: null,
+        stage: null,
+        round: null,
+        pid: process.pid,
+      });
+      agentLib.resetShutdownState();
+      if (typeof agentLib.resetFailureLogState === 'function') {
+        agentLib.resetFailureLogState();
+      }
+      agentLib.setJobSlug(slug);
+
+      await runOnce();
+
+      const body = fs.readFileSync(failurePath, 'utf8');
+      assert.equal([...body.matchAll(/=== orch failure ===/g)].length, 2);
+      assert.match(body, /pipeline-fail-generation-1/);
+      assert.match(body, /pipeline-fail-generation-2/);
+    } finally {
+      agentLib.resetShutdownState();
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not write failure.log when jobSlug is absent', async () => {
+    const tmpCwd = makeTmpCwd('orch-failure-log-noslug-');
+    try {
+      const runContext = fakeRunContext(tmpCwd, 'noslug-run-0000');
+      // Ensure artifact dir exists the way a real createRunContext would, so
+      // the assertion below is specifically about failure.log — not .orch.
+      fs.mkdirSync(runContext.artifactDir, { recursive: true });
+      const worktree = fakeWorktree(tmpCwd, 'noslug-run-0000');
+      const MockAgentClass = createMockAgentClass(complexPassBehaviors({
+        'test-runner': { ok: false, result: 'test runner crashed' },
+      }));
+
+      const logSpy = mock.method(console, 'log', () => {});
+      const errorSpy = mock.method(console, 'error', () => {});
+      const exitSpy = mock.method(process, 'exit', () => {});
+      try {
+        await runPipeline('do something complex', {
+          agent: 'claude',
+          AgentClass: MockAgentClass,
+          createRunContext: mock.fn(() => runContext),
+          createWorktree: mock.fn(() => worktree),
+          commitWorktree: mock.fn(() => {
+            throw new Error('commitWorktree must not be called');
+          }),
+          // no jobSlug / jobCwd / patchJob
+        });
+      } finally {
+        logSpy.mock.restore();
+        errorSpy.mock.restore();
+        exitSpy.mock.restore();
+      }
+
+      assert.equal(
+        fs.existsSync(path.join(runContext.artifactDir, 'failure.log')),
+        false,
+        'no job slug → no failure.log',
+      );
+      assert.equal(
+        fs.existsSync(path.join(runContext.artifactDir, 'run.json')),
+        false,
+        'no job slug → no run.json touch for this feature',
+      );
     } finally {
       fs.rmSync(tmpCwd, { recursive: true, force: true });
     }

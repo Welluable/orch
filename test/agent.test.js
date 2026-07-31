@@ -1,17 +1,20 @@
 import { describe, it, mock, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, rmSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import os from 'node:os';
 import { AgentCursor } from '../lib/agent-cursor.js';
 import { AgentClaude } from '../lib/agent-claude.js';
 import { AgentAgn } from '../lib/agent-agn.js';
 import { AgentOpencode } from '../lib/agent-opencode.js';
 import { Agent, formatElapsed, maybePrintModelLine, modelPrintState } from '../lib/agent.js';
+import * as agentLib from '../lib/agent.js';
 import { FileTracker } from '../lib/file-tracker.js';
 import { formatToolStatus } from '../lib/tool-status.js';
 import { parseTriageJson } from '../lib/parse-triage-json.js';
 import { parseVerdict } from '../lib/parse-verdict.js';
+import { jobPaths, writeJob, readJob } from '../lib/jobs.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -1279,5 +1282,310 @@ describe('formatToolStatus', () => {
       formatToolStatus({ name: 'edit', args: { path: 'a.js' } }),
       /Editing a\.js/,
     );
+  });
+});
+
+/**
+ * Contract for unit 01-failure-log (.spec/resume.md): while a job slug is
+ * active, agent backends always append thinking/tool/output deltas to an
+ * in-process stage buffer — even when `verbose: false` (stderr stays quiet).
+ * `-v` only gates live `process.stderr.write`. Flush APIs live on
+ * lib/agent.js: beginStageCapture / appendVerbose / flushFailureLog.
+ */
+describe('stage verbose buffer (failure.log capture, independent of -v)', () => {
+  function requireBufferApis() {
+    assert.equal(typeof agentLib.beginStageCapture, 'function', 'beginStageCapture must be exported');
+    assert.equal(typeof agentLib.appendVerbose, 'function', 'appendVerbose must be exported');
+    assert.equal(typeof agentLib.flushFailureLog, 'function', 'flushFailureLog must be exported');
+    assert.equal(typeof agentLib.setJobSlug, 'function');
+    assert.equal(typeof agentLib.resetShutdownState, 'function');
+  }
+
+  beforeEach(() => {
+    agentLib.resetShutdownState();
+    if (typeof agentLib.resetFailureLogState === 'function') {
+      agentLib.resetFailureLogState();
+    }
+    delete process.env.ORCH_JOB_SLUG;
+  });
+
+  it('AgentAgn assistant/delta with verbose:false buffers text and leaves stderr empty when a job is active', () => {
+    requireBufferApis();
+    const tmpCwd = mkdtempSync(path.join(os.tmpdir(), 'orch-failbuf-agn-'));
+    try {
+      const slug = 'failbuf-agn-0000';
+      writeJob(tmpCwd, slug, {
+        slug,
+        task: 'buffer me',
+        agent: 'agn',
+        maxRounds: 5,
+        cwd: tmpCwd,
+        pauseRequested: false,
+        branch: null,
+        worktree: null,
+        startedAt: new Date().toISOString(),
+        finishedAt: null,
+        exitCode: null,
+        logPath: jobPaths(tmpCwd, slug).logPath,
+        pid: process.pid,
+        state: 'running',
+        phase: 'research',
+        stage: 'research',
+        round: null,
+      });
+      agentLib.setJobSlug(slug);
+      agentLib.beginStageCapture({ phase: 'research', stage: 'research', round: null });
+
+      const agent = new AgentAgn('research', 'instr', 'prompt');
+      agent.setStatus = () => {};
+      const writes = [];
+      const restore = mock.method(process.stderr, 'write', (chunk) => {
+        writes.push(String(chunk));
+        return true;
+      });
+
+      agent.handleStreamEvent(
+        { type: 'assistant', subtype: 'delta', text: 'partial agn thought' },
+        { verbose: false, finish: mock.fn() },
+      );
+      restore.mock.restore();
+
+      assert.deepEqual(writes, [], 'non-verbose must not dump deltas to stderr');
+
+      const finishedAt = new Date().toISOString();
+      agentLib.flushFailureLog({
+        cwd: tmpCwd,
+        slug,
+        state: 'failed',
+        exitCode: 1,
+        finishedAt,
+        task: 'buffer me',
+        error: 'boom',
+      });
+
+      const body = readFileSync(jobPaths(tmpCwd, slug).failureLogPath, 'utf8');
+      assert.match(body, /partial agn thought/);
+      assert.match(body, /=== orch failure ===/);
+      assert.match(body, new RegExp(`slug:\\s*${slug}`));
+      assert.match(body, /state:\s*failed/);
+      assert.match(body, /finishedAt:\s*\d{4}-\d{2}-\d{2}T/);
+      assert.match(body, /task:\s*buffer me/);
+      assert.match(
+        body,
+        /error:\s*boom/,
+        'flushFailureLog must write the real error into the durable header (not only stage verbose)',
+      );
+      assert.equal(readJob(tmpCwd, slug).failureLogPath, jobPaths(tmpCwd, slug).failureLogPath);
+    } finally {
+      agentLib.resetShutdownState();
+      rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('AgentCursor thinking/delta with verbose:false buffers text and leaves stderr empty when a job is active', () => {
+    requireBufferApis();
+    const tmpCwd = mkdtempSync(path.join(os.tmpdir(), 'orch-failbuf-cursor-'));
+    try {
+      const slug = 'failbuf-cursor-0000';
+      writeJob(tmpCwd, slug, {
+        slug,
+        task: 'buffer me',
+        agent: 'cursor',
+        maxRounds: 5,
+        cwd: tmpCwd,
+        pauseRequested: false,
+        branch: null,
+        worktree: null,
+        startedAt: new Date().toISOString(),
+        finishedAt: null,
+        exitCode: null,
+        logPath: jobPaths(tmpCwd, slug).logPath,
+        pid: process.pid,
+        state: 'running',
+        phase: 'code-loop',
+        stage: 'code-writer',
+        round: 1,
+      });
+      agentLib.setJobSlug(slug);
+      agentLib.beginStageCapture({ phase: 'code-loop', stage: 'code-writer', round: 1 });
+
+      const agent = new AgentCursor('code-writer', 'instr', 'prompt');
+      agent.setStatus = () => {};
+      const writes = [];
+      const restore = mock.method(process.stderr, 'write', (chunk) => {
+        writes.push(String(chunk));
+        return true;
+      });
+
+      agent.handleStreamEvent(
+        { type: 'thinking', subtype: 'delta', text: 'cursor thinking chunk' },
+        { verbose: false, finish: mock.fn() },
+      );
+      restore.mock.restore();
+
+      assert.deepEqual(writes, [], 'non-verbose must not dump deltas to stderr');
+
+      agentLib.flushFailureLog({
+        cwd: tmpCwd,
+        slug,
+        state: 'failed',
+        exitCode: 1,
+        finishedAt: new Date().toISOString(),
+        task: 'buffer me',
+        error: 'boom',
+      });
+
+      const body = readFileSync(jobPaths(tmpCwd, slug).failureLogPath, 'utf8');
+      assert.match(body, /cursor thinking chunk/);
+    } finally {
+      agentLib.resetShutdownState();
+      rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('AgentOpencode reasoning/text with verbose:false buffers text and leaves stderr empty when a job is active', () => {
+    requireBufferApis();
+    const tmpCwd = mkdtempSync(path.join(os.tmpdir(), 'orch-failbuf-oc-'));
+    try {
+      const slug = 'failbuf-opencode-0000';
+      writeJob(tmpCwd, slug, {
+        slug,
+        task: 'buffer me',
+        agent: 'opencode',
+        maxRounds: 5,
+        cwd: tmpCwd,
+        pauseRequested: false,
+        branch: null,
+        worktree: null,
+        startedAt: new Date().toISOString(),
+        finishedAt: null,
+        exitCode: null,
+        logPath: jobPaths(tmpCwd, slug).logPath,
+        pid: process.pid,
+        state: 'running',
+        phase: 'test-loop',
+        stage: 'test-writer',
+        round: 1,
+      });
+      agentLib.setJobSlug(slug);
+      agentLib.beginStageCapture({ phase: 'test-loop', stage: 'test-writer', round: 1 });
+
+      const agent = new AgentOpencode('test-writer', 'instr', 'prompt');
+      agent.setStatus = () => {};
+      const writes = [];
+      const restore = mock.method(process.stderr, 'write', (chunk) => {
+        writes.push(String(chunk));
+        return true;
+      });
+
+      const [reasoning] = loadFixture('opencode-reasoning.jsonl').filter((e) => e.type === 'reasoning');
+      agent.handleStreamEvent(reasoning, { verbose: false, finish: mock.fn() });
+      agent.handleStreamEvent(
+        { type: 'text', part: { type: 'text', text: 'opencode text body' } },
+        { verbose: false, finish: mock.fn() },
+      );
+      restore.mock.restore();
+
+      assert.deepEqual(writes, [], 'non-verbose must not dump deltas to stderr');
+
+      agentLib.flushFailureLog({
+        cwd: tmpCwd,
+        slug,
+        state: 'failed',
+        exitCode: 1,
+        finishedAt: new Date().toISOString(),
+        task: 'buffer me',
+        error: 'boom',
+      });
+
+      const body = readFileSync(jobPaths(tmpCwd, slug).failureLogPath, 'utf8');
+      assert.match(body, /Considering where main\.js lives/);
+      assert.match(body, /opencode text body/);
+    } finally {
+      agentLib.resetShutdownState();
+      rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('beginStageCapture rotates the prior stage into the ring (best-effort prior summaries on flush)', () => {
+    requireBufferApis();
+    const tmpCwd = mkdtempSync(path.join(os.tmpdir(), 'orch-failbuf-ring-'));
+    try {
+      const slug = 'failbuf-ring-0000';
+      writeJob(tmpCwd, slug, {
+        slug,
+        task: 'buffer me',
+        agent: 'claude',
+        maxRounds: 5,
+        cwd: tmpCwd,
+        pauseRequested: false,
+        branch: null,
+        worktree: null,
+        startedAt: new Date().toISOString(),
+        finishedAt: null,
+        exitCode: null,
+        logPath: jobPaths(tmpCwd, slug).logPath,
+        pid: process.pid,
+        state: 'running',
+        phase: 'test-loop',
+        stage: 'test-critic',
+        round: 1,
+      });
+      agentLib.setJobSlug(slug);
+
+      agentLib.beginStageCapture({ phase: 'test-loop', stage: 'test-writer', round: 1 });
+      agentLib.appendVerbose('prior-stage-writer-verbose\n');
+      agentLib.beginStageCapture({ phase: 'test-loop', stage: 'test-critic', round: 1 });
+      agentLib.appendVerbose('current-stage-critic-verbose\n');
+
+      agentLib.flushFailureLog({
+        cwd: tmpCwd,
+        slug,
+        state: 'failed',
+        exitCode: 1,
+        finishedAt: new Date().toISOString(),
+        task: 'buffer me',
+        error: 'critic rejected',
+      });
+
+      const body = readFileSync(jobPaths(tmpCwd, slug).failureLogPath, 'utf8');
+      assert.match(body, /current-stage-critic-verbose/);
+      assert.match(body, /=== prior stage summaries/);
+      assert.match(body, /prior-stage-writer-verbose/);
+      assert.match(
+        body,
+        /error:\s*critic rejected/,
+        'ring-buffer flush still locks the durable header error: field',
+      );
+      assert.match(body, /task:\s*buffer me/);
+      assert.match(body, /finishedAt:\s*\d{4}-\d{2}-\d{2}T/);
+    } finally {
+      agentLib.resetShutdownState();
+      rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('flushFailureLog is a no-op for failure.log / run.json when no job slug is active', () => {
+    requireBufferApis();
+    const tmpCwd = mkdtempSync(path.join(os.tmpdir(), 'orch-failbuf-noslug-'));
+    try {
+      delete process.env.ORCH_JOB_SLUG;
+      agentLib.resetShutdownState();
+      agentLib.appendVerbose('orphan-chunk\n');
+
+      agentLib.flushFailureLog({
+        cwd: tmpCwd,
+        slug: null,
+        state: 'failed',
+        exitCode: 1,
+        finishedAt: new Date().toISOString(),
+        task: 'nope',
+        error: 'nope',
+      });
+
+      assert.equal(existsSync(path.join(tmpCwd, '.orch')), false);
+    } finally {
+      rmSync(tmpCwd, { recursive: true, force: true });
+    }
   });
 });

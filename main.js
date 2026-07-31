@@ -19,7 +19,7 @@ import { createWorktree } from './lib/worktree.js';
 import { commitWorktree, collectWorktreeChanges, printFilesChanged } from './lib/commit.js';
 import { FileTracker } from './lib/file-tracker.js';
 import { allocateJob } from './lib/job-lifecycle.js';
-import { setJobSlug, exitCodeForSignal, formatElapsed } from './lib/agent.js';
+import { setJobSlug, exitCodeForSignal, formatElapsed, flushFailureLog, beginStageCapture } from './lib/agent.js';
 import {
     jobPaths,
     readJob,
@@ -323,8 +323,24 @@ function defaultExecFile(command, args, options = {}) {
 
 /** Patch a job to a terminal state and write a matching `lastOutcome` in the same write. */
 function patchTerminalJob(patchJobFn, jobCwd, jobSlug, { state, exitCode, summary = '', error = null, task }) {
-    if (!jobSlug) return;
+    if (!jobSlug) return null;
     const finishedAt = new Date().toISOString();
+    let outcomeError = error;
+    if (state === 'failed') {
+        const pointer = flushFailureLog({
+            cwd: jobCwd,
+            slug: jobSlug,
+            state,
+            exitCode,
+            finishedAt,
+            task,
+            error,
+        });
+        if (pointer) {
+            outcomeError = pointer;
+            console.error(`error:    ${pointer}`);
+        }
+    }
     patchJobFn(jobCwd, jobSlug, (current) => ({
         state,
         exitCode,
@@ -338,9 +354,23 @@ function patchTerminalJob(patchJobFn, jobCwd, jobSlug, { state, exitCode, summar
             finishedAt,
             task: task ?? current.task,
             summary,
-            error,
+            error: outcomeError,
         }),
     }));
+    return outcomeError;
+}
+
+/** Patch live cursor fields and start stage-verbose capture when a job is active. */
+function patchJobCursor(patchJobFn, jobCwd, jobSlug, fields) {
+    if (!jobSlug) return;
+    if ('phase' in fields || 'stage' in fields) {
+        beginStageCapture({
+            phase: fields.phase ?? null,
+            stage: fields.stage ?? null,
+            round: 'round' in fields ? fields.round : null,
+        });
+    }
+    return patchJobFn(jobCwd, jobSlug, fields);
 }
 
 /** The test-writer ⇄ test-critic loop shared by `runPipeline` and `runWorkerPipeline`. */
@@ -608,7 +638,7 @@ export async function runPipeline(prompt, options) {
 
     const jobPatch = (fields) => {
         if (!jobSlug) return;
-        patchJobFn(jobCwd, jobSlug, fields);
+        return patchJobCursor(patchJobFn, jobCwd, jobSlug, fields);
     };
     const jobCheckpoint = async () => {
         if (!jobSlug) return;
@@ -978,7 +1008,7 @@ export async function runContinuePipeline(prompt, options = {}) {
 
     const jobPatch = (fields) => {
         if (!jobSlug) return;
-        patchJobFn(jobCwd, jobSlug, fields);
+        return patchJobCursor(patchJobFn, jobCwd, jobSlug, fields);
     };
     const jobCheckpoint = async () => {
         if (!jobSlug) return;
@@ -1294,7 +1324,7 @@ export async function runWorkerPipeline(prompt, options = {}) {
 
     const jobPatch = (fields) => {
         if (!jobSlug) return;
-        patchJobFn(jobCwd, jobSlug, fields);
+        return patchJobCursor(patchJobFn, jobCwd, jobSlug, fields);
     };
     const jobCheckpoint = async () => {
         if (!jobSlug) return;
@@ -1488,7 +1518,7 @@ export async function runUnitPipeline(prompt, options = {}) {
 
     const jobPatch = (fields) => {
         if (!jobSlug) return;
-        patchJobFn(jobCwd, jobSlug, fields);
+        return patchJobCursor(patchJobFn, jobCwd, jobSlug, fields);
     };
     const jobCheckpoint = async () => {
         if (!jobSlug) return;
@@ -1690,7 +1720,7 @@ export async function mergeOneUnit(options = {}) {
 
     const jobPatch = (fields) => {
         if (!jobSlug) return;
-        patchJobFn(jobCwd, jobSlug, fields);
+        return patchJobCursor(patchJobFn, jobCwd, jobSlug, fields);
     };
     const jobCheckpoint = async () => {
         if (!jobSlug) return;
@@ -1884,7 +1914,7 @@ export async function runIntegratePipeline(options = {}) {
 
     const jobPatch = (fields) => {
         if (!jobSlug) return;
-        patchJobFn(jobCwd, jobSlug, fields);
+        return patchJobCursor(patchJobFn, jobCwd, jobSlug, fields);
     };
     const jobCheckpoint = async () => {
         if (!jobSlug) return;
@@ -2209,7 +2239,7 @@ export async function runSeqPipeline(prompt, options = {}) {
 
     const jobPatch = (fields) => {
         if (!jobSlug) return;
-        patchJobFn(jobCwd, jobSlug, fields);
+        return patchJobCursor(patchJobFn, jobCwd, jobSlug, fields);
     };
     const jobCheckpoint = async () => {
         if (!jobSlug) return;
@@ -2761,7 +2791,7 @@ export async function runSeqContinuePipeline(options = {}) {
 
     const jobPatch = (fields) => {
         if (!jobSlug) return;
-        patchJobFn(jobCwd, jobSlug, fields);
+        return patchJobCursor(patchJobFn, jobCwd, jobSlug, fields);
     };
     const jobCheckpoint = async () => {
         if (!jobSlug) return;
@@ -3007,7 +3037,7 @@ export async function runFanoutPipeline(prompt, options = {}) {
 
     const jobPatch = (fields) => {
         if (!jobSlug) return;
-        patchJobFn(jobCwd, jobSlug, fields);
+        return patchJobCursor(patchJobFn, jobCwd, jobSlug, fields);
     };
     const jobCheckpoint = async () => {
         if (!jobSlug) return;
