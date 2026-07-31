@@ -24,8 +24,10 @@ import { allocateJob } from '../lib/job-lifecycle.js';
  * Contract this file pins down for lib/jobs.js (net-new module, see
  * .orch/swift-lagoon-49ea/task.md section 2 and research.md):
  *
- * - jobPaths(cwd, slug) -> { dir, runJsonPath, lockPath, logPath }, all
- *   absolute and rooted under `<cwd>/.orch/<slug>/`.
+ * - jobPaths(cwd, slug) -> { dir, runJsonPath, lockPath, logPath,
+ *   failureLogPath }, all absolute and rooted under `<cwd>/.orch/<slug>/`.
+ *   `failureLogPath` is always the canonical path to `failure.log` (like
+ *   `logPath` for `orch.log`); the file itself is created only on flush.
  * - writeJob(cwd, slug, record) -> atomic write (temp file + rename) of
  *   run.json; creates the job dir if missing.
  * - readJob(cwd, slug) -> parsed record, or `null` if run.json does not
@@ -105,6 +107,7 @@ describe('jobPaths', () => {
     assert.equal(paths.runJsonPath, path.join(paths.dir, 'run.json'));
     assert.equal(paths.lockPath, path.join(paths.dir, '.run.lock'));
     assert.equal(paths.logPath, path.join(paths.dir, 'orch.log'));
+    assert.equal(paths.failureLogPath, path.join(paths.dir, 'failure.log'));
     for (const p of Object.values(paths)) {
       assert.ok(path.isAbsolute(p), `${p} should be absolute`);
     }
@@ -255,9 +258,9 @@ describe('reconcileJob', () => {
      * runIntegratePipeline/the coordinator driver themselves — `crashed` is
      * only ever detected here, out-of-band, by reconcileJob discovering a
      * dead pid on a live state). No caught error and no captured stage
-     * summary are available at detection time, so `error` stays null/omitted
-     * and `summary` falls back to `''` per the same best-effort rule as
-     * every other lastOutcome write.
+     * summary are available at detection time, so `summary` falls back to
+     * `''`. Unit 01-failure-log: after header-only failure.log flush,
+     * `error` is a one-line pointer matching `/failure\.log/`.
      */
     it(`rewrites a dead-pid ${state} job's lastOutcome to mirror the crashed rewrite`, async () => {
       const tmpCwd = makeTmpCwd();
@@ -276,12 +279,73 @@ describe('reconcileJob', () => {
       assert.equal(result.lastOutcome.stage, record.stage);
       assert.equal(result.lastOutcome.round, record.round);
       assert.equal(result.lastOutcome.summary, '');
-      assert.ok(result.lastOutcome.error == null, 'error should be omitted/null — no caught error at crash-detection time');
+      // After failure.log flush, error is a one-line pointer (not a fabricated
+      // crash reason). Header-only capture still sets failureLogPath; the
+      // durable crash reason (and task/finishedAt) live in the file header.
+      assert.match(
+        String(result.lastOutcome.error ?? ''),
+        /failure\.log/,
+        'crashed lastOutcome.error should point at failure.log',
+      );
 
       const onDisk = readJob(tmpCwd, record.slug);
       assert.deepEqual(onDisk.lastOutcome, result.lastOutcome);
+
+      const failureBody = fs.readFileSync(jobPaths(tmpCwd, record.slug).failureLogPath, 'utf8');
+      assert.match(failureBody, /=== orch failure ===/);
+      assert.match(failureBody, new RegExp(`task:\\s*${record.task}`));
+      assert.match(failureBody, /finishedAt:\s*\d{4}-\d{2}-\d{2}T/);
+      assert.equal(result.lastOutcome.finishedAt, result.finishedAt);
+      // Header keeps a durable error line; lastOutcome.error is only the pointer.
+      assert.match(failureBody, /^error:\s*\S+/m);
+      assert.doesNotMatch(failureBody, /error:\s*.*failure\.log/);
     });
   }
+
+  /**
+   * failure.log on reconcileJob's crashed rewrite (unit 01-failure-log /
+   * .spec/resume.md): out-of-process crash detection has no in-memory stage
+   * buffer, so the flush is header-only (empty/minimal stage body — do not
+   * invent fake verbose). Still creates failure.log and sets
+   * run.json.failureLogPath.
+   */
+  it('writes failure.log (header-only) and sets failureLogPath when rewriting a dead-pid job to crashed', async () => {
+    const tmpCwd = makeTmpCwd();
+    const pid = await deadPid();
+    const record = baseRecord({
+      slug: 'dead-failure-log-0000',
+      state: 'running',
+      pid,
+      phase: 'test-loop',
+      stage: 'test-writer',
+      round: 1,
+    });
+    writeJob(tmpCwd, record.slug, record);
+
+    const result = reconcileJob(tmpCwd, record.slug, record);
+
+    assert.equal(result.state, 'crashed');
+    const expectedPath = jobPaths(tmpCwd, record.slug).failureLogPath;
+    assert.equal(result.failureLogPath, expectedPath);
+    assert.equal(fs.existsSync(expectedPath), true);
+
+    const body = fs.readFileSync(expectedPath, 'utf8');
+    assert.match(body, /=== orch failure ===/);
+    assert.match(body, new RegExp(`slug:\\s*${record.slug}`));
+    assert.match(body, /state:\s*crashed/);
+    assert.match(body, /phase:\s*test-loop/);
+    assert.match(body, /stage:\s*test-writer/);
+    assert.match(body, /round:\s*1/);
+    assert.match(body, /finishedAt:\s*\d{4}-\d{2}-\d{2}T/);
+    assert.match(body, new RegExp(`task:\\s*${record.task}`));
+    // Locked header still has error: even when lastOutcome.error is only a pointer
+    // (out-of-process crash has no err.message — non-empty durable marker is fine).
+    assert.match(body, /^error:\s*\S+/m, 'crashed failure.log header must include a durable error: line');
+    assert.doesNotMatch(body, /error:\s*.*failure\.log/, 'header error: must not be the pointer');
+    assert.match(body, /=== stage verbose/);
+    // No invented verbose from a process that is already dead.
+    assert.doesNotMatch(body, /invented|fake verbose|placeholder stream/i);
+  });
 
   for (const state of ['done', 'failed', 'stopped', 'crashed']) {
     it(`leaves a terminal "${state}" job alone even with a dead pid`, async () => {
@@ -654,7 +718,9 @@ describe('cleanJobs', () => {
  *   `logPath: jobPaths(cwd, slug).logPath` — this is what lets `--ask`/
  *   `--quick` records (which have no worktree/branch/rounds concept) degrade
  *   gracefully: callers simply omit `maxRounds` (defaults to `null`) rather
- *   than the helper needing ask/quick-specific branches.
+ *   than the helper needing ask/quick-specific branches. `failureLogPath` is
+ *   intentionally **not** seeded here — it is set only once a `failure.log`
+ *   file exists (unit 01-failure-log).
  * - `state` defaults to `"starting"` (the detached-parent case, where a
  *   separate child process still has to start) but callers pass `"running"`
  *   for foreground/non-detached invocations (ask, quick, and the plain
@@ -702,6 +768,11 @@ describe('allocateJob (shared job-allocation helper, lib/job-lifecycle.js)', () 
     assert.equal(onDisk.finishedAt, null);
     assert.equal(onDisk.exitCode, null);
     assert.equal(onDisk.logPath, jobPaths(tmpCwd, slug).logPath);
+    assert.equal(
+      onDisk.failureLogPath,
+      undefined,
+      'failureLogPath stays unset on allocate until a failure.log file exists',
+    );
     assert.ok(onDisk.startedAt);
   });
 

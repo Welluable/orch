@@ -12,7 +12,8 @@ import {
   resetShutdownState,
   setJobSlug,
 } from '../lib/agent.js';
-import { readJob, writeJob } from '../lib/jobs.js';
+import * as agentLib from '../lib/agent.js';
+import { readJob, writeJob, jobPaths } from '../lib/jobs.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const agentSrc = readFileSync(path.join(__dirname, '../lib/agent.js'), 'utf8');
@@ -244,7 +245,27 @@ describe('shutdown persists job state when ORCH_JOB_SLUG is set', () => {
       assert.equal(updated.lastOutcome.stage, record.stage);
       assert.equal(updated.lastOutcome.round, record.round);
       assert.equal(updated.lastOutcome.summary, '');
-      assert.ok(updated.lastOutcome.error == null, 'error should be omitted/null — no caught error at shutdown time');
+      // Unit 01-failure-log: after flushing failure.log, error is a pointer
+      // (not null). The durable signal reason lives in the file header.
+      assert.match(
+        String(updated.lastOutcome.error ?? ''),
+        /failure\.log/,
+        'stopped lastOutcome.error should point at failure.log',
+      );
+      const failureBody = readFileSync(jobPaths(tmpCwd, record.slug).failureLogPath, 'utf8');
+      assert.match(
+        failureBody,
+        /error:\s*SIGINT/,
+        'failure.log header error: must retain the signal name (SIGINT) for recover',
+      );
+      assert.match(failureBody, new RegExp(`task:\\s*${record.task}`));
+      assert.match(failureBody, /finishedAt:\s*\d{4}-\d{2}-\d{2}T/);
+      assert.equal(updated.lastOutcome.finishedAt, updated.finishedAt);
+      assert.doesNotMatch(
+        String(updated.lastOutcome.error ?? ''),
+        /^SIGINT$/,
+        'lastOutcome.error must be the pointer, not the raw signal',
+      );
 
       await waitFor(() => !pidAlive(child.pid));
     } finally {
@@ -403,6 +424,236 @@ describe('shutdown persists job state when ORCH_JOB_SLUG is set', () => {
       });
 
       assert.equal(readJob(tmpCwd, record.slug).state, 'running');
+
+      await waitFor(() => !pidAlive(child.pid));
+    } finally {
+      rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * Contract for unit 01-failure-log (.spec/resume.md § Failure log): when a
+ * job is active, shutdown()'s stopped write must flush `.orch/<slug>/failure.log`
+ * (header + current stage verbose buffer), set `run.json.failureLogPath`, and
+ * surface a one-line pointer — independent of `-v`. A later flush on the same
+ * slug appends a new `=== orch failure ===` section (never silently overwrite).
+ *
+ * Buffer APIs are expected on lib/agent.js (or re-exported there):
+ * `beginStageCapture`, `appendVerbose`, and optionally `resetFailureLogState`
+ * (also cleared by `resetShutdownState`).
+ */
+describe('shutdown flushes failure.log when a job is active', () => {
+  function makeTmpCwd() {
+    return mkdtempSync(path.join(os.tmpdir(), 'orch-shutdown-failure-'));
+  }
+
+  function baseRecord(overrides = {}) {
+    const now = new Date().toISOString();
+    return {
+      slug: 'shutdown-failure-0000',
+      task: 'do something',
+      agent: 'claude',
+      maxRounds: 5,
+      cwd: '/tmp/wherever',
+      pauseRequested: false,
+      branch: null,
+      worktree: null,
+      startedAt: now,
+      finishedAt: null,
+      exitCode: null,
+      logPath: '/tmp/wherever/.orch/shutdown-failure-0000/orch.log',
+      pid: process.pid,
+      state: 'running',
+      phase: 'test-loop',
+      stage: 'test-writer',
+      round: 1,
+      ...overrides,
+    };
+  }
+
+  function requireBufferApis() {
+    assert.equal(typeof agentLib.beginStageCapture, 'function', 'beginStageCapture must be exported from lib/agent.js');
+    assert.equal(typeof agentLib.appendVerbose, 'function', 'appendVerbose must be exported from lib/agent.js');
+  }
+
+  let originalJobSlug;
+
+  beforeEach(() => {
+    resetShutdownState();
+    if (typeof agentLib.resetFailureLogState === 'function') {
+      agentLib.resetFailureLogState();
+    }
+    originalJobSlug = process.env.ORCH_JOB_SLUG;
+  });
+
+  afterEach(() => {
+    resetShutdownState();
+    if (typeof agentLib.resetFailureLogState === 'function') {
+      agentLib.resetFailureLogState();
+    }
+    if (originalJobSlug === undefined) delete process.env.ORCH_JOB_SLUG;
+    else process.env.ORCH_JOB_SLUG = originalJobSlug;
+  });
+
+  it('writes failure.log with header + stage verbose, sets failureLogPath, even without -v', async () => {
+    requireBufferApis();
+    const tmpCwd = makeTmpCwd();
+    try {
+      const record = baseRecord();
+      writeJob(tmpCwd, record.slug, record);
+      process.env.ORCH_JOB_SLUG = record.slug;
+
+      agentLib.beginStageCapture({
+        phase: record.phase,
+        stage: record.stage,
+        round: record.round,
+      });
+      agentLib.appendVerbose('thinking about the tests…\n');
+      agentLib.appendVerbose('tool: Write test/example.test.js\n');
+
+      const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+        detached: true,
+        stdio: 'ignore',
+      });
+      child.unref();
+      trackLiveChild(child);
+
+      await new Promise((resolve) => {
+        shutdown('SIGINT', {
+          exit: () => resolve(),
+          jobCwd: tmpCwd,
+        });
+      });
+
+      const expectedPath = jobPaths(tmpCwd, record.slug).failureLogPath;
+      assert.equal(existsSync(expectedPath), true);
+      const updated = readJob(tmpCwd, record.slug);
+      assert.equal(updated.state, 'stopped');
+      assert.equal(updated.failureLogPath, expectedPath);
+      assert.match(String(updated.lastOutcome?.error ?? ''), /failure\.log/);
+
+      const body = readFileSync(expectedPath, 'utf8');
+      assert.match(body, /=== orch failure ===/);
+      assert.match(body, new RegExp(`slug:\\s*${record.slug}`));
+      assert.match(body, /state:\s*stopped/);
+      assert.match(body, /phase:\s*test-loop/);
+      assert.match(body, /stage:\s*test-writer/);
+      assert.match(body, /round:\s*1/);
+      assert.match(body, /exitCode:\s*130/);
+      assert.match(body, /finishedAt:\s*\d{4}-\d{2}-\d{2}T/);
+      assert.match(body, new RegExp(`task:\\s*${record.task}`));
+      // Locked shape (.spec/resume.md): signal reason stays in the header after
+      // lastOutcome.error becomes a /failure\.log/ pointer.
+      assert.match(
+        body,
+        /error:\s*SIGINT/,
+        'failure.log header error: must retain SIGINT (not only the pointer in lastOutcome)',
+      );
+      assert.match(body, /=== stage verbose/);
+      assert.match(body, /thinking about the tests/);
+      assert.match(body, /tool: Write test\/example\.test\.js/);
+      assert.doesNotMatch(String(updated.lastOutcome?.error ?? ''), /^SIGINT$/);
+
+      await waitFor(() => !pidAlive(child.pid));
+    } finally {
+      rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('appends a second === orch failure === section on a later stopped flush (does not overwrite)', async () => {
+    requireBufferApis();
+    const tmpCwd = makeTmpCwd();
+    try {
+      const record = baseRecord({ slug: 'shutdown-failure-append-0000' });
+      writeJob(tmpCwd, record.slug, record);
+      process.env.ORCH_JOB_SLUG = record.slug;
+
+      agentLib.beginStageCapture({ phase: 'test-loop', stage: 'test-writer', round: 1 });
+      agentLib.appendVerbose('first-stop-verbose\n');
+
+      const child1 = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+        detached: true,
+        stdio: 'ignore',
+      });
+      child1.unref();
+      trackLiveChild(child1);
+
+      await new Promise((resolve) => {
+        shutdown('SIGINT', { exit: () => resolve(), jobCwd: tmpCwd });
+      });
+      await waitFor(() => !pidAlive(child1.pid));
+
+      const failurePath = jobPaths(tmpCwd, record.slug).failureLogPath;
+      const firstBody = readFileSync(failurePath, 'utf8');
+      assert.equal([...firstBody.matchAll(/=== orch failure ===/g)].length, 1);
+
+      // Re-open as running and flush again (simulates later failure after resume).
+      resetShutdownState();
+      if (typeof agentLib.resetFailureLogState === 'function') {
+        agentLib.resetFailureLogState();
+      }
+      writeJob(tmpCwd, record.slug, {
+        ...readJob(tmpCwd, record.slug),
+        state: 'running',
+        finishedAt: null,
+        exitCode: null,
+        lastOutcome: null,
+        phase: 'code-loop',
+        stage: 'code-writer',
+        round: 2,
+        pid: process.pid,
+      });
+      process.env.ORCH_JOB_SLUG = record.slug;
+      agentLib.beginStageCapture({ phase: 'code-loop', stage: 'code-writer', round: 2 });
+      agentLib.appendVerbose('second-stop-verbose\n');
+
+      const child2 = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+        detached: true,
+        stdio: 'ignore',
+      });
+      child2.unref();
+      trackLiveChild(child2);
+
+      await new Promise((resolve) => {
+        shutdown('SIGTERM', { exit: () => resolve(), jobCwd: tmpCwd });
+      });
+
+      const secondBody = readFileSync(failurePath, 'utf8');
+      assert.equal([...secondBody.matchAll(/=== orch failure ===/g)].length, 2);
+      assert.match(secondBody, /first-stop-verbose/);
+      assert.match(secondBody, /second-stop-verbose/);
+      assert.match(secondBody, /stage:\s*code-writer/);
+      // Each appended section keeps its own durable signal reason in the header.
+      assert.match(secondBody, /error:\s*SIGINT/);
+      assert.match(secondBody, /error:\s*SIGTERM/);
+
+      await waitFor(() => !pidAlive(child2.pid));
+    } finally {
+      rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not create failure.log when no job slug is active', async () => {
+    requireBufferApis();
+    const tmpCwd = makeTmpCwd();
+    try {
+      delete process.env.ORCH_JOB_SLUG;
+      agentLib.beginStageCapture({ phase: 'test-loop', stage: 'test-writer', round: 1 });
+      agentLib.appendVerbose('should-not-flush\n');
+
+      const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+        detached: true,
+        stdio: 'ignore',
+      });
+      child.unref();
+      trackLiveChild(child);
+
+      await new Promise((resolve) => {
+        shutdown('SIGTERM', { exit: () => resolve(), jobCwd: tmpCwd });
+      });
+
+      assert.equal(existsSync(path.join(tmpCwd, '.orch')), false);
 
       await waitFor(() => !pidAlive(child.pid));
     } finally {
