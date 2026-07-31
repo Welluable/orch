@@ -1,0 +1,3 @@
+{"type":"step_finish","timestamp":0,"sessionID":"ses_1","part":{"type":"step-finish","reason":"stop","tokens":{"input":5,"output":0},"cost":0}}
+{"type":"text","timestamp":0,"sessionID":"ses_1","part":{"type":"text","text":"Late answer after empty stop."}}
+{"type":"step_finish","timestamp":0,"sessionID":"ses_1","part":{"type":"step-finish","reason":"stop","tokens":{"input":12,"output":8},"cost":0.0012}}

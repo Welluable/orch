@@ -1,3 +1,5 @@
+import { summaryTrailerInstructions } from './summary-footer.js';
+
 function feedbackBlock(feedback) {
     if (!Array.isArray(feedback) || feedback.length === 0) return '';
     const violations = feedback.map((violation) => `- ${violation}`).join('\n');
@@ -46,11 +48,9 @@ export function decomposerAgentArgs({ prompt, cwd, boundariesOutput, maxWorkers,
                         "decomposable": false,
                         "why": "short reason"
                       }
-                    * After the JSON above, on a new line write the exact marker
-                      \`<<<SUMMARY>>>\`, followed by one paragraph in natural, human-readable
-                      language explaining what you did in this step and what happened — no
-                      lists, no headers, just prose. The JSON itself must stay exactly as
-                      specified above, before the summary marker.
+                    * Before the summary marker below, the JSON itself must stay exactly as
+                      specified above.
+                    ${summaryTrailerInstructions({ before: 'the JSON verdict only' })}
 
                     [Boundaries Agent Output]
                     ${boundariesOutput}

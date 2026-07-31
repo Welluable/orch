@@ -13,7 +13,7 @@ import { AgentAgn } from './lib/agent-agn.js';
 import { AgentOpencode } from './lib/agent-opencode.js';
 import { parseTriageJson } from './lib/parse-triage-json.js';
 import { parseVerdict } from './lib/parse-verdict.js';
-import { splitStageSummary, printStageSummary } from './lib/stage-summary.js';
+import { splitStageSummary, printStageSummary, resolveStageSummary } from './lib/stage-summary.js';
 import { createRunContext } from './lib/run-context.js';
 import { createWorktree } from './lib/worktree.js';
 import { commitWorktree, collectWorktreeChanges, printFilesChanged } from './lib/commit.js';
@@ -387,7 +387,7 @@ async function runTestLoop({
         const { content: testWriterContent, summary: testWriterSummary } = splitStageSummary(testOut.result);
         printStageSummary(
             roundLabel('test-writer', round, maxRounds),
-            testWriterSummary,
+            resolveStageSummary(roundLabel('test-writer', round, maxRounds), testWriterSummary, testWriterContent),
             testWriterTracker.getFiles(),
         );
         if (!testOut.ok) {
@@ -420,7 +420,10 @@ async function runTestLoop({
         const criticOut = await testCritic.run({ verbose });
         await jobCheckpoint();
         const { content: testCriticContent, summary: testCriticSummary } = splitStageSummary(criticOut.result);
-        printStageSummary(roundLabel('test-critic', round, maxRounds), testCriticSummary);
+        printStageSummary(
+            roundLabel('test-critic', round, maxRounds),
+            resolveStageSummary(roundLabel('test-critic', round, maxRounds), testCriticSummary, testCriticContent),
+        );
         if (!criticOut.ok) {
             appendLoopStatus(statusPath, 'Test loop', {
                 round: testRound,
@@ -512,7 +515,7 @@ async function runCodeLoop({
             codeWriterContent = content;
             printStageSummary(
                 roundLabel('code-writer', round, maxRounds),
-                summary,
+                resolveStageSummary(roundLabel('code-writer', round, maxRounds), summary, content),
                 codeWriterTracker.getFiles(),
             );
             if (!codeOut.ok) {
@@ -545,7 +548,10 @@ async function runCodeLoop({
         const runnerOut = await testRunner.run({ verbose });
         await jobCheckpoint();
         const { content: testRunnerContent, summary: testRunnerSummary } = splitStageSummary(runnerOut.result);
-        printStageSummary(roundLabel('test-runner', round, maxRounds), testRunnerSummary);
+        printStageSummary(
+            roundLabel('test-runner', round, maxRounds),
+            resolveStageSummary(roundLabel('test-runner', round, maxRounds), testRunnerSummary, testRunnerContent),
+        );
         if (!runnerOut.ok) {
             appendLoopStatus(statusPath, loopTitle, {
                 round: codeRound,
@@ -641,7 +647,7 @@ export async function runPipeline(prompt, options) {
                 return;
             }
             const { content, summary } = splitStageSummary(askResult.result);
-            printStageSummary('ask', summary);
+            printStageSummary('ask', resolveStageSummary('ask', summary, content));
             console.log(content);
             jobPatch({ state: 'done', exitCode: 0, finishedAt: new Date().toISOString() });
         } catch (err) {
@@ -671,8 +677,8 @@ export async function runPipeline(prompt, options) {
                 process.exit(1);
                 return;
             }
-            const { summary: quickFixSummary } = splitStageSummary(quickFixResult.result);
-            printStageSummary('quick-fix', quickFixSummary, quickFixTracker.getFiles());
+            const { content: quickFixContent, summary: quickFixSummary } = splitStageSummary(quickFixResult.result);
+            printStageSummary('quick-fix', resolveStageSummary('quick-fix', quickFixSummary, quickFixContent), quickFixTracker.getFiles());
             jobPatch({ state: 'done', exitCode: 0, finishedAt: new Date().toISOString() });
         } catch (err) {
             console.error(`Error: ${err.message}`);
@@ -696,7 +702,7 @@ export async function runPipeline(prompt, options) {
         const triageResult = await triageAgent.run({ verbose });
         await jobCheckpoint();
         const { content: triageContent, summary: triageSummary } = splitStageSummary(triageResult.result);
-        printStageSummary('triage', triageSummary);
+        printStageSummary('triage', resolveStageSummary('triage', triageSummary, triageContent));
         const parsed = parseTriageJson(triageContent);
 
         if (parsed?.simple === true) {
@@ -716,8 +722,8 @@ export async function runPipeline(prompt, options) {
 
             const quickFixResult = await quickFixAgent.run({ verbose });
             await jobCheckpoint();
-            const { summary: quickFixSummary } = splitStageSummary(quickFixResult.result);
-            printStageSummary('quick-fix', quickFixSummary, quickFixTracker.getFiles());
+            const { content: quickFixContent, summary: quickFixSummary } = splitStageSummary(quickFixResult.result);
+            printStageSummary('quick-fix', resolveStageSummary('quick-fix', quickFixSummary, quickFixContent), quickFixTracker.getFiles());
             jobPatch({ state: 'done', exitCode: 0, finishedAt: new Date().toISOString() });
             return;
         }
@@ -743,7 +749,7 @@ export async function runPipeline(prompt, options) {
         const result = await researchAgent.run({ verbose });
         await jobCheckpoint();
         const { content: researchContent, summary: researchSummary } = splitStageSummary(result.result);
-        printStageSummary('research', researchSummary);
+        printStageSummary('research', resolveStageSummary('research', researchSummary, researchContent));
 
         jobPatch({ phase: 'plan', stage: 'planner', round: null });
         const planner = plannerAgentArgs({
@@ -762,8 +768,8 @@ export async function runPipeline(prompt, options) {
 
         const plannerResult = await plannerAgent.run({ verbose });
         await jobCheckpoint();
-        const { summary: plannerSummary } = splitStageSummary(plannerResult.result);
-        printStageSummary('planner', plannerSummary);
+        const { content: plannerContent, summary: plannerSummary } = splitStageSummary(plannerResult.result);
+        printStageSummary('planner', resolveStageSummary('planner', plannerSummary, plannerContent));
 
         jobPatch({ phase: 'worktree', stage: 'worktree', round: null });
         const worktree = createWorktreeFn({ cwd: invocationCwd, slug: runContext.slug });
@@ -1030,7 +1036,7 @@ export async function runContinuePipeline(prompt, options = {}) {
         const researchResult = await researchAgent.run({ verbose });
         await jobCheckpoint();
         const { content: researchContent, summary: researchSummary } = splitStageSummary(researchResult.result);
-        printStageSummary('research', researchSummary);
+        printStageSummary('research', resolveStageSummary('research', researchSummary, researchContent));
 
         jobPatch({ phase: 'plan', stage: 'planner', round: null });
         const planner = plannerAgentArgs({
@@ -1048,8 +1054,8 @@ export async function runContinuePipeline(prompt, options = {}) {
         );
         const plannerResult = await plannerAgent.run({ verbose });
         await jobCheckpoint();
-        const { summary: plannerSummary } = splitStageSummary(plannerResult.result);
-        printStageSummary('planner', plannerSummary);
+        const { content: plannerContent, summary: plannerSummary } = splitStageSummary(plannerResult.result);
+        printStageSummary('planner', resolveStageSummary('planner', plannerSummary, plannerContent));
 
         const testAccepted = await runTestLoop({
             prompt,
@@ -1313,7 +1319,7 @@ export async function runWorkerPipeline(prompt, options = {}) {
         const researchResult = await researchAgent.run({ verbose });
         await jobCheckpoint();
         const { content: researchContent, summary: researchSummary } = splitStageSummary(researchResult.result);
-        printStageSummary('research', researchSummary);
+        printStageSummary('research', resolveStageSummary('research', researchSummary, researchContent));
 
         jobPatch({ phase: 'plan', stage: 'planner', round: null });
         const planner = plannerAgentArgs({
@@ -1331,8 +1337,8 @@ export async function runWorkerPipeline(prompt, options = {}) {
         );
         const plannerResult = await plannerAgent.run({ verbose });
         await jobCheckpoint();
-        const { summary: plannerSummary } = splitStageSummary(plannerResult.result);
-        printStageSummary('planner', plannerSummary);
+        const { content: plannerContent, summary: plannerSummary } = splitStageSummary(plannerResult.result);
+        printStageSummary('planner', resolveStageSummary('planner', plannerSummary, plannerContent));
 
         jobPatch({ phase: 'worktree', stage: 'worktree', round: null });
         const worktree = createWorktreeFn({ cwd, slug: runContext.slug, base });
@@ -1508,7 +1514,7 @@ export async function runUnitPipeline(prompt, options = {}) {
         if (!researchResult.ok) throw researchResult.error ?? new Error('research failed');
         await jobCheckpoint();
         const { content: researchContent, summary: researchSummary } = splitStageSummary(researchResult.result);
-        printStageSummary('research', researchSummary);
+        printStageSummary('research', resolveStageSummary('research', researchSummary, researchContent));
 
         jobPatch({ phase: 'plan', stage: 'planner', round: null });
         const planner = plannerAgentArgs({
@@ -1526,8 +1532,8 @@ export async function runUnitPipeline(prompt, options = {}) {
         );
         const plannerResult = await plannerAgent.run({ verbose });
         await jobCheckpoint();
-        const { summary: plannerSummary } = splitStageSummary(plannerResult.result);
-        printStageSummary('planner', plannerSummary);
+        const { content: plannerContent, summary: plannerSummary } = splitStageSummary(plannerResult.result);
+        printStageSummary('planner', resolveStageSummary('planner', plannerSummary, plannerContent));
 
         jobPatch({ phase: 'worktree', stage: 'worktree', round: null });
         const worktree = await createWorktreeFn({ cwd, slug: runContext.slug, base });
@@ -1994,8 +2000,8 @@ export async function runIntegratePipeline(options = {}) {
                 try {
                     const integratorOut = await integratorAgent.run({ verbose });
                     await jobCheckpoint();
-                    const { summary: integratorSummary } = splitStageSummary(integratorOut.result);
-                    printStageSummary('integrator', integratorSummary);
+                    const { content: integratorContent, summary: integratorSummary } = splitStageSummary(integratorOut.result);
+                    printStageSummary('integrator', resolveStageSummary('integrator', integratorSummary, integratorContent));
                     integratorOk = Boolean(integratorOut.ok);
                 } catch (err) {
                     logIntegration(`- Integrator agent errored: ${err.message}`);
@@ -2265,7 +2271,7 @@ export async function runSeqPipeline(prompt, options = {}) {
         const researchResult = await researchAgent.run({ verbose });
         await jobCheckpoint();
         const { content: researchContent, summary: researchSummary } = splitStageSummary(researchResult.result);
-        printStageSummary('research', researchSummary);
+        printStageSummary('research', resolveStageSummary('research', researchSummary, researchContent));
 
         jobPatch({ phase: 'plan', stage: 'planner', round: null });
         const planner = plannerAgentArgs({
@@ -2274,8 +2280,8 @@ export async function runSeqPipeline(prompt, options = {}) {
         const plannerAgent = new AgentClass(planner.name, planner.instructions, planner.prompt, planner.options);
         const plannerResult = await plannerAgent.run({ verbose });
         await jobCheckpoint();
-        const { summary: plannerSummary } = splitStageSummary(plannerResult.result);
-        printStageSummary('planner', plannerSummary);
+        const { content: plannerContent, summary: plannerSummary } = splitStageSummary(plannerResult.result);
+        printStageSummary('planner', resolveStageSummary('planner', plannerSummary, plannerContent));
 
         jobPatch({ phase: 'worktree', stage: 'worktree', round: null });
         const worktree = await createWorktreeFn({ cwd: invocationCwd, slug: runContext.slug });
@@ -2362,7 +2368,7 @@ export async function runSeqPipeline(prompt, options = {}) {
             const adjustResult = await adjustAgent.run({ verbose });
             await jobCheckpoint();
             const { content: adjustContent, summary: adjustSummary } = splitStageSummary(adjustResult.result);
-            printStageSummary('adjust', adjustSummary);
+            printStageSummary('adjust', resolveStageSummary('adjust', adjustSummary, adjustContent));
 
             const parsed = parseDecomposition(adjustContent);
             if (!parsed) {
@@ -2485,7 +2491,7 @@ export async function runSeqPipeline(prompt, options = {}) {
         const triageResult = await triageAgent.run({ verbose });
         await jobCheckpoint();
         const { content: triageContent, summary: triageSummary } = splitStageSummary(triageResult.result);
-        printStageSummary('triage', triageSummary);
+        printStageSummary('triage', resolveStageSummary('triage', triageSummary, triageContent));
         const parsed = parseTriageJson(triageContent);
 
         if (parsed?.simple === true) {
@@ -2501,8 +2507,8 @@ export async function runSeqPipeline(prompt, options = {}) {
             );
             const quickFixResult = await quickFixAgent.run({ verbose });
             await jobCheckpoint();
-            const { summary: quickFixSummary } = splitStageSummary(quickFixResult.result);
-            printStageSummary('quick-fix', quickFixSummary, quickFixTracker.getFiles());
+            const { content: quickFixContent, summary: quickFixSummary } = splitStageSummary(quickFixResult.result);
+            printStageSummary('quick-fix', resolveStageSummary('quick-fix', quickFixSummary, quickFixContent), quickFixTracker.getFiles());
             jobPatch({ state: 'done', exitCode: 0, finishedAt: new Date().toISOString() });
             exitFn(0);
             return;
@@ -2521,7 +2527,7 @@ export async function runSeqPipeline(prompt, options = {}) {
             const decomposerResult = await decomposerAgent.run({ verbose });
             await jobCheckpoint();
             const { content: decomposerContent, summary: decomposerSummary } = splitStageSummary(decomposerResult.result);
-            printStageSummary('seq-decomposer', decomposerSummary);
+            printStageSummary('seq-decomposer', resolveStageSummary('seq-decomposer', decomposerSummary, decomposerContent));
 
             const parsedDecomposition = parseDecomposition(decomposerContent);
             if (!parsedDecomposition) {
@@ -3061,7 +3067,7 @@ export async function runFanoutPipeline(prompt, options = {}) {
         const triageResult = await triageAgent.run({ verbose });
         await jobCheckpoint();
         const { content: triageContent, summary: triageSummary } = splitStageSummary(triageResult.result);
-        printStageSummary('triage', triageSummary);
+        printStageSummary('triage', resolveStageSummary('triage', triageSummary, triageContent));
         const parsed = parseTriageJson(triageContent);
 
         if (parsed?.simple === true) {
@@ -3077,8 +3083,8 @@ export async function runFanoutPipeline(prompt, options = {}) {
             );
             const quickFixResult = await quickFixAgent.run({ verbose });
             await jobCheckpoint();
-            const { summary: quickFixSummary } = splitStageSummary(quickFixResult.result);
-            printStageSummary('quick-fix', quickFixSummary, quickFixTracker.getFiles());
+            const { content: quickFixContent, summary: quickFixSummary } = splitStageSummary(quickFixResult.result);
+            printStageSummary('quick-fix', resolveStageSummary('quick-fix', quickFixSummary, quickFixContent), quickFixTracker.getFiles());
             jobPatch({ state: 'done', exitCode: 0, finishedAt: new Date().toISOString() });
             exitFn(0);
             return;
@@ -3094,7 +3100,7 @@ export async function runFanoutPipeline(prompt, options = {}) {
         const boundariesResult = await boundariesAgent.run({ verbose });
         await jobCheckpoint();
         const { content: boundariesOutput, summary: boundariesSummary } = splitStageSummary(boundariesResult.result);
-        printStageSummary('boundaries', boundariesSummary);
+        printStageSummary('boundaries', resolveStageSummary('boundaries', boundariesSummary, boundariesOutput));
         console.log(`boundaries: ${boundariesSummary || 'done'}`);
 
         // --- decomposer: up to two repair round-trips on validation failure ---
@@ -3109,7 +3115,7 @@ export async function runFanoutPipeline(prompt, options = {}) {
             const decomposerResult = await decomposerAgent.run({ verbose });
             await jobCheckpoint();
             const { content: decomposerContent, summary: decomposerSummary } = splitStageSummary(decomposerResult.result);
-            printStageSummary('decomposer', decomposerSummary);
+            printStageSummary('decomposer', resolveStageSummary('decomposer', decomposerSummary, decomposerContent));
 
             const parsedDecomposition = parseDecomposition(decomposerContent);
             if (!parsedDecomposition) {
@@ -3145,7 +3151,7 @@ export async function runFanoutPipeline(prompt, options = {}) {
             const researchResult = await researchAgent.run({ verbose });
             await jobCheckpoint();
             const { content: researchContent, summary: researchSummary } = splitStageSummary(researchResult.result);
-            printStageSummary('research', researchSummary);
+            printStageSummary('research', resolveStageSummary('research', researchSummary, researchContent));
 
             jobPatch({ phase: 'plan', stage: 'planner', round: null });
             const planner = plannerAgentArgs({
@@ -3154,8 +3160,8 @@ export async function runFanoutPipeline(prompt, options = {}) {
             const plannerAgent = new AgentClass(planner.name, planner.instructions, planner.prompt, planner.options);
             const plannerResult = await plannerAgent.run({ verbose });
             await jobCheckpoint();
-            const { summary: plannerSummary } = splitStageSummary(plannerResult.result);
-            printStageSummary('planner', plannerSummary);
+            const { content: plannerContent, summary: plannerSummary } = splitStageSummary(plannerResult.result);
+            printStageSummary('planner', resolveStageSummary('planner', plannerSummary, plannerContent));
 
             jobPatch({ phase: 'worktree', stage: 'worktree', round: null });
             const worktree = createWorktreeFn({ cwd: invocationCwd, slug: runContext.slug });

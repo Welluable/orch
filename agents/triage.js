@@ -1,3 +1,5 @@
+import { summaryTrailerInstructions } from './summary-footer.js';
+
 export function triageAgentArgs({ prompt, cwd }) {
     return {
         name: 'triage',
@@ -18,12 +20,9 @@ export function triageAgentArgs({ prompt, cwd }) {
                 Set "simple": true only when a quick fix in the current working tree is enough.
                 Set "simple": false when research, planning, or a worktree is needed.
 
-                After the JSON above, on a new line write the summary marker (three
-                '<' characters, then SUMMARY, then three '>' characters, with no
-                spaces), followed by one paragraph in natural, human-readable language
-                explaining what you did in this step and what happened — no lists, no
-                headers, just prose. The JSON itself must stay exactly as specified
-                above, before the summary marker.
+                Before the summary marker below, the JSON itself must stay exactly as
+                specified above.
+                ${summaryTrailerInstructions({ before: 'the JSON verdict only' })}
             `,
         prompt,
         options: { cwd },

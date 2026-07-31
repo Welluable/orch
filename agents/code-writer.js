@@ -1,3 +1,5 @@
+import { summaryTrailerInstructions } from './summary-footer.js';
+
 export function codeWriterAgentArgs({
     prompt,
     cwd,
@@ -42,11 +44,7 @@ export function codeWriterAgentArgs({
                     * Do not run \`git add\`, \`git commit\`, or any other git branch/commit
                       command. Leave changes unstaged — orch commits after the pipeline finishes.
                     * Once implementation is done, the task is complete.
-                    * After your final message above, on a new line write the summary
-                      marker (three '<' characters, then SUMMARY, then three '>'
-                      characters, with no spaces), followed by one paragraph in natural,
-                      human-readable language explaining what you did in this step and
-                      what happened — no lists, no headers, just prose.
+                    ${summaryTrailerInstructions({ before: 'your final message' })}
                     * If you changed any files, after that paragraph add a line reading
                       exactly "Files:" followed by one line per changed file formatted
                       as "<path>: <one-line description>" (e.g. "lib/agent.js: wired the

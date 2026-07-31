@@ -1,3 +1,5 @@
+import { summaryTrailerInstructions } from './summary-footer.js';
+
 export function boundariesAgentArgs({ prompt, cwd, boundariesPath }) {
     return {
         name: 'boundaries',
@@ -15,10 +17,7 @@ export function boundariesAgentArgs({ prompt, cwd, boundariesPath }) {
                       ${boundariesPath}
                     * Before the summary marker below, your message must contain only the
                       exact path: ${boundariesPath}
-                    * After the path above, on a new line write the exact marker
-                      \`<<<SUMMARY>>>\`, followed by one paragraph in natural, human-readable
-                      language explaining what you did in this step and what happened — no
-                      lists, no headers, just prose.
+                    ${summaryTrailerInstructions({ before: `the exact path: ${boundariesPath}` })}
                 `,
         prompt,
         options: { cwd },

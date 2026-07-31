@@ -1,3 +1,5 @@
+import { summaryTrailerInstructions } from './summary-footer.js';
+
 /** Conflict-repair-only agent for the `--integrate` driver: resolves merge conflict
  * markers in the given files using the merge output and involved workers' subtask/area
  * as context. Never touches git itself — orch owns the merge commit. */
@@ -26,10 +28,7 @@ export function integratorAgentArgs({ prompt, cwd, conflictedFiles, mergeOutput,
                       command. orch completes the merge commit itself; you only edit files.
                     * Do not report a pass/fail judgment of any kind; orch checks whether
                       the conflict markers are gone itself.
-                    * After you finish editing, on a new line write the exact marker
-                      \`<<<SUMMARY>>>\`, followed by one paragraph in natural,
-                      human-readable language explaining what you did in this step and
-                      what happened — no lists, no headers, just prose.
+                    ${summaryTrailerInstructions({ before: 'your conflict-resolution work' })}
 
                     [Merge Output]
                     ${mergeOutput}

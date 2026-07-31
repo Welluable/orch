@@ -1,6 +1,7 @@
 import { describe, it, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { splitStageSummary, printStageSummary } from '../lib/stage-summary.js';
+import * as stageSummaryMod from '../lib/stage-summary.js';
 
 describe('splitStageSummary', () => {
   it('splits content and summary on the delimiter', () => {
@@ -249,5 +250,54 @@ describe('printStageSummary', () => {
       restore.mock.restore();
     }
     assert.deepEqual(logs, []);
+  });
+});
+
+describe('resolveStageSummary (fallback safety net)', () => {
+  it('exports resolveStageSummary(label, summary, content)', () => {
+    assert.equal(typeof stageSummaryMod.resolveStageSummary, 'function');
+  });
+
+  it('returns the agent summary unchanged when the delimiter produced a non-empty summary', () => {
+    const { resolveStageSummary } = stageSummaryMod;
+    assert.equal(
+      resolveStageSummary('ask', 'Agent wrote this trailer.', 'First sentence of content. More.'),
+      'Agent wrote this trailer.',
+    );
+  });
+
+  it('falls back to the first sentence of content (~160 chars) when summary is empty', () => {
+    const { resolveStageSummary } = stageSummaryMod;
+    const content =
+      'The entrypoint is main.js in the project root. Extra sentences stay out of the box.';
+    const resolved = resolveStageSummary('ask', '', content);
+    assert.match(resolved, /^The entrypoint is main\.js/);
+    assert.doesNotMatch(resolved, /Extra sentences/);
+    assert.ok(resolved.length <= 160);
+  });
+
+  it('returns empty when content is empty so printStageSummary stays silent', () => {
+    const { resolveStageSummary } = stageSummaryMod;
+    assert.equal(resolveStageSummary('ask', '', ''), '');
+    assert.equal(resolveStageSummary('ask', '', '   '), '');
+  });
+
+  it('falls back to "<label> completed" when content is non-empty but yields no first sentence', () => {
+    const { resolveStageSummary } = stageSummaryMod;
+    // Last-resort else branch from the parity spec. A non-empty string that the
+    // shared sentence-split heuristic cannot turn into a bullet should become
+    // "<label> completed"; if the impl treats the whole string as one sentence,
+    // that string is also an acceptable fallback (never invent a delimiter).
+    const resolved = resolveStageSummary('ask', '', '…');
+    assert.ok(resolved === 'ask completed' || resolved === '…');
+    assert.doesNotMatch(resolved, /<<<SUMMARY>>>/);
+  });
+
+  it('truncates a long first sentence to about 160 chars', () => {
+    const { resolveStageSummary } = stageSummaryMod;
+    const long = `${'word '.repeat(50)}.`;
+    const resolved = resolveStageSummary('ask', '', long);
+    assert.ok(resolved.length <= 160);
+    assert.ok(resolved.length >= 140);
   });
 });

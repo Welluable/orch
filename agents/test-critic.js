@@ -1,3 +1,5 @@
+import { summaryTrailerInstructions } from './summary-footer.js';
+
 export function testCriticAgentArgs({
     prompt,
     cwd,
@@ -23,12 +25,9 @@ export function testCriticAgentArgs({
                     * Your final message MUST include a JSON verdict:
                       {"passed": true|false, "summary": "short reason", "failures": ["optional"]}
                     * Set passed: true only when verification is adequate to freeze for implementation.
-                    * After the JSON above, on a new line write the summary marker (three
-                      '<' characters, then SUMMARY, then three '>' characters, with no
-                      spaces), followed by one paragraph in natural, human-readable language
-                      explaining what you did in this step and what happened — no lists, no
-                      headers, just prose. The JSON itself must stay exactly as specified
-                      above, before the summary marker.
+                    * Before the summary marker below, the JSON itself must stay exactly as
+                      specified above.
+                    ${summaryTrailerInstructions({ before: 'the JSON verdict only' })}
 
                     [Test Writer Output]
                     ${testWriterOutput}

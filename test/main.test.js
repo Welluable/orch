@@ -1927,7 +1927,7 @@ describe('runPipeline per-stage summary output (<<<SUMMARY>>> paragraphs)', () =
     assert.match(joined, stageSummaryBlockRegex('ask', ASK_SUMMARY));
   });
 
-  it('--ask with a canned result that omits the delimiter prints no summary block (backward compat)', async () => {
+  it('--ask with a canned result that omits the delimiter still prints a fallback ask summary box', async () => {
     const answer = 'The entrypoint is main.js.';
     const MockAgentClass = createMockAgentClass({
       ask: { ok: true, result: answer },
@@ -1951,14 +1951,13 @@ describe('runPipeline per-stage summary output (<<<SUMMARY>>> paragraphs)', () =
       exitSpy.mock.restore();
     }
 
+    const joined = logs.join('\n');
     assert.ok(
       logs.some((line) => line.trim() === answer),
-      `expected the (unchanged) answer among logs; got: ${JSON.stringify(logs)}`,
+      `expected the (unchanged) full answer among logs; got: ${JSON.stringify(logs)}`,
     );
-    assert.ok(
-      !logs.some((line) => line.includes('•')),
-      `expected no summary block when the delimiter is absent; got: ${JSON.stringify(logs)}`,
-    );
+    assert.doesNotMatch(joined, /<<<SUMMARY>>>/);
+    assert.match(joined, stageSummaryBlockRegex('ask', answer));
   });
 
   it('quick-fix path prints [triage] and [quick-fix] summary blocks and still routes off the stripped JSON', async () => {
@@ -2063,23 +2062,35 @@ describe('runPipeline per-stage summary output (<<<SUMMARY>>> paragraphs)', () =
     const byRole = Object.fromEntries(MockAgentClass.instances.map((i) => [agentRole(i.name), i]));
 
     // Planner must receive the exact research path, never the raw delimiter or
-    // the research stage's summary paragraph.
+    // the research stage's summary paragraph (footer marker in instructions is fine).
     const plannerPrompt = `${byRole.planner.instructions}\n${byRole.planner.prompt}`;
     assert.ok(plannerPrompt.includes(runContext.researchPath));
-    assert.doesNotMatch(plannerPrompt, /<<<SUMMARY>>>/);
+    assert.doesNotMatch(byRole.planner.prompt, /<<<SUMMARY>>>/);
     assert.doesNotMatch(plannerPrompt, new RegExp(escapeRegex(RESEARCH_SUMMARY)));
+    const researchBlock = byRole.planner.instructions.match(
+      /\[Research Agent Output\]([\s\S]*?)\[\/Research Agent Output\]/,
+    )?.[1] ?? '';
+    assert.doesNotMatch(researchBlock, /<<<SUMMARY>>>/);
 
     // test-critic must receive the exact test-writer content, not its summary paragraph.
     const criticPrompt = `${byRole['test-critic'].instructions}\n${byRole['test-critic'].prompt}`;
     assert.ok(criticPrompt.includes(testWriterContent));
-    assert.doesNotMatch(criticPrompt, /<<<SUMMARY>>>/);
+    assert.doesNotMatch(byRole['test-critic'].prompt, /<<<SUMMARY>>>/);
     assert.doesNotMatch(criticPrompt, new RegExp(escapeRegex(TEST_WRITER_SUMMARY)));
+    const writerBlock = byRole['test-critic'].instructions.match(
+      /\[Test Writer Output\]([\s\S]*?)\[\/Test Writer Output\]/,
+    )?.[1] ?? '';
+    assert.doesNotMatch(writerBlock, /<<<SUMMARY>>>/);
 
     // test-runner must receive the exact code-writer content, not its summary paragraph.
     const runnerPrompt = `${byRole['test-runner'].instructions}\n${byRole['test-runner'].prompt}`;
     assert.ok(runnerPrompt.includes(codeWriterContent));
-    assert.doesNotMatch(runnerPrompt, /<<<SUMMARY>>>/);
+    assert.doesNotMatch(byRole['test-runner'].prompt, /<<<SUMMARY>>>/);
     assert.doesNotMatch(runnerPrompt, new RegExp(escapeRegex(CODE_WRITER_SUMMARY)));
+    const codeBlock = byRole['test-runner'].instructions.match(
+      /\[Code Writer Output\]([\s\S]*?)\[\/Code Writer Output\]/,
+    )?.[1] ?? '';
+    assert.doesNotMatch(codeBlock, /<<<SUMMARY>>>/);
   });
 
   it('parseTriageJson/parseVerdict still parse correctly and status.md is unaffected by the appended summary block', async () => {
@@ -2127,15 +2138,17 @@ describe('runPipeline per-stage summary output (<<<SUMMARY>>> paragraphs)', () =
     }
   });
 
-  it('a canned result that omits the delimiter mid-pipeline prints no summary block for that stage (backward compat)', async () => {
+  it('a canned result that omits the delimiter mid-pipeline still prints a fallback summary box for that stage', async () => {
     const invocationCwd = process.cwd();
     const runContext = fakeRunContext(invocationCwd);
     const worktree = fakeWorktree(invocationCwd);
 
     // research/planner deliberately omit the delimiter; every other stage keeps it.
+    const researchContent = 'research-output-no-summary';
+    const plannerContent = 'planner-output-no-summary';
     const behaviors = complexPassBehaviors({
-      research: { ok: true, result: 'research-output-no-summary' },
-      planner: { ok: true, result: 'planner-output-no-summary' },
+      research: { ok: true, result: researchContent },
+      planner: { ok: true, result: plannerContent },
     });
     const MockAgentClass = createMockAgentClass(behaviors);
 
@@ -2153,11 +2166,50 @@ describe('runPipeline per-stage summary output (<<<SUMMARY>>> paragraphs)', () =
     }
 
     const joined = logs.join('\n');
-    assert.doesNotMatch(joined, /\n─+\n research \n─+\n/);
-    assert.doesNotMatch(joined, /\n─+\n planner \n─+\n/);
+    assert.match(joined, stageSummaryBlockRegex('research', researchContent));
+    assert.match(joined, stageSummaryBlockRegex('planner', plannerContent));
+    assert.doesNotMatch(joined, /<<<SUMMARY>>>/);
     // Other stages, which still include the delimiter, keep printing normally.
     assert.match(joined, stageSummaryBlockRegex('triage', TRIAGE_SUMMARY));
     assert.match(joined, stageSummaryBlockRegex('test-writer 1/5', TEST_WRITER_SUMMARY));
+
+    // Fallback is print-only — forwarded research content must not gain an invented delimiter.
+    const byRole = Object.fromEntries(MockAgentClass.instances.map((i) => [agentRole(i.name), i]));
+    assert.ok(byRole.planner.instructions.includes(researchContent));
+    const researchBlock = byRole.planner.instructions.match(
+      /\[Research Agent Output\]([\s\S]*?)\[\/Research Agent Output\]/,
+    )?.[1] ?? '';
+    assert.doesNotMatch(researchBlock, /<<<SUMMARY>>>/);
+    assert.ok(researchBlock.includes(researchContent));
+  });
+
+  it('--ask with empty content and no delimiter still prints no summary block', async () => {
+    const MockAgentClass = createMockAgentClass({
+      ask: { ok: true, result: '' },
+    });
+
+    const { logs, restore } = collectLogs();
+    const errorSpy = mock.method(console, 'error', () => {});
+    const exitSpy = mock.method(process, 'exit', () => {});
+    try {
+      await runPipeline('where is the CLI entrypoint?', {
+        agent: 'claude',
+        ask: true,
+        AgentClass: MockAgentClass,
+        createRunContext: mock.fn(() => fakeRunContext(process.cwd())),
+        createWorktree: mock.fn(() => fakeWorktree(process.cwd())),
+        commitWorktree: mock.fn(() => fakeCommitResult('orch/stub')),
+      });
+    } finally {
+      restore();
+      errorSpy.mock.restore();
+      exitSpy.mock.restore();
+    }
+
+    assert.ok(
+      !logs.some((line) => line.includes('•')),
+      `expected no summary block when content is empty; got: ${JSON.stringify(logs)}`,
+    );
   });
 });
 

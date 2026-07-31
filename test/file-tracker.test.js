@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
+import * as fileTrackerMod from '../lib/file-tracker.js';
 import { FileTracker } from '../lib/file-tracker.js';
 
 const WORKTREE = '/repo/root-slug';
@@ -85,6 +86,46 @@ describe('FileTracker', () => {
     assert.deepEqual(tracker.getFiles(), [
       { marker: '+', path: 'via-path.js' },
       { marker: '+', path: 'via-file-path.js' },
+    ]);
+  });
+
+  it('accepts OpenCode-style args.filePath as a first-class path alias', () => {
+    const tracker = new FileTracker({ cwd: WORKTREE });
+
+    recordPair(tracker, {
+      name: 'write',
+      args: { filePath: 'via-filePath.js' },
+      callId: 'fp1',
+    });
+    recordPair(tracker, {
+      name: 'edit',
+      args: { filePath: 'lib/via-edit.js' },
+      callId: 'fp2',
+    });
+
+    assert.deepEqual(tracker.getFiles(), [
+      { marker: '+', path: 'via-filePath.js' },
+      { marker: '~', path: 'lib/via-edit.js' },
+    ]);
+  });
+
+  it('prefers path over file_path over filePath when multiple aliases are set', () => {
+    const tracker = new FileTracker({ cwd: WORKTREE });
+
+    recordPair(tracker, {
+      name: 'Write',
+      args: { path: 'wins.js', file_path: 'snake.js', filePath: 'camel.js' },
+      callId: 'pref1',
+    });
+    recordPair(tracker, {
+      name: 'Write',
+      args: { file_path: 'snake-wins.js', filePath: 'camel.js' },
+      callId: 'pref2',
+    });
+
+    assert.deepEqual(tracker.getFiles(), [
+      { marker: '+', path: 'wins.js' },
+      { marker: '+', path: 'snake-wins.js' },
     ]);
   });
 
@@ -199,5 +240,70 @@ describe('FileTracker', () => {
       tracker.record({ name: 'Read', args: { path: 'a.js' }, phase: 'completed', callId: '2' }),
       null,
     );
+  });
+});
+
+describe('parseApplyPatchPaths (OpenCode apply_patch)', () => {
+  it('exports parseApplyPatchPaths that maps Add/Update/Delete/Move markers', () => {
+    assert.equal(typeof fileTrackerMod.parseApplyPatchPaths, 'function');
+    const patchText = [
+      '*** Begin Patch',
+      '*** Add File: lib/new.js',
+      '+export const x = 1;',
+      '*** Update File: lib/old.js',
+      '@@',
+      '-a',
+      '+b',
+      '*** Delete File: lib/gone.js',
+      '*** Update File: lib/renamed.js',
+      '*** Move to: lib/renamed-dest.js',
+      '*** End Patch',
+    ].join('\n');
+
+    assert.deepEqual(fileTrackerMod.parseApplyPatchPaths(patchText), [
+      { marker: '+', path: 'lib/new.js' },
+      { marker: '~', path: 'lib/old.js' },
+      { marker: '-', path: 'lib/gone.js' },
+      { marker: '~', path: 'lib/renamed-dest.js' },
+    ]);
+  });
+
+  it('returns [] for missing/empty/malformed patchText', () => {
+    assert.equal(typeof fileTrackerMod.parseApplyPatchPaths, 'function');
+    assert.deepEqual(fileTrackerMod.parseApplyPatchPaths(''), []);
+    assert.deepEqual(fileTrackerMod.parseApplyPatchPaths(null), []);
+    assert.deepEqual(fileTrackerMod.parseApplyPatchPaths(undefined), []);
+    assert.deepEqual(fileTrackerMod.parseApplyPatchPaths('not a patch'), []);
+  });
+
+  it('records apply_patch completions into the tracker (sticky/summary parity)', () => {
+    const tracker = new FileTracker({ cwd: WORKTREE });
+    const patchText = [
+      '*** Add File: src/a.js',
+      '*** Update File: src/b.js',
+      '*** Delete File: src/c.js',
+    ].join('\n');
+
+    // Dedicated API or synthetic write/edit/delete pairs — either must land
+    // these paths with the correct markers.
+    if (typeof tracker.recordApplyPatch === 'function') {
+      tracker.recordApplyPatch(patchText);
+    } else {
+      assert.equal(typeof fileTrackerMod.parseApplyPatchPaths, 'function');
+      for (const [i, entry] of fileTrackerMod.parseApplyPatchPaths(patchText).entries()) {
+        const name = entry.marker === '+' ? 'write' : entry.marker === '-' ? 'delete' : 'edit';
+        recordPair(tracker, {
+          name,
+          args: { path: entry.path },
+          callId: `patch-${i}`,
+        });
+      }
+    }
+
+    assert.deepEqual(tracker.getFiles(), [
+      { marker: '+', path: 'src/a.js' },
+      { marker: '~', path: 'src/b.js' },
+      { marker: '-', path: 'src/c.js' },
+    ]);
   });
 });

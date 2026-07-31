@@ -468,7 +468,7 @@ describe('AgentOpencode', () => {
     const agent = new AgentOpencode('research', 'instr', 'prompt');
     const { command, args, options } = agent.getSpawnConfig('hello');
     assert.equal(command, 'opencode');
-    assert.deepEqual(args, ['run', '--format', 'json', '--auto', 'hello']);
+    assert.deepEqual(args, ['run', '--format', 'json', '--auto', '--thinking', 'hello']);
     assert.equal(options.env, process.env);
   });
 
@@ -476,7 +476,8 @@ describe('AgentOpencode', () => {
     const agent = new AgentOpencode('ask', 'instr', 'prompt', { readOnly: true });
     const { command, args, options } = agent.getSpawnConfig('hello');
     assert.equal(command, 'opencode');
-    assert.deepEqual(args, ['run', '--format', 'json', '--auto', '--agent', 'plan', 'hello']);
+    assert.ok(args.includes('--thinking'), 'read-only spawn must pass --thinking');
+    assert.deepEqual(args, ['run', '--format', 'json', '--auto', '--thinking', '--agent', 'plan', 'hello']);
     assert.equal(options.env.OPENCODE_PERMISSION, DENY_PERMISSION);
     assert.notEqual(options.env, process.env);
     // Spread-inherit parent env (PATH, HOME, …); only OPENCODE_PERMISSION is overridden.
@@ -484,12 +485,19 @@ describe('AgentOpencode', () => {
     assert.deepEqual(options.env, { ...process.env, OPENCODE_PERMISSION: DENY_PERMISSION });
   });
 
-  it('does not pass -p, --password, --continue, --attach, --dir, --thinking, or --share', () => {
+  it('does not pass -p, --password, --continue, --attach, --dir, or --share', () => {
     const agent = new AgentOpencode('research', 'instr', 'prompt');
     const { args } = agent.getSpawnConfig('hello');
-    for (const banned of ['-p', '--password', '--continue', '--attach', '--dir', '--thinking', '--share']) {
+    for (const banned of ['-p', '--password', '--continue', '--attach', '--dir', '--share']) {
       assert.ok(!args.includes(banned), `unexpected arg ${banned}`);
     }
+  });
+
+  it('passes --thinking on both write and readOnly spawn args', () => {
+    const writeArgs = new AgentOpencode('research', 'instr', 'prompt').getSpawnConfig('hello').args;
+    const readArgs = new AgentOpencode('ask', 'instr', 'prompt', { readOnly: true }).getSpawnConfig('hello').args;
+    assert.ok(writeArgs.includes('--thinking'));
+    assert.ok(readArgs.includes('--thinking'));
   });
 
   it('defaults spawn cwd to process.cwd() and uses the shared stdio shape', () => {
@@ -545,12 +553,14 @@ describe('AgentOpencode', () => {
       args: { pattern: '*.md' },
       phase: 'started',
       callId: 'call_1',
+      title: 'glob *.md',
     });
     assert.deepEqual(onToolEvent.mock.calls[1].arguments[0], {
       name: 'glob',
       args: { pattern: '*.md' },
       phase: 'completed',
       callId: 'call_1',
+      title: 'glob *.md',
     });
     assert.equal(agent.activeTools.size, 0);
   });
@@ -727,6 +737,241 @@ describe('AgentOpencode', () => {
     assert.equal(finishFail.mock.calls.length, 1);
     assert.match(String(finishFail.mock.calls[0].arguments[0]), /exited 1 before result/);
   });
+
+  it('empty step_finish stop does not settle; later text settles once (pendingStop)', () => {
+    const agent = new AgentOpencode('code-writer', 'instr', 'prompt');
+    agent.spinner = fakeSpinner();
+    agent.startedAt = Date.now();
+    const finish = mock.fn();
+    const events = loadFixture('opencode-stop-before-text.jsonl');
+
+    agent.handleStreamEvent(events[0], { verbose: false, finish });
+    assert.equal(finish.mock.calls.length, 0, 'empty stop must not settle');
+
+    agent.handleStreamEvent(events[1], { verbose: false, finish });
+    assert.equal(finish.mock.calls.length, 1);
+    const [err, value] = finish.mock.calls[0].arguments;
+    assert.equal(err, null);
+    assert.equal(value.ok, true);
+    assert.equal(value.result, 'Late answer after empty stop.');
+
+    agent.handleStreamEvent(events[2], { verbose: false, finish });
+    assert.equal(finish.mock.calls.length, 1, 'already settled; second stop is a no-op');
+  });
+
+  it('step_finish stop with non-empty buffer still settles immediately', () => {
+    const agent = new AgentOpencode('code-writer', 'instr', 'prompt');
+    agent.spinner = fakeSpinner();
+    agent.startedAt = Date.now();
+    const finish = mock.fn();
+
+    agent.handleStreamEvent(
+      { type: 'text', part: { type: 'text', text: 'buffered' } },
+      { verbose: false, finish },
+    );
+    agent.handleStreamEvent(
+      { type: 'step_finish', part: { type: 'step-finish', reason: 'stop' } },
+      { verbose: false, finish },
+    );
+
+    assert.equal(finish.mock.calls.length, 1);
+    assert.equal(finish.mock.calls[0].arguments[1].result, 'buffered');
+  });
+
+  it('reasoning sets thinking… when idle; verbose writes reasoning text to stderr', () => {
+    const agent = new AgentOpencode('ask', 'instr', 'prompt', { readOnly: true });
+    const statuses = [];
+    agent.setStatus = (text) => statuses.push(text);
+    const [reasoning] = loadFixture('opencode-reasoning.jsonl').filter((e) => e.type === 'reasoning');
+
+    agent.handleStreamEvent(reasoning, { verbose: false, finish: mock.fn() });
+    assert.deepEqual(statuses, ['thinking…']);
+
+    const verboseAgent = new AgentOpencode('ask', 'instr', 'prompt', { readOnly: true });
+    verboseAgent.activeTools.set('call_1', { name: 'read', args: {} });
+    const verboseStatuses = [];
+    verboseAgent.setStatus = (text) => verboseStatuses.push(text);
+    const writes = [];
+    const restore = mock.method(process.stderr, 'write', (chunk) => {
+      writes.push(String(chunk));
+      return true;
+    });
+    try {
+      verboseAgent.handleStreamEvent(reasoning, { verbose: true, finish: mock.fn() });
+    } finally {
+      restore.mock.restore();
+    }
+    assert.deepEqual(writes, ['Considering where main.js lives…']);
+    assert.deepEqual(verboseStatuses, [], 'active tool: do not override status with thinking…');
+  });
+
+  it('verbose settle prints one tokens/cost usage line; omits cost when 0; non-verbose stays quiet', () => {
+    const verboseAgent = new AgentOpencode('code-writer', 'instr', 'prompt');
+    verboseAgent.spinner = fakeSpinner();
+    verboseAgent.startedAt = Date.now();
+    const finish = mock.fn();
+    const writes = [];
+    const restore = mock.method(process.stderr, 'write', (chunk) => {
+      writes.push(String(chunk));
+      return true;
+    });
+    try {
+      verboseAgent.handleStreamEvent(
+        { type: 'text', part: { type: 'text', text: 'done' } },
+        { verbose: true, finish },
+      );
+      verboseAgent.handleStreamEvent(
+        {
+          type: 'step_finish',
+          part: {
+            type: 'step-finish',
+            reason: 'stop',
+            tokens: { input: 20, output: 15 },
+            cost: 0,
+          },
+        },
+        { verbose: true, finish },
+      );
+    } finally {
+      restore.mock.restore();
+    }
+    assert.equal(finish.mock.calls.length, 1);
+    const usageLines = writes.filter((w) => /tokens:/i.test(w));
+    assert.equal(usageLines.length, 1);
+    assert.match(usageLines[0], /tokens:\s*in=20\s+out=15/);
+    assert.doesNotMatch(usageLines[0], /cost=/);
+
+    const costAgent = new AgentOpencode('code-writer', 'instr', 'prompt');
+    costAgent.spinner = fakeSpinner();
+    costAgent.startedAt = Date.now();
+    const costFinish = mock.fn();
+    const costWrites = [];
+    const restoreCost = mock.method(process.stderr, 'write', (chunk) => {
+      costWrites.push(String(chunk));
+      return true;
+    });
+    try {
+      costAgent.handleStreamEvent(
+        { type: 'text', part: { type: 'text', text: 'done' } },
+        { verbose: true, finish: costFinish },
+      );
+      costAgent.handleStreamEvent(
+        {
+          type: 'step_finish',
+          part: {
+            type: 'step-finish',
+            reason: 'stop',
+            tokens: { input: 12, output: 8 },
+            cost: 0.0012,
+          },
+        },
+        { verbose: true, finish: costFinish },
+      );
+    } finally {
+      restoreCost.mock.restore();
+    }
+    assert.match(costWrites.join(''), /tokens:\s*in=12\s+out=8.*cost=\$0\.0012/s);
+
+    const quietAgent = new AgentOpencode('code-writer', 'instr', 'prompt');
+    quietAgent.spinner = fakeSpinner();
+    quietAgent.startedAt = Date.now();
+    const quietFinish = mock.fn();
+    const quietWrites = [];
+    const restoreQuiet = mock.method(process.stderr, 'write', (chunk) => {
+      quietWrites.push(String(chunk));
+      return true;
+    });
+    try {
+      quietAgent.handleStreamEvent(
+        { type: 'text', part: { type: 'text', text: 'done' } },
+        { verbose: false, finish: quietFinish },
+      );
+      quietAgent.handleStreamEvent(
+        {
+          type: 'step_finish',
+          part: {
+            type: 'step-finish',
+            reason: 'stop',
+            tokens: { input: 20, output: 15 },
+            cost: 1.5,
+          },
+        },
+        { verbose: false, finish: quietFinish },
+      );
+    } finally {
+      restoreQuiet.mock.restore();
+    }
+    assert.equal(quietWrites.filter((w) => /tokens:/i.test(w)).length, 0);
+  });
+
+  it('best-effort model: banner prints once when the stream exposes a model id', () => {
+    modelPrintState.printed = false;
+    const agent = new AgentOpencode('ask', 'instr', 'prompt', { readOnly: true });
+    agent.spinner = fakeSpinner();
+    const logs = [];
+    const restore = mock.method(console, 'log', (...args) => logs.push(args.join(' ')));
+    try {
+      agent.handleStreamEvent(
+        {
+          type: 'message.updated',
+          properties: { info: { modelID: 'opencode/test-model' } },
+        },
+        { verbose: false, finish: mock.fn() },
+      );
+      agent.handleStreamEvent(
+        {
+          type: 'message.updated',
+          properties: { info: { modelID: 'opencode/other' } },
+        },
+        { verbose: false, finish: mock.fn() },
+      );
+    } finally {
+      restore.mock.restore();
+    }
+    const modelLines = logs.filter((l) => /^model:/.test(l));
+    assert.equal(modelLines.length, 1);
+    assert.equal(modelLines[0], 'model: opencode/test-model');
+  });
+
+  it('apply_patch + filePath write feed FileTracker sticky paths and Files list', () => {
+    const tracker = new FileTracker({ cwd: '/repo/root-slug' });
+    const agent = new AgentOpencode('code-writer', 'instr', 'prompt', {
+      cwd: '/repo/root-slug',
+      fileTracker: tracker,
+    });
+    agent.spinner = {
+      isSpinning: true,
+      stop: mock.fn(),
+      start: mock.fn(),
+      succeed: mock.fn(),
+      fail: mock.fn(),
+    };
+    const logs = [];
+    const restore = mock.method(console, 'log', (msg) => logs.push(msg));
+    const statuses = [];
+    agent.setStatus = (text) => statuses.push(text);
+
+    try {
+      for (const event of loadFixture('opencode-apply-patch.jsonl')) {
+        agent.handleStreamEvent(event, { verbose: false, finish: mock.fn() });
+      }
+    } finally {
+      restore.mock.restore();
+    }
+
+    assert.ok(
+      statuses.some((s) => /Patching|Applying patch/i.test(s)),
+      `expected Patching/Applying patch status; got ${JSON.stringify(statuses)}`,
+    );
+    assert.deepEqual(tracker.getFiles(), [
+      { marker: '+', path: 'lib/new-file.js' },
+      { marker: '~', path: 'lib/existing.js' },
+      { marker: '-', path: 'lib/obsolete.js' },
+      { marker: '+', path: 'lib/via-filePath.js' },
+    ]);
+    assert.ok(logs.some((l) => /\+ lib\/new-file\.js/.test(l)));
+    assert.ok(logs.some((l) => /\+ lib\/via-filePath\.js/.test(l)));
+  });
 });
 
 describe('Agent file-change sticky lines', () => {
@@ -828,6 +1073,33 @@ describe('Agent file-change sticky lines', () => {
     assert.deepEqual(logs, ['  + lib/agent.js']);
     assert.deepEqual(tracker.getFiles(), [{ marker: '+', path: 'lib/agent.js' }]);
     assert.equal(agent.activeTools.has('toolu_2'), false);
+  });
+
+  it('treats OpenCode filePath as hasPath for sticky lines and activeTools recall', () => {
+    const tracker = new FileTracker({ cwd: '/repo/root-slug' });
+    const { agent } = spinningAgent({ fileTracker: tracker });
+    const logs = [];
+    const restore = mock.method(console, 'log', (msg) => logs.push(msg));
+
+    try {
+      agent.onToolEvent({
+        name: 'write',
+        args: { filePath: 'lib/opencode-write.js' },
+        phase: 'started',
+        callId: 'oc-1',
+      });
+      agent.onToolEvent({
+        name: 'write',
+        args: {},
+        phase: 'completed',
+        callId: 'oc-1',
+      });
+    } finally {
+      restore.mock.restore();
+    }
+
+    assert.deepEqual(logs, ['  + lib/opencode-write.js']);
+    assert.deepEqual(tracker.getFiles(), [{ marker: '+', path: 'lib/opencode-write.js' }]);
   });
 
   it('invokes onFileChange only for the first live print per path', () => {

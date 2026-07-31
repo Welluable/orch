@@ -1,3 +1,5 @@
+import { summaryTrailerInstructions } from './summary-footer.js';
+
 export function testWriterAgentArgs({
     prompt,
     cwd,
@@ -37,11 +39,7 @@ export function testWriterAgentArgs({
                     * Your final message must include test file paths / run command, if
                       applicable, so it can be handed to the next stage.
                     * Later rounds must address critic feedback; do not write production code.
-                    * After your final message above, on a new line write the summary
-                      marker (three '<' characters, then SUMMARY, then three '>'
-                      characters, with no spaces), followed by one paragraph in natural,
-                      human-readable language explaining what you did in this step and
-                      what happened — no lists, no headers, just prose.
+                    ${summaryTrailerInstructions({ before: 'your final message' })}
                     * If you changed any files, after that paragraph add a line reading
                       exactly "Files:" followed by one line per changed file formatted
                       as "<path>: <one-line description>" (e.g. "test/agent.test.js:

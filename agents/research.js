@@ -1,3 +1,5 @@
+import { summaryTrailerInstructions } from './summary-footer.js';
+
 export function researchAgentArgs({ prompt, cwd, researchPath }) {
     return {
         name: 'research',
@@ -11,11 +13,7 @@ export function researchAgentArgs({ prompt, cwd, researchPath }) {
                       findings only to the exact path: ${researchPath}
                     * Before the summary marker below, your message must contain only the
                       exact path: ${researchPath}
-                    * After the path above, on a new line write the summary marker (three
-                      '<' characters, then SUMMARY, then three '>' characters, with no
-                      spaces), followed by one paragraph in natural, human-readable language
-                      explaining what you did in this step and what happened — no lists, no
-                      headers, just prose.
+                    ${summaryTrailerInstructions({ before: `the exact path: ${researchPath}` })}
                 `,
         prompt,
         options: { cwd },

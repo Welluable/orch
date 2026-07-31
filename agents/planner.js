@@ -1,3 +1,5 @@
+import { summaryTrailerInstructions } from './summary-footer.js';
+
 export function plannerAgentArgs({ prompt, cwd, researchPath, taskPath, researchOutput }) {
     return {
         name: 'planner',
@@ -10,11 +12,7 @@ export function plannerAgentArgs({ prompt, cwd, researchPath, taskPath, research
                       the exact path: ${taskPath}
                     * Before the summary marker below, your message must contain only the
                       exact path: ${taskPath}
-                    * After the path above, on a new line write the summary marker (three
-                      '<' characters, then SUMMARY, then three '>' characters, with no
-                      spaces), followed by one paragraph in natural, human-readable language
-                      explaining what you did in this step and what happened — no lists, no
-                      headers, just prose.
+                    ${summaryTrailerInstructions({ before: `the exact path: ${taskPath}` })}
 
                     [Research Agent Output]
                     ${researchOutput}

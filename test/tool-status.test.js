@@ -15,6 +15,7 @@ import {
   basename,
   formatArgPreview,
 } from '../lib/tool-status.js';
+import * as toolStatusMod from '../lib/tool-status.js';
 import { Agent } from '../lib/agent.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -122,6 +123,65 @@ describe('formatToolStatus file_path fallback (bug fix)', () => {
 
   it('falls back to "file" when neither path nor file_path is present', () => {
     assert.match(formatToolStatus({ name: 'edit', args: {} }), /Editing file/);
+  });
+});
+
+describe('toolPath helper + OpenCode filePath alias', () => {
+  it('exports toolPath that accepts path | file_path | filePath', () => {
+    assert.equal(typeof toolStatusMod.toolPath, 'function');
+    const { toolPath } = toolStatusMod;
+    assert.equal(toolPath({ path: 'a.js' }), 'a.js');
+    assert.equal(toolPath({ file_path: 'b.js' }), 'b.js');
+    assert.equal(toolPath({ filePath: 'c.js' }), 'c.js');
+    assert.equal(toolPath({ path: 'p.js', file_path: 's.js', filePath: 'c.js' }), 'p.js');
+    assert.equal(toolPath({ file_path: 's.js', filePath: 'c.js' }), 's.js');
+    assert.equal(toolPath({}), null);
+    assert.equal(toolPath(null), null);
+    assert.equal(toolPath({ path: '' }), null);
+    assert.equal(toolPath({ path: 42 }), null);
+  });
+
+  it('read/write/edit/delete resolve filePath when path and file_path are absent', () => {
+    assert.match(formatToolStatus({ name: 'read', args: { filePath: 'lib/a.js' } }), /Reading a\.js/);
+    assert.match(formatToolStatus({ name: 'write', args: { filePath: 'lib/a.js' } }), /Writing a\.js/);
+    assert.match(formatToolStatus({ name: 'edit', args: { filePath: 'lib/a.js' } }), /Editing a\.js/);
+    assert.match(formatToolStatus({ name: 'delete', args: { filePath: 'lib/a.js' } }), /Deleting a\.js/);
+  });
+
+  it('formats apply_patch as Patching/Applying patch (short, stable)', () => {
+    const text = formatToolStatus({
+      name: 'apply_patch',
+      args: { patchText: '*** Add File: lib/a.js\n' },
+    });
+    assert.match(text, /Patching|Applying patch/);
+    assert.doesNotMatch(text, /\*\*\* Add File/);
+  });
+});
+
+describe('formatToolStatus tool title preference', () => {
+  it('uses a non-empty title when the formatter would otherwise be vague', () => {
+    const text = formatToolStatus({
+      name: 'CustomTool',
+      args: {},
+      title: 'Looking up docs',
+    });
+    assert.match(text, /Looking up docs/);
+    assert.doesNotMatch(text, /^Running CustomTool…$/);
+  });
+
+  it('does not clobber precise Reading/Writing/Editing/Running lines with title', () => {
+    assert.match(
+      formatToolStatus({ name: 'read', args: { path: 'a.js' }, title: 'vague title' }),
+      /Reading a\.js/,
+    );
+    assert.doesNotMatch(
+      formatToolStatus({ name: 'read', args: { path: 'a.js' }, title: 'vague title' }),
+      /vague title/,
+    );
+    assert.match(
+      formatToolStatus({ name: 'shell', args: { command: 'npm test' }, title: 'run tests' }),
+      /Running: npm test/,
+    );
   });
 });
 
@@ -437,6 +497,7 @@ describe('normalizeOpencodeToolEvent', () => {
       args: { pattern: '*.md' },
       phase: 'completed',
       callId: 'call_1',
+      title: 'glob *.md',
     });
   });
 
@@ -539,6 +600,36 @@ describe('normalizeOpencodeToolEvent', () => {
         phase: 'completed',
         callId: 'call_g',
       },
+    );
+  });
+
+  it('passes through a non-empty part.state.title (or part.title) for vague status lines', () => {
+    const event = {
+      type: 'tool_use',
+      part: {
+        tool: 'webfetch',
+        callID: 'call_t',
+        state: { status: 'completed', input: {}, title: 'Fetch example.com' },
+      },
+    };
+    const normalized = normalizeOpencodeToolEvent(event);
+    assert.equal(normalized.title, 'Fetch example.com');
+    assert.match(formatToolStatus(normalized), /Fetch example\.com/);
+  });
+
+  it('formats OpenCode write with filePath via the shared formatter', () => {
+    assert.match(
+      formatToolStatus(
+        normalizeOpencodeToolEvent({
+          type: 'tool_use',
+          part: {
+            tool: 'write',
+            callID: 'c-wfp',
+            state: { status: 'completed', input: { filePath: 'lib/a.js', content: 'secret' } },
+          },
+        }),
+      ),
+      /Writing a\.js/,
     );
   });
 });
