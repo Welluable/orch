@@ -1,10 +1,12 @@
 import { summaryTrailerInstructions } from './summary-footer.js';
+import { researchConsumerHardRule } from './research-reuse.js';
 
 export function testCriticAgentArgs({
     prompt,
     cwd,
     worktreePath,
     branch,
+    researchPath,
     taskPath,
     statusPath,
     testWriterOutput,
@@ -16,6 +18,7 @@ export function testCriticAgentArgs({
                     * You are already running inside the git worktree for this task
                       (worktree: ${worktreePath}, branch: ${branch}). Do not
                       create, select, or switch worktrees or branches.
+                    * ${researchConsumerHardRule(researchPath)}
                     * Read the task checklist at the exact path: ${taskPath} and the
                       status at the exact path: ${statusPath}
                     * Judge whether the current tests / "## Verification" section are adequate

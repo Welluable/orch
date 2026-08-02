@@ -1,10 +1,12 @@
 import { summaryTrailerInstructions } from './summary-footer.js';
+import { researchConsumerHardRule } from './research-reuse.js';
 
 export function testRunnerAgentArgs({
     prompt,
     cwd,
     worktreePath,
     branch,
+    researchPath,
     statusPath,
     codeWriterOutput,
 }) {
@@ -15,8 +17,10 @@ export function testRunnerAgentArgs({
                     * You are already running inside the git worktree for this task
                       (worktree: ${worktreePath}, branch: ${branch}). Do not
                       create, select, or switch worktrees or branches.
+                    * ${researchConsumerHardRule(researchPath)}
                     * Read the status at the exact path: ${statusPath} and prior stage
-                      output for the test command(s) to run.
+                      output for the test command(s) to run. Prefer commands and
+                      conventions already recorded in research when present.
                     * If a runnable command is recorded, run it and report the outcome.
                     * If only a "## Verification" section exists, evaluate the current diff against
                       those criteria by inspection.

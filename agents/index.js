@@ -12,3 +12,8 @@ export { boundariesAgentArgs } from './boundaries.js';
 export { decomposerAgentArgs } from './decomposer.js';
 export { seqDecomposerAgentArgs } from './seq-decomposer.js';
 export { adjustAgentArgs } from './adjust.js';
+export {
+    researchConsumerHardRule,
+    shrinkResearchOutput,
+    RESEARCH_INLINE_MAX_CHARS,
+} from './research-reuse.js';

@@ -1,10 +1,12 @@
 import { summaryTrailerInstructions } from './summary-footer.js';
+import { researchConsumerHardRule } from './research-reuse.js';
 
 export function testWriterAgentArgs({
     prompt,
     cwd,
     worktreePath,
     branch,
+    researchPath,
     taskPath,
     statusPath,
     criticFeedback,
@@ -24,6 +26,7 @@ export function testWriterAgentArgs({
                     * You are already running inside the git worktree for this task
                       (worktree: ${worktreePath}, branch: ${branch}). Do not
                       create, select, or switch worktrees or branches.
+                    * ${researchConsumerHardRule(researchPath)}
                     * Read the task checklist at the exact path: ${taskPath}
                     * Before making any production-code changes, decide how to verify the work:
                       - If automated tests are practical, write the relevant test cases/files first,

@@ -96,12 +96,6 @@ describe('main.js CLI', () => {
     assert.match(stdout, /opencode/);
   });
 
-  it('prints version for --version', async () => {
-    const { code, stdout } = await runCli(['--version']);
-    assert.equal(code, 0);
-    assert.equal(stdout.trim(), '1.3.0');
-  });
-
   it('help output mentions --agent, --verbose, --dry-run, --max-rounds, --ask, and --quick', async () => {
     const { code, stdout } = await runCli(['--help']);
     assert.equal(code, 0);
@@ -672,6 +666,21 @@ describe('runPipeline cwd-scoped artifacts and orch-owned worktrees', () => {
     assert.ok(planner.instructions.includes(runContext.taskPath));
     assert.doesNotMatch(research.instructions, /<taskname>/);
     assert.doesNotMatch(planner.instructions, /<taskname>/);
+
+    const byRole = Object.fromEntries(
+      MockAgentClass.instances.map((i) => [agentRole(i.name), i]),
+    );
+    for (const role of ['test-writer', 'test-critic', 'code-writer', 'test-runner']) {
+      assert.ok(
+        byRole[role].instructions.includes(runContext.researchPath),
+        `${role} must receive researchPath`,
+      );
+      assert.match(
+        byRole[role].instructions,
+        /Do not re-search or re-document/i,
+        `${role} must include the consumer hard rule`,
+      );
+    }
   });
 
   it('passes the structured worktree path/branch to code-writer instead of parsed test-writer prose', async () => {

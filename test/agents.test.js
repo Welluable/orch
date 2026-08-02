@@ -13,6 +13,11 @@ import { testWriterAgentArgs } from '../agents/test-writer.js';
 import { testCriticAgentArgs } from '../agents/test-critic.js';
 import { codeWriterAgentArgs } from '../agents/code-writer.js';
 import { testRunnerAgentArgs } from '../agents/test-runner.js';
+import {
+  researchConsumerHardRule,
+  shrinkResearchOutput,
+  RESEARCH_INLINE_MAX_CHARS,
+} from '../agents/research-reuse.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.join(__dirname, '..');
@@ -138,6 +143,39 @@ describe('quickFixAgentArgs', () => {
   });
 });
 
+describe('researchConsumerHardRule', () => {
+  it('contains required substance: read path, no re-document covered facts, worktree wins', () => {
+    const researchPath = '/tmp/orch/.orch/slug/research.md';
+    const text = researchConsumerHardRule(researchPath);
+
+    assert.ok(text.includes(researchPath));
+    assert.match(text, /Read research at/i);
+    assert.match(text, /Do not re-search or re-document/i);
+    assert.match(text, /architecture/i);
+    assert.match(text, /commands/i);
+    assert.match(text, /conventions/i);
+    assert.match(text, /entry points/i);
+    assert.match(text, /Explore only what your stage still needs/i);
+    assert.match(text, /worktree is authoritative/i);
+  });
+});
+
+describe('shrinkResearchOutput', () => {
+  it('keeps short excerpts intact and truncates large dumps with a path pointer', () => {
+    const researchPath = '/tmp/orch/.orch/slug/research.md';
+    assert.equal(shrinkResearchOutput('short findings', { researchPath }), 'short findings');
+    assert.equal(shrinkResearchOutput('', { researchPath }), '');
+
+    const large = `${'x'.repeat(RESEARCH_INLINE_MAX_CHARS * 2)}\nTAIL`;
+    const shrunk = shrinkResearchOutput(large, { researchPath });
+    assert.ok(shrunk.length < large.length);
+    assert.ok(shrunk.length <= RESEARCH_INLINE_MAX_CHARS + researchPath.length + 80);
+    assert.ok(shrunk.includes(researchPath));
+    assert.match(shrunk, /truncated/i);
+    assert.doesNotMatch(shrunk, /TAIL/);
+  });
+});
+
 describe('researchAgentArgs', () => {
   it('interpolates invocationCwd and absolute researchPath; no <taskname>', () => {
     const researchPath = '/tmp/orch/.orch/slug/research.md';
@@ -156,10 +194,28 @@ describe('researchAgentArgs', () => {
     assert.ok(args.instructions.includes(researchPath));
     assert.doesNotMatch(args.instructions, /<taskname>/);
   });
+
+  it('requires reuse-oriented sections, forbids plan/large dumps, and sets stop conditions', () => {
+    const args = researchAgentArgs({
+      prompt: 'add feature',
+      cwd: '/tmp/repo',
+      researchPath: '/tmp/orch/.orch/slug/research.md',
+    });
+
+    assert.match(args.instructions, /Layout \/ architecture/i);
+    assert.match(args.instructions, /Commands/i);
+    assert.match(args.instructions, /Conventions/i);
+    assert.match(args.instructions, /Relevant paths/i);
+    assert.match(args.instructions, /Constraints/i);
+    assert.match(args.instructions, /Explicit gaps/i);
+    assert.match(args.instructions, /Do not write an implementation plan/i);
+    assert.match(args.instructions, /Do not paste large file contents/i);
+    assert.match(args.instructions, /Stop when/i);
+  });
 });
 
 describe('plannerAgentArgs', () => {
-  it('interpolates paths and wraps prior output in [Research Agent Output]', () => {
+  it('interpolates paths, hard rule, and wraps prior output in [Research Agent Output]', () => {
     const researchPath = '/tmp/orch/.orch/slug/research.md';
     const taskPath = '/tmp/orch/.orch/slug/task.md';
     const researchOutput = 'found three call sites';
@@ -175,10 +231,27 @@ describe('plannerAgentArgs', () => {
     assert.equal(args.name, 'planner');
     assert.ok(args.instructions.includes(researchPath));
     assert.ok(args.instructions.includes(taskPath));
+    assert.ok(args.instructions.includes(researchConsumerHardRule(researchPath)));
     assert.match(args.instructions, /\[Research Agent Output\]/);
     assert.match(args.instructions, /\[\/Research Agent Output\]/);
     assert.ok(args.instructions.includes(researchOutput));
     assert.doesNotMatch(args.instructions, /<taskname>/);
+  });
+
+  it('shrinks large inline researchOutput and keeps the researchPath hard rule', () => {
+    const researchPath = '/tmp/orch/.orch/slug/research.md';
+    const large = `HEAD\n${'y'.repeat(RESEARCH_INLINE_MAX_CHARS + 80)}\nTAIL`;
+    const args = plannerAgentArgs({
+      prompt: 'add feature',
+      cwd: '/tmp/repo',
+      researchPath,
+      taskPath: '/tmp/orch/.orch/slug/task.md',
+      researchOutput: large,
+    });
+
+    assert.ok(args.instructions.includes(researchConsumerHardRule(researchPath)));
+    assert.match(args.instructions, /truncated/i);
+    assert.doesNotMatch(args.instructions, /TAIL/);
   });
 });
 
@@ -188,6 +261,7 @@ describe('testWriterAgentArgs', () => {
     cwd: '/tmp/wt',
     worktreePath: '/tmp/wt',
     branch: 'orch/slug',
+    researchPath: '/tmp/.orch/slug/research.md',
     taskPath: '/tmp/.orch/slug/task.md',
     statusPath: '/tmp/.orch/slug/status.md',
   };
@@ -199,6 +273,8 @@ describe('testWriterAgentArgs', () => {
     assert.equal(args.options.cwd, base.cwd);
     assert.ok(args.instructions.includes(base.worktreePath));
     assert.ok(args.instructions.includes(base.branch));
+    assert.ok(args.instructions.includes(base.researchPath));
+    assert.ok(args.instructions.includes(researchConsumerHardRule(base.researchPath)));
     assert.ok(args.instructions.includes(base.taskPath));
     assert.ok(args.instructions.includes(base.statusPath));
     assert.match(args.instructions, /Test Writer Agent/);
@@ -223,6 +299,7 @@ describe('testCriticAgentArgs', () => {
       cwd: '/tmp/wt',
       worktreePath: '/tmp/wt',
       branch: 'orch/slug',
+      researchPath: '/tmp/.orch/slug/research.md',
       taskPath: '/tmp/.orch/slug/task.md',
       statusPath: '/tmp/.orch/slug/status.md',
       testWriterOutput: 'wrote test/agents.test.js; run npm test',
@@ -233,6 +310,8 @@ describe('testCriticAgentArgs', () => {
     assert.equal(args.options.cwd, ctx.cwd);
     assert.ok(args.instructions.includes(ctx.worktreePath));
     assert.ok(args.instructions.includes(ctx.branch));
+    assert.ok(args.instructions.includes(ctx.researchPath));
+    assert.ok(args.instructions.includes(researchConsumerHardRule(ctx.researchPath)));
     assert.ok(args.instructions.includes(ctx.taskPath));
     assert.ok(args.instructions.includes(ctx.statusPath));
     assert.match(args.instructions, /Test Critic Agent/);
@@ -250,6 +329,7 @@ describe('codeWriterAgentArgs', () => {
     cwd: '/tmp/wt',
     worktreePath: '/tmp/wt',
     branch: 'orch/slug',
+    researchPath: '/tmp/.orch/slug/research.md',
     taskPath: '/tmp/.orch/slug/task.md',
     statusPath: '/tmp/.orch/slug/status.md',
   };
@@ -266,6 +346,8 @@ describe('codeWriterAgentArgs', () => {
     assert.equal(args.options.cwd, base.cwd);
     assert.ok(args.instructions.includes(base.worktreePath));
     assert.ok(args.instructions.includes(base.branch));
+    assert.ok(args.instructions.includes(base.researchPath));
+    assert.ok(args.instructions.includes(researchConsumerHardRule(base.researchPath)));
     assert.ok(args.instructions.includes(base.taskPath));
     assert.ok(args.instructions.includes(base.statusPath));
     assert.match(args.instructions, /Code Writer Agent/);
@@ -302,6 +384,7 @@ describe('testRunnerAgentArgs', () => {
       cwd: '/tmp/wt',
       worktreePath: '/tmp/wt',
       branch: 'orch/slug',
+      researchPath: '/tmp/.orch/slug/research.md',
       statusPath: '/tmp/.orch/slug/status.md',
       codeWriterOutput: 'moved factories under agents/',
     };
@@ -311,6 +394,8 @@ describe('testRunnerAgentArgs', () => {
     assert.equal(args.options.cwd, ctx.cwd);
     assert.ok(args.instructions.includes(ctx.worktreePath));
     assert.ok(args.instructions.includes(ctx.branch));
+    assert.ok(args.instructions.includes(ctx.researchPath));
+    assert.ok(args.instructions.includes(researchConsumerHardRule(ctx.researchPath)));
     assert.ok(args.instructions.includes(ctx.statusPath));
     assert.match(args.instructions, /Test Runner Agent/);
     assert.match(args.instructions, /\[Code Writer Output\]/);
@@ -318,6 +403,34 @@ describe('testRunnerAgentArgs', () => {
     assert.ok(args.instructions.includes(ctx.codeWriterOutput));
     assert.match(args.instructions, /"passed"/);
     assert.match(args.instructions, /Do not edit production code or tests/i);
+  });
+});
+
+describe('implementer researchPath wiring', () => {
+  it('includes researchPath and the shared hard rule in every implementer factory', () => {
+    const researchPath = '/tmp/.orch/slug/research.md';
+    const hardRule = researchConsumerHardRule(researchPath);
+    const common = {
+      prompt: 'task',
+      cwd: '/tmp/wt',
+      worktreePath: '/tmp/wt',
+      branch: 'orch/slug',
+      researchPath,
+      taskPath: '/tmp/.orch/slug/task.md',
+      statusPath: '/tmp/.orch/slug/status.md',
+    };
+
+    const cases = [
+      testWriterAgentArgs(common),
+      testCriticAgentArgs({ ...common, testWriterOutput: 'tests' }),
+      codeWriterAgentArgs({ ...common, round: 1, acceptedVerification: 'ok' }),
+      testRunnerAgentArgs({ ...common, codeWriterOutput: 'done' }),
+    ];
+
+    for (const args of cases) {
+      assert.ok(args.instructions.includes(researchPath));
+      assert.ok(args.instructions.includes(hardRule));
+    }
   });
 });
 
