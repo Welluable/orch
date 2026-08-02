@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { jobPaths, readJob, writeJob } from '../lib/jobs.js';
 
 /**
- * Contract for `.spec/server.md` phase 1 (unit 02-serve-jobs-api):
+ * Contract for `.spec/server.md` phases 1–2 (serve jobs + products API):
  *
  * - `orch serve` binds home to `os.homedir()` (injectable `homedir` in tests),
  *   ensures `$HOME/.orch/products/`, refuses when `$HOME/.orch` is not writable,
@@ -21,11 +21,20 @@ import { jobPaths, readJob, writeJob } from '../lib/jobs.js';
  *   jobs via injectable `runDetached` with `pr: true`, product cwd, optional
  *   `base`, and a no-op `exit` so the serve process stays alive. HTTP starts
  *   persist `source: { kind, id, remoteAddr, receivedAt }` on the job record.
- * - HTTP (no auth): `GET /api/healthz`; `POST /api/products/:product/jobs` for
- *   an existing product dir only; `GET /api/jobs`, `GET /api/jobs/:slug`,
- *   `GET /api/jobs/:slug/logs`, `POST .../pause|resume|stop`.
+ * - HTTP (no auth): `GET /api/healthz`; product routes below; `POST
+ *   /api/products/:product/jobs` for an existing product dir; `GET /api/jobs`,
+ *   `GET /api/jobs/:slug`, `GET /api/jobs/:slug/logs`, `POST .../pause|resume|stop`.
+ * - Phase 2 products: `GET`/`POST /api/products`, `GET`/`PATCH
+ *   /api/products/:product` (no DELETE). Slug
+ *   `/^[a-z0-9]+(?:-[a-z0-9]+)*$/` max 64; required `name` + `slug`.
+ *   Init = `git init -b main` → empty commit → private `gh repo create`
+ *   (owner: request → `--github-owner` → `gh` login) → `git remote add origin`
+ *   → push `main`; clone = `git clone` into `$HOME/.orch/products/<slug>/`.
+ *   Existing slug → `409` for both init and clone. Write `product.json`.
+ *   Failures after mkdir → best-effort rm + `502`. Stub `gh`/`git` via
+ *   injectable `execFile` / `execFileSync` — no live GitHub.
  * - Durable `state: "queued"` jobs are re-enqueued on boot; shutdown does not
- *   kill children. Product create/PATCH and files API are out of scope here.
+ *   kill children. Files API remains deferred (unit 04).
  *
  * Implementation seam: `lib/serve.js` exports `startServe(options)`.
  */
@@ -127,11 +136,69 @@ function okGhExecFileSync(cmd, args) {
   throw new Error(`unexpected execFileSync: ${cmd} ${args.join(' ')}`);
 }
 
+/**
+ * Fake sync/async-compatible exec for product init/clone (and boot auth).
+ * Records calls; simulates git clone by creating the destination directory.
+ */
+function makeProductExec({
+  login = 'login-user',
+  failRepoCreate = false,
+  failClone = false,
+  failAfterMkdir = null,
+} = {}) {
+  const calls = [];
+  const execFile = (cmd, args = [], options = {}) => {
+    calls.push({ command: cmd, args: [...args], options });
+    if (cmd === 'which') return '/usr/bin/' + args[0];
+    if (cmd === 'gh' && args[0] === 'auth' && args[1] === 'status') {
+      return 'Logged in to github.com as acme';
+    }
+    if (cmd === 'gh' && args[0] === 'api' && args.includes('user')) {
+      return `${login}\n`;
+    }
+    if (cmd === 'gh' && args[0] === 'repo' && args[1] === 'create') {
+      if (failRepoCreate || failAfterMkdir === 'repo-create') {
+        const err = new Error('gh repo create failed');
+        err.stderr = 'HTTP 422: Repository creation failed';
+        throw err;
+      }
+      assert.ok(args.includes('--private'), 'gh repo create must pass --private');
+      return '';
+    }
+    if (cmd === 'git') {
+      if (failAfterMkdir === 'git' && (args.includes('init') || args[0] === 'init')) {
+        const err = new Error('git init failed');
+        err.stderr = 'fatal: could not initialize';
+        throw err;
+      }
+      if (args[0] === 'clone' || args.includes('clone')) {
+        if (failClone || failAfterMkdir === 'clone') {
+          const err = new Error('git clone failed');
+          err.stderr = 'fatal: repository not found';
+          throw err;
+        }
+        // `git clone <url> <dest>` — create dest so product.json can be written.
+        const dest = args[args.length - 1];
+        if (dest && !dest.startsWith('-') && !/^https?:/.test(dest) && !dest.includes('@')) {
+          fs.mkdirSync(dest, { recursive: true });
+          fs.mkdirSync(path.join(dest, '.git'), { recursive: true });
+        }
+        return '';
+      }
+      // init / commit / remote / push / remote set-url — succeed by default
+      return '';
+    }
+    throw new Error(`unexpected execFile: ${cmd} ${args.join(' ')}`);
+  };
+  return { execFile, calls };
+}
+
 function serveBaseOptions(home, overrides = {}) {
   const runDetached = overrides.runDetached ?? mock.fn(async (_prompt, options = {}) => {
     // Mimic detach-parent success without exiting the test process.
     if (typeof options.exit === 'function') options.exit(0);
   });
+  const defaultExec = makeProductExec().execFile;
   return {
     homedir: () => home,
     host: '127.0.0.1',
@@ -140,14 +207,97 @@ function serveBaseOptions(home, overrides = {}) {
     maxQueue: 64,
     agent: 'claude',
     maxRounds: 5,
-    runDetached,
     isBinaryOnPath: (bin) => bin === 'gh' || bin === 'claude' || bin === 'agent',
-    execFileSync: okGhExecFileSync,
+    execFileSync: defaultExec,
+    execFile: defaultExec,
     log: () => {},
     warn: () => {},
     ...overrides,
     runDetached: overrides.runDetached ?? runDetached,
   };
+}
+
+function readProductJson(home, slug) {
+  const p = path.join(productsDir(home), slug, 'product.json');
+  return JSON.parse(fs.readFileSync(p, 'utf8'));
+}
+
+function ghRepoCreateCalls(calls) {
+  return calls.filter(
+    (c) => c.command === 'gh' && c.args[0] === 'repo' && c.args[1] === 'create',
+  );
+}
+
+function ghApiUserCalls(calls) {
+  return calls.filter(
+    (c) => c.command === 'gh' && c.args[0] === 'api' && c.args.some((a) => a === 'user' || String(a).startsWith('user')),
+  );
+}
+
+function gitCalls(calls) {
+  return calls.filter((c) => c.command === 'git');
+}
+
+function firstGitCallIndex(calls, predicate) {
+  return calls.findIndex((c) => c.command === 'git' && predicate(c.args));
+}
+
+/** Locked init steps from `.spec/server.md`: init -b main → empty commit → remote add → push main. */
+function assertInitGitPipeline(calls, { owner, slug }) {
+  const initIdx = firstGitCallIndex(
+    calls,
+    (args) => {
+      // Spec: `git init -b main` (flag then branch name as separate argv).
+      const initAt = args.indexOf('init');
+      if (initAt < 0) return false;
+      const bAt = args.indexOf('-b', initAt);
+      return bAt >= 0 && args[bAt + 1] === 'main';
+    },
+  );
+  assert.ok(initIdx >= 0, `expected git init -b main; git calls=${JSON.stringify(gitCalls(calls))}`);
+
+  const commitIdx = firstGitCallIndex(
+    calls,
+    (args) =>
+      (args[0] === 'commit' || args.includes('commit')) && args.includes('--allow-empty'),
+  );
+  assert.ok(
+    commitIdx >= 0,
+    `expected empty commit (git commit --allow-empty); git calls=${JSON.stringify(gitCalls(calls))}`,
+  );
+
+  const remoteIdx = firstGitCallIndex(
+    calls,
+    (args) => args.includes('remote') && args.includes('add') && args.includes('origin'),
+  );
+  assert.ok(
+    remoteIdx >= 0,
+    `expected git remote add origin; git calls=${JSON.stringify(gitCalls(calls))}`,
+  );
+
+  const pushIdx = firstGitCallIndex(
+    calls,
+    (args) => (args[0] === 'push' || args.includes('push')) && args.includes('main'),
+  );
+  assert.ok(pushIdx >= 0, `expected git push … main; git calls=${JSON.stringify(gitCalls(calls))}`);
+
+  assert.ok(initIdx < commitIdx, 'git init must precede empty commit');
+  assert.ok(commitIdx < remoteIdx, 'empty commit must precede remote add');
+  assert.ok(remoteIdx < pushIdx, 'remote add must precede push main');
+
+  const creates = ghRepoCreateCalls(calls);
+  assert.equal(creates.length, 1);
+  const createIdx = calls.indexOf(creates[0]);
+  assert.ok(commitIdx < createIdx, 'empty commit must precede gh repo create');
+  assert.ok(createIdx < remoteIdx, 'gh repo create must precede git remote add origin');
+  assert.ok(
+    creates[0].args.includes('--private'),
+    'gh repo create must pass --private',
+  );
+  assert.ok(
+    creates[0].args.some((a) => a === `${owner}/${slug}` || String(a).endsWith(`${owner}/${slug}`)),
+    `repo create must target ${owner}/${slug}; args=${creates[0].args.join(' ')}`,
+  );
 }
 
 async function startTestServe(home, overrides = {}) {
@@ -888,34 +1038,481 @@ describe('serve HTTP jobs API (scan + controls + logs)', () => {
     }
   });
 
-  it('does not expose product create/PATCH or files routes in this unit', async () => {
+  it('keeps files API deferred (unit 04)', async () => {
     const home = makeTmpHome();
     try {
       seedProduct(home, 'solo');
       const handle = await startTestServe(home);
       try {
-        // Phase 1 may 404 these; must not succeed as implemented product APIs.
-        const create = await jsonRequest(handle.baseUrl, 'POST', '/api/products', {
-          body: { name: 'X', slug: 'x', source: 'init' },
-        });
-        assert.ok(
-          create.res.status === 404 || create.res.status === 405 || create.res.status === 501,
-          `product create must be deferred; got ${create.res.status}`,
-        );
-
-        const patch = await jsonRequest(handle.baseUrl, 'PATCH', '/api/products/solo', {
-          body: { name: 'Nope' },
-        });
-        assert.ok(
-          patch.res.status === 404 || patch.res.status === 405 || patch.res.status === 501,
-          `product PATCH must be deferred; got ${patch.res.status}`,
-        );
-
         const files = await jsonRequest(handle.baseUrl, 'GET', '/api/jobs/any/files');
         assert.ok(
           files.res.status === 404 || files.res.status === 405 || files.res.status === 501,
           `files API must be deferred; got ${files.res.status}`,
         );
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('serve products API (phase 2)', () => {
+  it('GET /api/products lists product.json records under the products dir', async () => {
+    const home = makeTmpHome();
+    try {
+      seedProduct(home, 'alpha', { name: 'Alpha' });
+      seedProduct(home, 'beta', { name: 'Beta' });
+      const handle = await startTestServe(home);
+      try {
+        const { res, json } = await jsonRequest(handle.baseUrl, 'GET', '/api/products');
+        assert.equal(res.status, 200);
+        const products = json?.products ?? json;
+        assert.ok(Array.isArray(products), 'response must include a products array');
+        const slugs = products.map((p) => p.slug).sort();
+        assert.deepEqual(slugs, ['alpha', 'beta']);
+        const alpha = products.find((p) => p.slug === 'alpha');
+        assert.equal(alpha.name, 'Alpha');
+        assert.equal(alpha.source, 'clone');
+        assert.equal(alpha.remote?.owner, 'acme');
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('POST /api/products init runs locked git pipeline, private gh repo create, product.json → 201', async () => {
+    const home = makeTmpHome();
+    try {
+      const { execFile, calls } = makeProductExec({ login: 'login-user' });
+      const handle = await startTestServe(home, {
+        githubOwner: undefined,
+        execFile,
+        execFileSync: execFile,
+      });
+      try {
+        const { res, json } = await jsonRequest(handle.baseUrl, 'POST', '/api/products', {
+          body: { name: 'My App', slug: 'my-app', source: 'init', owner: 'acme' },
+        });
+        assert.equal(res.status, 201, `expected 201; got ${res.status}: ${JSON.stringify(json)}`);
+        const product = json?.product ?? json;
+        assert.equal(product.slug, 'my-app');
+        assert.equal(product.name, 'My App');
+        assert.equal(product.source, 'init');
+        assert.equal(product.remote?.visibility, 'private');
+        assert.equal(product.remote?.owner, 'acme');
+        assert.ok(product.createdAt);
+
+        const onDisk = readProductJson(home, 'my-app');
+        assert.equal(onDisk.slug, 'my-app');
+        assert.equal(onDisk.name, 'My App');
+        assert.equal(onDisk.source, 'init');
+        assert.equal(onDisk.remote.visibility, 'private');
+        assert.equal(onDisk.remote.owner, 'acme');
+        assert.ok(fs.statSync(path.join(productsDir(home), 'my-app')).isDirectory());
+
+        // Spec-locked init: git init -b main → empty commit → gh repo create --private
+        // → git remote add origin → push main (order matters).
+        assertInitGitPipeline(calls, { owner: 'acme', slug: 'my-app' });
+        // Request owner wins — must not need gh api user for owner resolution.
+        assert.equal(ghApiUserCalls(calls).length, 0);
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('init owner falls back: request owner → githubOwner → gh login', async () => {
+    const home = makeTmpHome();
+    try {
+      // 1) request owner wins over githubOwner and login
+      {
+        const { execFile, calls } = makeProductExec({ login: 'login-user' });
+        const handle = await startTestServe(home, {
+          githubOwner: 'serve-org',
+          execFile,
+          execFileSync: execFile,
+        });
+        try {
+          const { res } = await jsonRequest(handle.baseUrl, 'POST', '/api/products', {
+            body: { name: 'A', slug: 'owner-req', source: 'init', owner: 'req-org' },
+          });
+          assert.equal(res.status, 201);
+          const creates = ghRepoCreateCalls(calls);
+          assert.ok(creates[0].args.some((a) => String(a).includes('req-org/owner-req')));
+          assert.equal(ghApiUserCalls(calls).length, 0);
+        } finally {
+          await handle.close();
+        }
+      }
+
+      // 2) --github-owner when request omits owner
+      {
+        const { execFile, calls } = makeProductExec({ login: 'login-user' });
+        const handle = await startTestServe(home, {
+          githubOwner: 'serve-org',
+          execFile,
+          execFileSync: execFile,
+        });
+        try {
+          const { res } = await jsonRequest(handle.baseUrl, 'POST', '/api/products', {
+            body: { name: 'B', slug: 'owner-serve', source: 'init' },
+          });
+          assert.equal(res.status, 201);
+          const creates = ghRepoCreateCalls(calls);
+          assert.ok(creates[0].args.some((a) => String(a).includes('serve-org/owner-serve')));
+          assert.equal(ghApiUserCalls(calls).length, 0);
+        } finally {
+          await handle.close();
+        }
+      }
+
+      // 3) gh login when neither request nor serve owner set
+      {
+        const { execFile, calls } = makeProductExec({ login: 'login-user' });
+        const handle = await startTestServe(home, {
+          githubOwner: undefined,
+          execFile,
+          execFileSync: execFile,
+        });
+        try {
+          const { res } = await jsonRequest(handle.baseUrl, 'POST', '/api/products', {
+            body: { name: 'C', slug: 'owner-login', source: 'init' },
+          });
+          assert.equal(res.status, 201);
+          assert.ok(ghApiUserCalls(calls).length >= 1);
+          const creates = ghRepoCreateCalls(calls);
+          assert.ok(creates[0].args.some((a) => String(a).includes('login-user/owner-login')));
+          assert.equal(readProductJson(home, 'owner-login').remote.owner, 'login-user');
+        } finally {
+          await handle.close();
+        }
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('POST /api/products clone clones url into products/<slug> and writes product.json', async () => {
+    const home = makeTmpHome();
+    try {
+      const { execFile, calls } = makeProductExec();
+      const handle = await startTestServe(home, { execFile, execFileSync: execFile });
+      try {
+        const url = 'https://github.com/org/cloned-app.git';
+        const { res, json } = await jsonRequest(handle.baseUrl, 'POST', '/api/products', {
+          body: { name: 'Cloned App', slug: 'cloned-app', source: 'clone', url },
+        });
+        assert.equal(res.status, 201, `expected 201; got ${res.status}: ${JSON.stringify(json)}`);
+        const product = json?.product ?? json;
+        assert.equal(product.slug, 'cloned-app');
+        assert.equal(product.source, 'clone');
+        assert.ok(
+          product.remote?.url === url || String(product.remote?.url).includes('cloned-app'),
+          'clone product.json must record remote url',
+        );
+
+        const onDisk = readProductJson(home, 'cloned-app');
+        assert.equal(onDisk.source, 'clone');
+        assert.ok(fs.existsSync(path.join(productsDir(home), 'cloned-app', '.git')));
+
+        const cloneCalls = calls.filter(
+          (c) => c.command === 'git' && (c.args[0] === 'clone' || c.args.includes('clone')),
+        );
+        assert.equal(cloneCalls.length, 1);
+        assert.ok(cloneCalls[0].args.includes(url));
+        const dest = path.join(productsDir(home), 'cloned-app');
+        assert.ok(
+          cloneCalls[0].args.some((a) => path.resolve(String(a)) === path.resolve(dest)),
+          `clone dest must be ${dest}; args=${cloneCalls[0].args.join(' ')}`,
+        );
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects invalid slug / missing name (400) and existing slug for init+clone (409)', async () => {
+    const home = makeTmpHome();
+    try {
+      seedProduct(home, 'taken');
+      const { execFile, calls } = makeProductExec();
+      const handle = await startTestServe(home, { execFile, execFileSync: execFile });
+      try {
+        for (const slug of ['Bad_Slug', '-leading', 'trailing-', 'has space', 'UPPER', 'a'.repeat(65)]) {
+          const { res, json } = await jsonRequest(handle.baseUrl, 'POST', '/api/products', {
+            body: { name: 'X', slug, source: 'init' },
+          });
+          assert.equal(res.status, 400, `slug ${JSON.stringify(slug)} → ${res.status}: ${JSON.stringify(json)}`);
+        }
+
+        const missingSlug = await jsonRequest(handle.baseUrl, 'POST', '/api/products', {
+          body: { name: 'X', source: 'init' },
+        });
+        assert.equal(missingSlug.res.status, 400);
+
+        // Required name (+ slug): missing or empty name → 400.
+        const missingName = await jsonRequest(handle.baseUrl, 'POST', '/api/products', {
+          body: { slug: 'needs-name', source: 'init' },
+        });
+        assert.equal(missingName.res.status, 400, 'missing name must be 400');
+
+        const emptyName = await jsonRequest(handle.baseUrl, 'POST', '/api/products', {
+          body: { name: '', slug: 'empty-name', source: 'init' },
+        });
+        assert.equal(emptyName.res.status, 400, 'empty name must be 400');
+
+        const emptyNameClone = await jsonRequest(handle.baseUrl, 'POST', '/api/products', {
+          body: {
+            name: '',
+            slug: 'empty-name-clone',
+            source: 'clone',
+            url: 'https://github.com/org/empty-name-clone.git',
+          },
+        });
+        assert.equal(emptyNameClone.res.status, 400, 'empty name on clone must be 400');
+
+        const badSource = await jsonRequest(handle.baseUrl, 'POST', '/api/products', {
+          body: { name: 'X', slug: 'ok-slug', source: 'local' },
+        });
+        assert.equal(badSource.res.status, 400);
+
+        const cloneNoUrl = await jsonRequest(handle.baseUrl, 'POST', '/api/products', {
+          body: { name: 'X', slug: 'needs-url', source: 'clone' },
+        });
+        assert.equal(cloneNoUrl.res.status, 400);
+
+        const conflictInit = await jsonRequest(handle.baseUrl, 'POST', '/api/products', {
+          body: { name: 'Taken', slug: 'taken', source: 'init' },
+        });
+        assert.equal(conflictInit.res.status, 409, 'init into existing products/<slug> → 409');
+
+        // Clone into an existing products/<slug> dir is also 409 (not only init).
+        const callsBeforeCloneConflict = calls.length;
+        const conflictClone = await jsonRequest(handle.baseUrl, 'POST', '/api/products', {
+          body: {
+            name: 'Taken Clone',
+            slug: 'taken',
+            source: 'clone',
+            url: 'https://github.com/org/taken.git',
+          },
+        });
+        assert.equal(conflictClone.res.status, 409, 'clone into existing products/<slug> → 409');
+        const cloneAttempts = calls
+          .slice(callsBeforeCloneConflict)
+          .filter((c) => c.command === 'git' && (c.args[0] === 'clone' || c.args.includes('clone')));
+        assert.equal(
+          cloneAttempts.length,
+          0,
+          '409 existing slug must reject before git clone runs',
+        );
+
+        // Must not have wiped the existing product.
+        assert.ok(fs.existsSync(path.join(productsDir(home), 'taken', 'product.json')));
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('502 on gh/git failure best-effort deletes the half-created product dir', async () => {
+    const home = makeTmpHome();
+    try {
+      const { execFile } = makeProductExec({ failRepoCreate: true });
+      const handle = await startTestServe(home, { execFile, execFileSync: execFile });
+      try {
+        const { res, json } = await jsonRequest(handle.baseUrl, 'POST', '/api/products', {
+          body: { name: 'Boom', slug: 'boom-app', source: 'init', owner: 'acme' },
+        });
+        assert.equal(res.status, 502, `expected 502; got ${res.status}: ${JSON.stringify(json)}`);
+        assert.equal(
+          fs.existsSync(path.join(productsDir(home), 'boom-app')),
+          false,
+          'half-created product dir must be removed after init failure',
+        );
+      } finally {
+        await handle.close();
+      }
+
+      const { execFile: execClone } = makeProductExec({ failClone: true });
+      const handle2 = await startTestServe(home, { execFile: execClone, execFileSync: execClone });
+      try {
+        const { res } = await jsonRequest(handle2.baseUrl, 'POST', '/api/products', {
+          body: {
+            name: 'Clone Boom',
+            slug: 'clone-boom',
+            source: 'clone',
+            url: 'https://github.com/org/missing.git',
+          },
+        });
+        assert.equal(res.status, 502);
+        assert.equal(
+          fs.existsSync(path.join(productsDir(home), 'clone-boom')),
+          false,
+          'half-created product dir must be removed after clone failure',
+        );
+      } finally {
+        await handle2.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('GET /api/products/:product returns product + recent jobs summary; unknown → 404', async () => {
+    const home = makeTmpHome();
+    try {
+      const dir = seedProduct(home, 'solo', { name: 'Solo App' });
+      seedJob(dir, 'job-aaaa-1111', {
+        product: 'solo',
+        state: 'done',
+        task: 'first',
+        startedAt: '2026-01-01T00:00:00.000Z',
+        finishedAt: '2026-01-01T00:01:00.000Z',
+      });
+      seedJob(dir, 'job-bbbb-2222', {
+        product: 'solo',
+        state: 'running',
+        task: 'second',
+        startedAt: '2026-01-02T00:00:00.000Z',
+        pid: process.pid,
+      });
+      const handle = await startTestServe(home);
+      try {
+        const missing = await jsonRequest(handle.baseUrl, 'GET', '/api/products/nope');
+        assert.equal(missing.res.status, 404);
+
+        const { res, json } = await jsonRequest(handle.baseUrl, 'GET', '/api/products/solo');
+        assert.equal(res.status, 200);
+        const product = json?.product ?? json;
+        assert.equal(product.slug, 'solo');
+        assert.equal(product.name, 'Solo App');
+        const jobs = json?.jobs ?? product.jobs ?? json?.recentJobs;
+        assert.ok(Array.isArray(jobs), 'GET product must include a recent jobs summary array');
+        assert.ok(jobs.length >= 1);
+        assert.ok(jobs.some((j) => j.slug === 'job-bbbb-2222' || j.slug === 'job-aaaa-1111'));
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('PATCH /api/products/:product merges name / remote / defaults; unknown → 404', async () => {
+    const home = makeTmpHome();
+    try {
+      const dir = seedProduct(home, 'patch-me', { name: 'Before' });
+      fs.mkdirSync(path.join(dir, '.git'), { recursive: true });
+      const { execFile, calls } = makeProductExec();
+      const handle = await startTestServe(home, { execFile, execFileSync: execFile });
+      try {
+        const missing = await jsonRequest(handle.baseUrl, 'PATCH', '/api/products/nope', {
+          body: { name: 'X' },
+        });
+        assert.equal(missing.res.status, 404);
+
+        const bad = await jsonRequest(handle.baseUrl, 'PATCH', '/api/products/patch-me', {
+          body: '{',
+        });
+        assert.equal(bad.res.status, 400, `invalid JSON body must be 400; got ${bad.res.status}`);
+
+        const { res, json } = await jsonRequest(handle.baseUrl, 'PATCH', '/api/products/patch-me', {
+          body: {
+            name: 'After',
+            remote: { url: 'https://github.com/acme/patch-me-v2.git' },
+            defaults: { agent: 'cursor', base: 'develop' },
+          },
+        });
+        assert.equal(res.status, 200, `expected 200; got ${res.status}: ${JSON.stringify(json)}`);
+        const product = json?.product ?? json;
+        assert.equal(product.name, 'After');
+        assert.equal(product.defaults?.agent, 'cursor');
+        assert.equal(product.defaults?.base, 'develop');
+        assert.ok(
+          String(product.remote?.url).includes('patch-me-v2'),
+          'PATCH should update remote.url',
+        );
+
+        const onDisk = readProductJson(home, 'patch-me');
+        assert.equal(onDisk.name, 'After');
+        assert.equal(onDisk.defaults.agent, 'cursor');
+        assert.ok(String(onDisk.remote.url).includes('patch-me-v2'));
+
+        // When remote URL changes, sync git remote if practical.
+        const setUrl = calls.filter(
+          (c) => c.command === 'git' && c.args.includes('remote') && c.args.includes('set-url'),
+        );
+        assert.ok(
+          setUrl.length >= 1,
+          `expected git remote set-url after remote.url PATCH; calls=${JSON.stringify(calls.filter((c) => c.command === 'git'))}`,
+        );
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('does not expose DELETE /api/products/:product', async () => {
+    const home = makeTmpHome();
+    try {
+      seedProduct(home, 'keep-me');
+      const handle = await startTestServe(home);
+      try {
+        const { res } = await jsonRequest(handle.baseUrl, 'DELETE', '/api/products/keep-me');
+        assert.ok(
+          res.status === 404 || res.status === 405,
+          `DELETE must not be implemented; got ${res.status}`,
+        );
+        assert.ok(fs.existsSync(path.join(productsDir(home), 'keep-me', 'product.json')));
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('existing product dirs still accept POST /api/products/:product/jobs after products API', async () => {
+    const home = makeTmpHome();
+    try {
+      seedProduct(home, 'job-ready');
+      const started = [];
+      const handle = await startTestServe(home, {
+        concurrency: 1,
+        runDetached: mock.fn(async (prompt, options = {}) => {
+          started.push({ prompt, cwd: options.cwd, pr: options.pr });
+          if (typeof options.exit === 'function') options.exit(0);
+        }),
+      });
+      try {
+        const { res, json } = await jsonRequest(handle.baseUrl, 'POST', '/api/products/job-ready/jobs', {
+          body: { task: 'still works', id: 'id-still' },
+        });
+        assert.ok(
+          res.status === 200 || res.status === 201 || res.status === 202,
+          `jobs route must still work; got ${res.status}`,
+        );
+        assert.ok(json?.slug);
+        await new Promise((r) => setTimeout(r, 50));
+        if (started.length > 0) {
+          assert.equal(started[0].pr, true);
+          assert.equal(
+            path.resolve(started[0].cwd),
+            path.resolve(path.join(productsDir(home), 'job-ready')),
+          );
+        }
       } finally {
         await handle.close();
       }
