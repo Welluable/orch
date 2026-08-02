@@ -415,12 +415,16 @@ describe('Commander continue — ORCH_JOB_SLUG already set (detached child path)
     const cwd = makeTmpCwd();
     const { slug } = seedEligibleContinueJob(cwd);
 
+    // Drop inherited orch job env so this CLI child is truly "foreground"
+    // (spread of process.env alone would keep ORCH_JOB_SLUG when npm test
+    // runs under an orch worker and vacuous-pass the sibling skip-reopen case).
+    const env = { ...process.env, PATH: '/nonexistent-empty-path-for-tests' };
+    delete env.ORCH_JOB_SLUG;
+    delete env.ORCH_DETACHED;
+
     const { code, stderr } = await runCli(
       ['continue', slug, 'follow-up polish', '--agent', 'claude'],
-      {
-        cwd,
-        env: { ...process.env, PATH: '/nonexistent-empty-path-for-tests' },
-      },
+      { cwd, env },
     );
     assert.equal(code, 1);
     assert.match(stderr, /claude not found/i);

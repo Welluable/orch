@@ -81,6 +81,7 @@ From there, either a short path or the full phase sequence runs.
 | Test loop | `test-writer` ⇄ `test-critic` iterate until tests/acceptance criteria are frozen. |
 | Code loop | `code-writer` ⇄ `test-runner` iterate until the runner passes. |
 | Commit | Commits the passing state on the run's branch inside the worktree. |
+| Publish | With `--pr`: pushes `orch/<slug>` and opens a pull request via `gh`. |
 
 `--ask`, `--quick`, and `--dry-run` are alternate entry paths that bypass some
 or all of this table — see [Execution modes](#execution-modes).
@@ -126,6 +127,7 @@ you invoked `orch`, plus a persistent sibling git worktree and branch:
   research.md
   task.md
   status.md
+  pr.md                               # generated PR body (--pr only)
   run.json                            # job state (state, phase, pid, ...); written for every run
   orch.log                            # full stdout/stderr of the run; --detach only
 
@@ -137,7 +139,9 @@ orch/<slug>                           # branch
 paths above. Implementer stages (test-writer, test-critic, code-writer,
 test-runner) run inside the worktree instead. The worktree is never deleted
 automatically — it's left in place after the run so you can inspect,
-continue, or merge the work whenever you're ready.
+continue, or merge the work whenever you're ready. With `--pr`, orch also
+writes `pr.md` and records `base` / `remote` / `pushedAt` / `prUrl` /
+`prNumber` on `run.json`.
 
 `run.json` is written for every invocation — default, `--quick`, `--ask`, and
 `--detach` alike — so `orch list`/`status` always have something to show; see
@@ -173,6 +177,7 @@ agent CLI does all the actual reading and writing of files.
 | `--ask` | Skips triage and all write pipelines; one read-only agent answers and orch prints the reply. | You want an answer about the codebase, not a change. |
 | `--dry-run` | Checks the selected agent CLI is on `PATH` and exits without running the pipeline. | You want to sanity-check your setup before a real run. |
 | `--detach` | Runs the pipeline in a background process and returns immediately, printing the run slug. Manage it with `orch list/status/pause/resume/stop/logs`. | You want to kick off a run and keep using your shell, or run several tasks concurrently. |
+| `--pr` | After a successful commit on the complex path, pushes `orch/<slug>` and opens a pull request with `gh`. | You want a PR instead of a local merge hint (required later for served jobs). |
 
 For `--ask`, Cursor uses `--mode ask`, Claude uses `--permission-mode plan`,
 `agn` is prompt-only best-effort (it has no dedicated read-only flag), and
@@ -184,6 +189,27 @@ every non-`--dry-run` invocation gets one. Combining `--detach` with
 because there's no way to background those modes, not because they'd lack a
 job record. Multiple `--detach` runs can execute concurrently in the same
 directory, each with its own slug.
+
+### Pull requests
+
+`orch "<task>" --pr` adds a publish phase after commit: push
+`orch/<slug>` to `origin`, then open a PR with `gh` (or reuse an existing
+open PR for that head). The PR title is the first line of the task; the
+body is assembled mechanically into `.orch/<slug>/pr.md` from the task
+text, `task.md`, and the files-changed rollup — no agent writes it.
+
+`--base <branch>` names a remote branch (`main`, not `origin/main`). With
+`--pr` it is both the worktree start point (`origin/<base>`) and the PR
+base. Without `--pr`, `--base` alone still starts the worktree at
+`origin/<base>`. When `--pr` is set and `--base` is omitted, orch resolves
+the remote default via `origin/HEAD`.
+
+`--pr` requires `gh` on `PATH` and authenticated (`gh auth status`); that
+check runs before any job is created. It cannot be combined with `--ask`,
+`--quick`, or `--dry-run`. Skips (still `done`): triage → quick-fix, or
+nothing to commit. Failures (job `failed` at `phase: "publish"`, commit
+kept): push rejected or `gh pr create` failed. The local `merge: git merge …`
+hint is suppressed when a PR URL is reported.
 
 ## CLI Reference
 
@@ -204,6 +230,12 @@ Usage: orch [options] [command] <task...>
   tree; creates no artifacts, worktrees, or commits.
 - `--detach` — runs the pipeline in the background and returns immediately,
   printing `started <slug> (pid <pid>)`; rejects `--ask`/`--quick`/`--dry-run`.
+- `--pr` — after a successful commit, push `orch/<slug>` and open a pull
+  request with `gh`; requires `gh` on `PATH` and authenticated; rejects
+  `--ask`/`--quick`/`--dry-run`. See [Pull requests](#pull-requests).
+- `--base <branch>` — remote base branch for the worktree start point
+  (`origin/<branch>`) and, with `--pr`, the pull request base; defaults to
+  the remote's default branch when `--pr` is set without `--base`.
 - `--max-rounds <n>` — max writer⇄critic and writer⇄runner iterations per
   implementer loop; defaults to `5`, ignored with `--ask` and `--quick`.
 - `--fan-out` — decomposes the task into parallel workers coordinated by this
@@ -272,6 +304,8 @@ orch "fix the typo in the README" --agent opencode
 orch --ask "where is the CLI entrypoint?" --agent claude
 orch --ask "where is package.json?" --agent opencode
 orch --quick "fix the typo in the README" --agent claude
+orch "implement the flag" --pr --agent claude
+orch "implement the flag" --pr --base develop --agent claude
 orch "noop" --dry-run --agent cursor
 orch "noop" --dry-run --agent opencode
 orch config
@@ -498,6 +532,7 @@ layout shown in [Artifacts and worktrees](#artifacts-and-worktrees):
   research.md
   task.md
   status.md
+  pr.md                               # --pr only
   run.json                            # written for every run
   orch.log                            # --detach only
 
@@ -539,6 +574,7 @@ pkill -f 'opencode run' # --agent opencode
   Code), `agn`, or `opencode` (OpenCode `>= 1.17.18`).
 - Git, for any run that isn't `--ask` or `--quick` (worktrees and commits
   need it).
+- The GitHub CLI (`gh`) on `PATH` and authenticated, when using `--pr`.
 
 ## Development
 
