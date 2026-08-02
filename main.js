@@ -17,6 +17,12 @@ import { splitStageSummary, printStageSummary, resolveStageSummary } from './lib
 import { createRunContext } from './lib/run-context.js';
 import { createWorktree } from './lib/worktree.js';
 import { commitWorktree, collectWorktreeChanges, printFilesChanged } from './lib/commit.js';
+import {
+    resolveBaseBranch,
+    fetchBase,
+    publish as realPublish,
+} from './lib/publish.js';
+import { buildPrTitle, buildPrBody } from './lib/pr-body.js';
 import { FileTracker } from './lib/file-tracker.js';
 import { allocateJob } from './lib/job-lifecycle.js';
 import { setJobSlug, exitCodeForSignal, formatElapsed, flushFailureLog, beginStageCapture } from './lib/agent.js';
@@ -157,6 +163,28 @@ function ensureBinaryOnPath(binary, agentName) {
     }
 }
 
+/** Require `gh` on PATH and authenticated. Used before allocateJob when `--pr`. */
+function ensureGhAuthenticated() {
+    if (!isBinaryOnPath('gh')) {
+        console.error('gh not found; install the GitHub CLI (https://cli.github.com) to use --pr');
+        process.exit(1);
+    }
+    try {
+        execFileSync('gh', ['auth', 'status'], {
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'pipe'],
+        });
+    } catch (err) {
+        const detail = String(err.stderr || err.message || '').trim();
+        console.error(
+            detail
+                ? `gh is not authenticated: ${detail}`
+                : 'gh is not authenticated; run gh auth login',
+        );
+        process.exit(1);
+    }
+}
+
 const TERMINAL_JOB_STATES = ['done', 'failed', 'stopped', 'crashed'];
 
 function formatRelativeTime(iso) {
@@ -263,6 +291,13 @@ export function formatStatus(cwd, record) {
         `exitCode: ${record.exitCode ?? '-'}`,
         `log:      ${record.logPath ?? '-'}`,
     ];
+
+    if (record.base) {
+        lines.push(`base:     ${record.base}`);
+    }
+    if (record.prUrl) {
+        lines.push(`pr:       ${record.prUrl}`);
+    }
 
     if (record.parent) {
         lines.splice(1, 0, `parent:   ${record.parent}`);
@@ -670,6 +705,14 @@ export async function runPipeline(prompt, options) {
     const createWorktreeFn = options.createWorktree ?? createWorktree;
     const commitWorktreeFn = options.commitWorktree ?? commitWorktree;
     const collectWorktreeChangesFn = options.collectWorktreeChanges ?? collectWorktreeChanges;
+    const resolveBaseBranchFn = options.resolveBaseBranch ?? resolveBaseBranch;
+    const fetchBaseFn = options.fetchBase ?? fetchBase;
+    const publishFn = options.publish ?? ((args) => realPublish({
+        ...args,
+        pushBranch: options.pushBranch,
+        findOpenPullRequest: options.findOpenPullRequest,
+        createPullRequest: options.createPullRequest,
+    }));
     const invocationCwd = process.cwd();
 
     const jobSlug = options.jobSlug ?? process.env.ORCH_JOB_SLUG;
@@ -768,7 +811,20 @@ export async function runPipeline(prompt, options) {
         triage.options,
     );
 
+    let resolvedBase = options.base ?? null;
+
     try {
+        // Resolve/fetch base before any stage when --pr or --base is set.
+        if (options.pr || options.base) {
+            if (!resolvedBase) {
+                resolvedBase = resolveBaseBranchFn({ cwd: invocationCwd });
+            }
+            fetchBaseFn({ cwd: invocationCwd, remote: 'origin', base: resolvedBase });
+            if (options.pr) {
+                jobPatch({ base: resolvedBase, remote: 'origin' });
+            }
+        }
+
         jobPatch({ phase: 'triage', stage: 'triage', round: null });
         await jobCheckpoint();
         const triageResult = await triageAgent.run({ verbose });
@@ -796,6 +852,9 @@ export async function runPipeline(prompt, options) {
             await jobCheckpoint();
             const { content: quickFixContent, summary: quickFixSummary } = splitStageSummary(quickFixResult.result);
             printStageSummary('quick-fix', resolveStageSummary('quick-fix', quickFixSummary, quickFixContent), quickFixTracker.getFiles());
+            if (options.pr) {
+                console.log('pr: skipped (quick fix, no branch)');
+            }
             jobPatch({ state: 'done', exitCode: 0, finishedAt: new Date().toISOString() });
             return;
         }
@@ -844,7 +903,11 @@ export async function runPipeline(prompt, options) {
         printStageSummary('planner', resolveStageSummary('planner', plannerSummary, plannerContent));
 
         jobPatch({ phase: 'worktree', stage: 'worktree', round: null });
-        const worktree = createWorktreeFn({ cwd: invocationCwd, slug: runContext.slug });
+        const worktree = createWorktreeFn({
+            cwd: invocationCwd,
+            slug: runContext.slug,
+            ...(resolvedBase ? { base: `origin/${resolvedBase}` } : {}),
+        });
         jobPatch({ branch: worktree.branch, worktree: worktree.worktreePath });
 
         fs.mkdirSync(path.dirname(runContext.statusPath), { recursive: true });
@@ -909,7 +972,45 @@ export async function runPipeline(prompt, options) {
                 `\n## Commit\n\n- SHA: \`${commitResult.sha}\`\n- Branch: \`${commitResult.branch}\`\n`,
             );
             console.log(`commit: ${commitResult.sha.slice(0, 7)} on ${commitResult.branch}`);
-            console.log(`merge:  git merge ${commitResult.branch}`);
+
+            if (options.pr) {
+                jobPatch({ phase: 'publish', stage: 'publish', round: null });
+                const plan = fs.existsSync(runContext.taskPath)
+                    ? fs.readFileSync(runContext.taskPath, 'utf8')
+                    : '';
+                const bodyPath = path.join(runContext.artifactDir, 'pr.md');
+                fs.writeFileSync(
+                    bodyPath,
+                    buildPrBody({
+                        task: prompt,
+                        plan,
+                        changes: worktreeChanges,
+                        slug: runContext.slug,
+                        agent: options.agent,
+                        version,
+                    }),
+                );
+                const prResult = publishFn({
+                    worktreePath: worktree.worktreePath,
+                    remote: 'origin',
+                    branch: worktree.branch,
+                    base: resolvedBase,
+                    title: buildPrTitle(prompt),
+                    bodyPath,
+                });
+                jobPatch({
+                    pushedAt: new Date().toISOString(),
+                    prUrl: prResult.url,
+                    prNumber: prResult.number,
+                });
+                fs.appendFileSync(
+                    runContext.statusPath,
+                    `\n## Pull request\n\n- ${prResult.url}\n`,
+                );
+                console.log(`pr:     ${prResult.url}`);
+            } else {
+                console.log(`merge:  git merge ${commitResult.branch}`);
+            }
             console.log(`next:   orch continue ${runContext.slug} "…"`);
         } else {
             fs.appendFileSync(
@@ -917,6 +1018,9 @@ export async function runPipeline(prompt, options) {
                 `\n## Commit\n\n- No changes to commit on \`${commitResult.branch}\`.\n`,
             );
             console.log(`commit: no changes on ${commitResult.branch}`);
+            if (options.pr) {
+                console.log('pr: skipped (no changes)');
+            }
         }
 
         patchTerminalJob(patchJobFn, jobCwd, jobSlug, {
@@ -962,6 +1066,8 @@ export async function runDetached(prompt, options = {}) {
         seq = false,
         maxUnits = 8,
         notify,
+        pr = false,
+        base,
         createRunContext: createRunContextFn = createRunContext,
         spawn: spawnFn = spawn,
         exit = (code) => process.exit(code),
@@ -976,6 +1082,10 @@ export async function runDetached(prompt, options = {}) {
         console.error(binaryMissingHint(agent));
         exit(1);
         return;
+    }
+
+    if (pr) {
+        ensureGhAuthenticated();
     }
 
     const { slug } = allocateJob({
@@ -996,6 +1106,8 @@ export async function runDetached(prompt, options = {}) {
     if (seq) {
         childArgs.push('--seq', '--max-units', String(maxUnits));
     }
+    if (pr) childArgs.push('--pr');
+    if (base) childArgs.push('--base', base);
     appendNotifyArgs(childArgs, notify);
 
     const child = spawnFn(process.execPath, childArgs, {
@@ -4414,6 +4526,8 @@ program
     .option('--ask', 'Ask a read-only question about the codebase; print the reply and exit (skips triage and all write pipelines)')
     .option('--quick', 'Skip triage, run quick-fix directly in the current working tree; create no artifacts, worktrees, or commits')
     .option('--detach', 'Run the pipeline in the background and return immediately; manage it with orch list/status/pause/resume/stop/logs. Cannot be combined with --ask, --quick, or --dry-run')
+    .option('--pr', 'After a successful commit, push orch/<slug> and open a pull request with gh. Requires gh on PATH and authenticated. Cannot be combined with --ask, --quick, or --dry-run')
+    .option('--base <branch>', 'Remote base branch for the worktree start point and (with --pr) the pull request base; defaults to the remote\'s default branch when --pr is set')
     .option('--max-rounds <n>', 'Max writer⇄critic and writer⇄runner iterations per implementer loop (ignored with --ask and --quick)', positiveIntParser('--max-rounds'), 5)
     .option('--fan-out', 'Decompose into parallel workers, then integrate once. Cannot be combined with --ask, --quick, --dry-run, or --seq')
     .option('--seq', 'Decompose into ordered units; merge each, then adjust the next. Cannot be combined with --fan-out, --ask, --quick, or --dry-run')
@@ -4449,6 +4563,8 @@ Examples:
 
 Headless runs:
   $ orch "long-running task" --detach --agent claude   # start in the background, prints the run slug
+  $ orch "implement the flag" --pr --agent claude      # push and open a PR after commit
+  $ orch "implement the flag" --pr --base develop      # PR against develop; worktree starts at origin/develop
   $ orch list                                          # show all tracked runs
   $ orch status [slug]                                 # show full status (defaults to most recent)
   $ orch pause <slug>                                  # request a pause at the next stage boundary
@@ -4517,6 +4633,18 @@ Sequential (--seq):
             console.error('Error: --seq cannot be combined with --fan-out');
             process.exit(1);
             return;
+        }
+
+        if (options.pr) {
+            const prConflicts = ['ask', 'quick', 'dryRun']
+                .filter((key) => options[key])
+                .map((key) => `--${key === 'dryRun' ? 'dry-run' : key}`);
+            if (prConflicts.length > 0) {
+                console.error(`Error: --pr cannot be combined with ${prConflicts.join(', ')}`);
+                process.exit(1);
+                return;
+            }
+            ensureGhAuthenticated();
         }
 
         if (options.seq) {

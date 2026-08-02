@@ -101,6 +101,31 @@ describe('createWorktree (injected execFile, argument-level)', () => {
     ]);
   });
 
+  it('accepts an origin/<base> remote-ref start point the same way (publish path)', () => {
+    const { execFile, calls } = makeFakeExecFile([
+      { match: isShowToplevel, stdout: '/repo/root\n' },
+      { match: isWorktreeAdd, stdout: '' },
+    ]);
+
+    createWorktree({
+      cwd: '/repo/root',
+      slug: 'brave-kestrel-0ad0',
+      base: 'origin/main',
+      execFile,
+    });
+
+    assert.deepEqual(calls[1].args, [
+      '-C',
+      '/repo/root',
+      'worktree',
+      'add',
+      '-b',
+      'orch/brave-kestrel-0ad0',
+      '/repo/root-brave-kestrel-0ad0',
+      'origin/main',
+    ]);
+  });
+
   it('rejects a non-git cwd by propagating the rev-parse failure', () => {
     const gitError = Object.assign(new Error('git failed'), {
       stderr: 'fatal: not a git repository (or any of the parent directories): .git',

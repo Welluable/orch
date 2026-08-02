@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { runPipeline, formatStatus } from '../main.js';
+import { runPipeline, formatStatus, runDetached } from '../main.js';
 import { jobPaths, readJob, writeJob, patchJob as realPatchJob } from '../lib/jobs.js';
 import * as agentLib from '../lib/agent.js';
 
@@ -56,10 +56,10 @@ function seedForegroundJob(tmpCwd, slug, task) {
   });
 }
 
-function runCli(args, { env = process.env } = {}) {
+function runCli(args, { cwd = path.join(__dirname, '..'), env = process.env } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [mainPath, ...args], {
-      cwd: path.join(__dirname, '..'),
+      cwd,
       env,
     });
 
@@ -76,6 +76,17 @@ function runCli(args, { env = process.env } = {}) {
     child.on('close', (code) => {
       resolve({ code, stdout, stderr });
     });
+  });
+}
+
+/** Minimal fake detach spawn used by --pr/--base argv-forwarding checks. */
+function fakeDetachSpawn(pid) {
+  return mock.fn(() => {
+    const child = {
+      pid,
+      unref() {},
+    };
+    return child;
   });
 }
 
@@ -96,7 +107,7 @@ describe('main.js CLI', () => {
     assert.match(stdout, /opencode/);
   });
 
-  it('help output mentions --agent, --verbose, --dry-run, --max-rounds, --ask, and --quick', async () => {
+  it('help output mentions --agent, --verbose, --dry-run, --max-rounds, --ask, --quick, --pr, and --base', async () => {
     const { code, stdout } = await runCli(['--help']);
     assert.equal(code, 0);
     assert.match(stdout, /--verbose/);
@@ -105,6 +116,8 @@ describe('main.js CLI', () => {
     assert.match(stdout, /--max-rounds/);
     assert.match(stdout, /--ask/);
     assert.match(stdout, /--quick/);
+    assert.match(stdout, /--pr/);
+    assert.match(stdout, /--base/);
   });
 
   it('--dry-run reports readiness without running the pipeline', async () => {
@@ -1582,6 +1595,8 @@ describe('runPipeline --ask (read-only Q&A)', () => {
   it('never calls patchJob for --ask when no job is active (jobSlug unset) — existing no-job behavior is unchanged', async () => {
     const MockAgentClass = createMockAgentClass({ ask: { ok: true, result: 'answer' } });
     const patchJobMock = mock.fn();
+    const prevJobSlug = process.env.ORCH_JOB_SLUG;
+    delete process.env.ORCH_JOB_SLUG;
 
     const logSpy = mock.method(console, 'log', () => {});
     const errorSpy = mock.method(console, 'error', () => {});
@@ -1600,6 +1615,8 @@ describe('runPipeline --ask (read-only Q&A)', () => {
       logSpy.mock.restore();
       errorSpy.mock.restore();
       exitSpy.mock.restore();
+      if (prevJobSlug === undefined) delete process.env.ORCH_JOB_SLUG;
+      else process.env.ORCH_JOB_SLUG = prevJobSlug;
     }
 
     assert.equal(patchJobMock.mock.calls.length, 0);
@@ -1869,6 +1886,8 @@ describe('runPipeline --quick (skip triage → quick-fix)', () => {
     const commitWorktreeMock = mock.fn(() => fakeCommitResult('orch/stub-stub-0000'));
     const MockAgentClass = createMockAgentClass({ 'quick-fix': { ok: true, result: 'fixed' } });
     const patchJobMock = mock.fn();
+    const prevJobSlug = process.env.ORCH_JOB_SLUG;
+    delete process.env.ORCH_JOB_SLUG;
 
     const logSpy = mock.method(console, 'log', () => {});
     const errorSpy = mock.method(console, 'error', () => {});
@@ -1887,6 +1906,8 @@ describe('runPipeline --quick (skip triage → quick-fix)', () => {
       logSpy.mock.restore();
       errorSpy.mock.restore();
       exitSpy.mock.restore();
+      if (prevJobSlug === undefined) delete process.env.ORCH_JOB_SLUG;
+      else process.env.ORCH_JOB_SLUG = prevJobSlug;
     }
 
     assert.equal(patchJobMock.mock.calls.length, 0);
@@ -2590,6 +2611,8 @@ describe('runPipeline job-record patching for the plain/full pipeline (universal
     const worktree = fakeWorktree(invocationCwd);
     const MockAgentClass = createMockAgentClass(complexPassBehaviors());
     const patchJobMock = mock.fn();
+    const prevJobSlug = process.env.ORCH_JOB_SLUG;
+    delete process.env.ORCH_JOB_SLUG;
 
     const logSpy = mock.method(console, 'log', () => {});
     try {
@@ -2603,6 +2626,8 @@ describe('runPipeline job-record patching for the plain/full pipeline (universal
       });
     } finally {
       logSpy.mock.restore();
+      if (prevJobSlug === undefined) delete process.env.ORCH_JOB_SLUG;
+      else process.env.ORCH_JOB_SLUG = prevJobSlug;
     }
 
     assert.equal(patchJobMock.mock.calls.length, 0);
@@ -3004,6 +3029,733 @@ describe('runPipeline failure.log persistence without -v', () => {
       );
     } finally {
       fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * Contract for `.spec/publish.md` (unit 01-publish): `--pr` / `--base` flags,
+ * publish DI after commit, skip/failure rules, merge-hint suppression, status
+ * rows, detach argv forwarding, and startup `gh` validation.
+ */
+describe('runPipeline publish (--pr)', () => {
+  function collectLogs() {
+    const logs = [];
+    const restore = mock.method(console, 'log', (...args) => logs.push(args.map(String).join(' ')));
+    return { logs, restore: () => restore.mock.restore() };
+  }
+
+  const sampleChanges = {
+    files: [
+      { status: 'M', path: 'main.js' },
+      { status: 'A', path: 'lib/publish.js' },
+    ],
+    shortstat: '2 files changed, 118 insertions(+), 3 deletions(-)',
+  };
+
+  it('with --pr: publish runs after commit; run.json gains pushedAt/prUrl/prNumber; status.md gains a PR section; merge hint is suppressed', async () => {
+    const tmpCwd = makeTmpCwd('orch-publish-pr-');
+    try {
+      const slug = 'publish-pr-ok-0000';
+      seedForegroundJob(tmpCwd, slug, 'Add publish phase');
+      const runContext = fakeRunContext(tmpCwd, slug);
+      fs.mkdirSync(runContext.artifactDir, { recursive: true });
+      fs.writeFileSync(runContext.taskPath, '- [ ] wire --pr\n', 'utf8');
+      fs.writeFileSync(runContext.statusPath, `# Status\n\n- Slug: \`${slug}\`\n`, 'utf8');
+      const worktree = fakeWorktree(tmpCwd, slug);
+      const MockAgentClass = createMockAgentClass(complexPassBehaviors());
+      const patchCalls = [];
+      const patchJobMock = realDiskPatchJobSpy(patchCalls);
+      const publishMock = mock.fn(() => ({
+        url: 'https://github.com/owner/repo/pull/42',
+        number: 42,
+      }));
+      const createWorktreeMock = mock.fn(() => worktree);
+      const resolveBaseBranchMock = mock.fn(() => 'main');
+      const fetchBaseMock = mock.fn(() => {});
+
+      const { logs, restore } = collectLogs();
+      try {
+        await runPipeline('Add publish phase', {
+          agent: 'claude',
+          pr: true,
+          AgentClass: MockAgentClass,
+          createRunContext: mock.fn(() => runContext),
+          createWorktree: createWorktreeMock,
+          commitWorktree: mock.fn(() => fakeCommitResult(worktree.branch)),
+          collectWorktreeChanges: mock.fn(() => sampleChanges),
+          resolveBaseBranch: resolveBaseBranchMock,
+          fetchBase: fetchBaseMock,
+          publish: publishMock,
+          jobSlug: slug,
+          jobCwd: tmpCwd,
+          patchJob: patchJobMock,
+        });
+      } finally {
+        restore();
+      }
+
+      assert.equal(resolveBaseBranchMock.mock.calls.length, 1);
+      assert.equal(fetchBaseMock.mock.calls.length, 1);
+      assert.equal(createWorktreeMock.mock.calls[0].arguments[0].base, 'origin/main');
+
+      assert.equal(publishMock.mock.calls.length, 1);
+      const publishArg = publishMock.mock.calls[0].arguments[0];
+      assert.equal(publishArg.worktreePath, worktree.worktreePath);
+      assert.equal(publishArg.branch, worktree.branch);
+      assert.equal(publishArg.base, 'main');
+      assert.ok(publishArg.bodyPath?.endsWith(`${path.sep}pr.md`) || publishArg.bodyPath?.endsWith('/pr.md'));
+
+      const prMdPath = path.join(runContext.artifactDir, 'pr.md');
+      assert.equal(fs.existsSync(prMdPath), true, 'pr.md must be written under the run dir');
+
+      const phases = patchCalls.filter((c) => c.fields.phase).map((c) => c.fields.phase);
+      assert.ok(phases.includes('publish'), `expected publish phase in ${JSON.stringify(phases)}`);
+      assert.ok(
+        phases.indexOf('publish') > phases.indexOf('commit'),
+        'publish must follow commit',
+      );
+
+      const record = readJob(tmpCwd, slug);
+      assert.equal(record.state, 'done');
+      assert.equal(record.exitCode, 0);
+      assert.equal(record.base, 'main');
+      assert.equal(record.remote, 'origin');
+      assert.equal(record.prUrl, 'https://github.com/owner/repo/pull/42');
+      assert.equal(record.prNumber, 42);
+      assert.ok(record.pushedAt, 'pushedAt must be set');
+
+      const status = fs.readFileSync(runContext.statusPath, 'utf8');
+      assert.match(status, /## (Pull request|PR)/i);
+      assert.match(status, /github\.com\/owner\/repo\/pull\/42/);
+
+      const joined = logs.join('\n');
+      assert.match(joined, /pr:\s+https:\/\/github\.com\/owner\/repo\/pull\/42/);
+      assert.doesNotMatch(joined, /merge:\s+git merge/);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('without --pr: no publish call, merge hint still printed, no pr.md, no PR fields in run.json', async () => {
+    const tmpCwd = makeTmpCwd('orch-publish-nopr-');
+    try {
+      const slug = 'publish-nopr-0000';
+      seedForegroundJob(tmpCwd, slug, 'Add publish phase');
+      const runContext = fakeRunContext(tmpCwd, slug);
+      fs.mkdirSync(runContext.artifactDir, { recursive: true });
+      fs.writeFileSync(runContext.statusPath, `# Status\n\n- Slug: \`${slug}\`\n`, 'utf8');
+      const worktree = fakeWorktree(tmpCwd, slug);
+      const MockAgentClass = createMockAgentClass(complexPassBehaviors());
+      const publishMock = mock.fn(() => {
+        throw new Error('publish must not be called without --pr');
+      });
+      const resolveBaseBranchMock = mock.fn(() => {
+        throw new Error('resolveBaseBranch must not run without --pr/--base');
+      });
+
+      const { logs, restore } = collectLogs();
+      try {
+        await runPipeline('Add publish phase', {
+          agent: 'claude',
+          AgentClass: MockAgentClass,
+          createRunContext: mock.fn(() => runContext),
+          createWorktree: mock.fn(() => worktree),
+          commitWorktree: mock.fn(() => fakeCommitResult(worktree.branch)),
+          collectWorktreeChanges: mock.fn(() => sampleChanges),
+          resolveBaseBranch: resolveBaseBranchMock,
+          publish: publishMock,
+          jobSlug: slug,
+          jobCwd: tmpCwd,
+          patchJob: realDiskPatchJobSpy([]),
+        });
+      } finally {
+        restore();
+      }
+
+      assert.equal(publishMock.mock.calls.length, 0);
+      assert.equal(resolveBaseBranchMock.mock.calls.length, 0);
+      assert.equal(fs.existsSync(path.join(runContext.artifactDir, 'pr.md')), false);
+
+      const record = readJob(tmpCwd, slug);
+      assert.equal(record.prUrl, undefined);
+      assert.equal(record.prNumber, undefined);
+      assert.equal(record.pushedAt, undefined);
+      assert.equal(record.base, undefined);
+
+      const joined = logs.join('\n');
+      assert.match(joined, new RegExp(`merge:\\s+git merge ${escapeRegex(worktree.branch)}`));
+      assert.doesNotMatch(joined, /^pr:/m);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('with --base alone: worktree starts at origin/<base> but publish is not invoked', async () => {
+    const tmpCwd = makeTmpCwd('orch-publish-base-only-');
+    try {
+      const slug = 'publish-base-only-0000';
+      seedForegroundJob(tmpCwd, slug, 'Add publish phase');
+      const runContext = fakeRunContext(tmpCwd, slug);
+      const worktree = fakeWorktree(tmpCwd, slug);
+      const MockAgentClass = createMockAgentClass(complexPassBehaviors());
+      const createWorktreeMock = mock.fn(() => worktree);
+      const fetchBaseMock = mock.fn(() => {});
+      const publishMock = mock.fn(() => {
+        throw new Error('publish must not run for --base without --pr');
+      });
+
+      const logSpy = mock.method(console, 'log', () => {});
+      try {
+        await runPipeline('Add publish phase', {
+          agent: 'claude',
+          base: 'develop',
+          AgentClass: MockAgentClass,
+          createRunContext: mock.fn(() => runContext),
+          createWorktree: createWorktreeMock,
+          commitWorktree: mock.fn(() => fakeCommitResult(worktree.branch)),
+          collectWorktreeChanges: mock.fn(() => null),
+          fetchBase: fetchBaseMock,
+          publish: publishMock,
+          jobSlug: slug,
+          jobCwd: tmpCwd,
+          patchJob: realDiskPatchJobSpy([]),
+        });
+      } finally {
+        logSpy.mock.restore();
+      }
+
+      assert.equal(fetchBaseMock.mock.calls.length, 1);
+      assert.equal(fetchBaseMock.mock.calls[0].arguments[0].base, 'develop');
+      assert.equal(createWorktreeMock.mock.calls[0].arguments[0].base, 'origin/develop');
+      assert.equal(publishMock.mock.calls.length, 0);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('with --pr and explicit --base: skips resolveBaseBranch; origin/<base> and PR base use the flag', async () => {
+    const tmpCwd = makeTmpCwd('orch-publish-pr-base-');
+    try {
+      const slug = 'publish-pr-base-0000';
+      seedForegroundJob(tmpCwd, slug, 'Add publish phase');
+      const runContext = fakeRunContext(tmpCwd, slug);
+      fs.mkdirSync(runContext.artifactDir, { recursive: true });
+      fs.writeFileSync(runContext.statusPath, `# Status\n\n- Slug: \`${slug}\`\n`, 'utf8');
+      const worktree = fakeWorktree(tmpCwd, slug);
+      const MockAgentClass = createMockAgentClass(complexPassBehaviors());
+      const createWorktreeMock = mock.fn(() => worktree);
+      const resolveBaseBranchMock = mock.fn(() => {
+        throw new Error('resolveBaseBranch must not run when --base is explicit');
+      });
+      const fetchBaseMock = mock.fn(() => {});
+      const publishMock = mock.fn(() => ({
+        url: 'https://github.com/owner/repo/pull/11',
+        number: 11,
+      }));
+
+      const logSpy = mock.method(console, 'log', () => {});
+      try {
+        await runPipeline('Add publish phase', {
+          agent: 'claude',
+          pr: true,
+          base: 'develop',
+          AgentClass: MockAgentClass,
+          createRunContext: mock.fn(() => runContext),
+          createWorktree: createWorktreeMock,
+          commitWorktree: mock.fn(() => fakeCommitResult(worktree.branch)),
+          collectWorktreeChanges: mock.fn(() => sampleChanges),
+          resolveBaseBranch: resolveBaseBranchMock,
+          fetchBase: fetchBaseMock,
+          publish: publishMock,
+          jobSlug: slug,
+          jobCwd: tmpCwd,
+          patchJob: realDiskPatchJobSpy([]),
+        });
+      } finally {
+        logSpy.mock.restore();
+      }
+
+      assert.equal(resolveBaseBranchMock.mock.calls.length, 0);
+      assert.equal(fetchBaseMock.mock.calls.length, 1);
+      assert.equal(fetchBaseMock.mock.calls[0].arguments[0].base, 'develop');
+      assert.equal(createWorktreeMock.mock.calls[0].arguments[0].base, 'origin/develop');
+      assert.equal(publishMock.mock.calls.length, 1);
+      assert.equal(publishMock.mock.calls[0].arguments[0].base, 'develop');
+
+      const record = readJob(tmpCwd, slug);
+      assert.equal(record.state, 'done');
+      assert.equal(record.base, 'develop');
+      assert.equal(record.prUrl, 'https://github.com/owner/repo/pull/11');
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('skip: triage → quick-fix with --pr prints a skip line and ends done', async () => {
+    const tmpCwd = makeTmpCwd('orch-publish-skip-quick-');
+    try {
+      const slug = 'publish-skip-quick-0000';
+      seedForegroundJob(tmpCwd, slug, 'fix the typo');
+      const MockAgentClass = createMockAgentClass({
+        triage: SIMPLE_TRIAGE,
+        'quick-fix': { ok: true, result: withSummary('fixed', QUICK_FIX_SUMMARY) },
+      });
+      const publishMock = mock.fn(() => {
+        throw new Error('publish must not run on quick-fix skip');
+      });
+
+      const { logs, restore } = collectLogs();
+      const exitSpy = mock.method(process, 'exit', () => {});
+      try {
+        await runPipeline('fix the typo', {
+          agent: 'claude',
+          pr: true,
+          AgentClass: MockAgentClass,
+          createRunContext: mock.fn(() => {
+            throw new Error('createRunContext must not be called on quick-fix');
+          }),
+          createWorktree: mock.fn(() => {
+            throw new Error('createWorktree must not be called on quick-fix');
+          }),
+          publish: publishMock,
+          resolveBaseBranch: mock.fn(() => 'main'),
+          fetchBase: mock.fn(() => {}),
+          jobSlug: slug,
+          jobCwd: tmpCwd,
+          patchJob: realDiskPatchJobSpy([]),
+        });
+      } finally {
+        restore();
+        exitSpy.mock.restore();
+      }
+
+      assert.equal(publishMock.mock.calls.length, 0);
+      const joined = logs.join('\n');
+      assert.match(joined, /pr:\s+skipped \(quick fix, no branch\)/);
+      const record = readJob(tmpCwd, slug);
+      assert.equal(record.state, 'done');
+      assert.equal(record.exitCode, 0);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('skip: committed: false with --pr prints a skip line and ends done', async () => {
+    const tmpCwd = makeTmpCwd('orch-publish-skip-clean-');
+    try {
+      const slug = 'publish-skip-clean-0000';
+      seedForegroundJob(tmpCwd, slug, 'Add publish phase');
+      const runContext = fakeRunContext(tmpCwd, slug);
+      fs.mkdirSync(runContext.artifactDir, { recursive: true });
+      fs.writeFileSync(runContext.statusPath, `# Status\n\n- Slug: \`${slug}\`\n`, 'utf8');
+      const worktree = fakeWorktree(tmpCwd, slug);
+      const MockAgentClass = createMockAgentClass(complexPassBehaviors());
+      const publishMock = mock.fn(() => {
+        throw new Error('publish must not run when there is nothing to commit');
+      });
+
+      const { logs, restore } = collectLogs();
+      const exitSpy = mock.method(process, 'exit', () => {});
+      try {
+        await runPipeline('Add publish phase', {
+          agent: 'claude',
+          pr: true,
+          AgentClass: MockAgentClass,
+          createRunContext: mock.fn(() => runContext),
+          createWorktree: mock.fn(() => worktree),
+          commitWorktree: mock.fn(() => ({ committed: false, sha: null, branch: worktree.branch })),
+          collectWorktreeChanges: mock.fn(() => null),
+          resolveBaseBranch: mock.fn(() => 'main'),
+          fetchBase: mock.fn(() => {}),
+          publish: publishMock,
+          jobSlug: slug,
+          jobCwd: tmpCwd,
+          patchJob: realDiskPatchJobSpy([]),
+        });
+      } finally {
+        restore();
+        exitSpy.mock.restore();
+      }
+
+      assert.equal(publishMock.mock.calls.length, 0);
+      assert.match(logs.join('\n'), /pr:\s+skipped \(no changes\)/);
+      const record = readJob(tmpCwd, slug);
+      assert.equal(record.state, 'done');
+      assert.equal(record.exitCode, 0);
+      assert.equal(fs.existsSync(path.join(runContext.artifactDir, 'pr.md')), false);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('failure: throwing pushBranch leaves state failed at phase publish with commit SHA intact', async () => {
+    const tmpCwd = makeTmpCwd('orch-publish-fail-push-');
+    try {
+      const slug = 'publish-fail-push-0000';
+      seedForegroundJob(tmpCwd, slug, 'Add publish phase');
+      const runContext = fakeRunContext(tmpCwd, slug);
+      fs.mkdirSync(runContext.artifactDir, { recursive: true });
+      fs.writeFileSync(runContext.statusPath, `# Status\n\n- Slug: \`${slug}\`\n`, 'utf8');
+      const worktree = fakeWorktree(tmpCwd, slug);
+      const sha = 'deadbeefcafebabe0000000000000000000000';
+      const MockAgentClass = createMockAgentClass(complexPassBehaviors());
+      const pushBranchMock = mock.fn(() => {
+        throw new Error('git push -u origin orch/publish-fail-push-0000 failed: remote rejected');
+      });
+      const findOpenPullRequestMock = mock.fn(() => null);
+      const createPullRequestMock = mock.fn(() => {
+        throw new Error('createPullRequest must not run after pushBranch throws');
+      });
+
+      const logSpy = mock.method(console, 'log', () => {});
+      const errorSpy = mock.method(console, 'error', () => {});
+      const exitSpy = mock.method(process, 'exit', () => {});
+      try {
+        await runPipeline('Add publish phase', {
+          agent: 'claude',
+          pr: true,
+          AgentClass: MockAgentClass,
+          createRunContext: mock.fn(() => runContext),
+          createWorktree: mock.fn(() => worktree),
+          commitWorktree: mock.fn(() => ({ committed: true, sha, branch: worktree.branch })),
+          collectWorktreeChanges: mock.fn(() => sampleChanges),
+          resolveBaseBranch: mock.fn(() => 'main'),
+          fetchBase: mock.fn(() => {}),
+          // Real publish orchestration — inject the failing step, not an opaque publish().
+          pushBranch: pushBranchMock,
+          findOpenPullRequest: findOpenPullRequestMock,
+          createPullRequest: createPullRequestMock,
+          jobSlug: slug,
+          jobCwd: tmpCwd,
+          patchJob: realDiskPatchJobSpy([]),
+        });
+      } finally {
+        logSpy.mock.restore();
+        errorSpy.mock.restore();
+        exitSpy.mock.restore();
+      }
+
+      assert.equal(pushBranchMock.mock.calls.length, 1);
+      assert.equal(findOpenPullRequestMock.mock.calls.length, 0);
+      assert.equal(createPullRequestMock.mock.calls.length, 0);
+      assert.equal(exitSpy.mock.calls[0].arguments[0], 1);
+      const record = readJob(tmpCwd, slug);
+      assert.equal(record.state, 'failed');
+      assert.equal(record.phase, 'publish');
+      assert.equal(record.exitCode, 1);
+      const status = fs.readFileSync(runContext.statusPath, 'utf8');
+      assert.match(status, /## Commit/);
+      assert.match(status, new RegExp(sha.slice(0, 7)));
+      assert.equal(record.prUrl ?? null, null);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('failure: throwing createPullRequest leaves state failed at phase publish with commit SHA intact', async () => {
+    const tmpCwd = makeTmpCwd('orch-publish-fail-create-');
+    try {
+      const slug = 'publish-fail-create-0000';
+      seedForegroundJob(tmpCwd, slug, 'Add publish phase');
+      const runContext = fakeRunContext(tmpCwd, slug);
+      fs.mkdirSync(runContext.artifactDir, { recursive: true });
+      fs.writeFileSync(runContext.statusPath, `# Status\n\n- Slug: \`${slug}\`\n`, 'utf8');
+      const worktree = fakeWorktree(tmpCwd, slug);
+      const sha = 'cafebabedeadbeef0000000000000000000001';
+      const MockAgentClass = createMockAgentClass(complexPassBehaviors());
+      const pushBranchMock = mock.fn(() => {});
+      const findOpenPullRequestMock = mock.fn(() => null);
+      const createPullRequestMock = mock.fn(() => {
+        throw new Error('gh pr create failed: GraphQL: Resource not accessible');
+      });
+
+      const logSpy = mock.method(console, 'log', () => {});
+      const errorSpy = mock.method(console, 'error', () => {});
+      const exitSpy = mock.method(process, 'exit', () => {});
+      try {
+        await runPipeline('Add publish phase', {
+          agent: 'claude',
+          pr: true,
+          AgentClass: MockAgentClass,
+          createRunContext: mock.fn(() => runContext),
+          createWorktree: mock.fn(() => worktree),
+          commitWorktree: mock.fn(() => ({ committed: true, sha, branch: worktree.branch })),
+          collectWorktreeChanges: mock.fn(() => sampleChanges),
+          resolveBaseBranch: mock.fn(() => 'main'),
+          fetchBase: mock.fn(() => {}),
+          pushBranch: pushBranchMock,
+          findOpenPullRequest: findOpenPullRequestMock,
+          createPullRequest: createPullRequestMock,
+          jobSlug: slug,
+          jobCwd: tmpCwd,
+          patchJob: realDiskPatchJobSpy([]),
+        });
+      } finally {
+        logSpy.mock.restore();
+        errorSpy.mock.restore();
+        exitSpy.mock.restore();
+      }
+
+      assert.equal(pushBranchMock.mock.calls.length, 1);
+      assert.equal(findOpenPullRequestMock.mock.calls.length, 1);
+      assert.equal(createPullRequestMock.mock.calls.length, 1);
+      assert.equal(exitSpy.mock.calls[0].arguments[0], 1);
+      const record = readJob(tmpCwd, slug);
+      assert.equal(record.state, 'failed');
+      assert.equal(record.phase, 'publish');
+      assert.equal(record.exitCode, 1);
+      const status = fs.readFileSync(runContext.statusPath, 'utf8');
+      assert.match(status, /## Commit/);
+      assert.match(status, new RegExp(sha.slice(0, 7)));
+      assert.equal(record.prUrl ?? null, null);
+      // Push may have recorded pushedAt before create failed; PR fields must stay unset.
+      assert.equal(record.prNumber ?? null, null);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('existing PR: push → non-empty findOpenPullRequest skips createPullRequest and reports the URL', async () => {
+    const tmpCwd = makeTmpCwd('orch-publish-reuse-');
+    try {
+      const slug = 'publish-reuse-0000';
+      seedForegroundJob(tmpCwd, slug, 'Add publish phase');
+      const runContext = fakeRunContext(tmpCwd, slug);
+      fs.mkdirSync(runContext.artifactDir, { recursive: true });
+      fs.writeFileSync(runContext.statusPath, `# Status\n\n- Slug: \`${slug}\`\n`, 'utf8');
+      const worktree = fakeWorktree(tmpCwd, slug);
+      const MockAgentClass = createMockAgentClass(complexPassBehaviors());
+      const existingUrl = 'https://github.com/owner/repo/pull/99';
+      const pushBranchMock = mock.fn(() => {});
+      const findOpenPullRequestMock = mock.fn(() => ({ url: existingUrl, number: 99 }));
+      const createPullRequestMock = mock.fn(() => {
+        throw new Error('createPullRequest must not run when an open PR already exists');
+      });
+
+      const { logs, restore } = collectLogs();
+      try {
+        await runPipeline('Add publish phase', {
+          agent: 'claude',
+          pr: true,
+          AgentClass: MockAgentClass,
+          createRunContext: mock.fn(() => runContext),
+          createWorktree: mock.fn(() => worktree),
+          commitWorktree: mock.fn(() => fakeCommitResult(worktree.branch)),
+          collectWorktreeChanges: mock.fn(() => sampleChanges),
+          resolveBaseBranch: mock.fn(() => 'main'),
+          fetchBase: mock.fn(() => {}),
+          // Orchestration via injectable steps — not a mocked publish() return value.
+          pushBranch: pushBranchMock,
+          findOpenPullRequest: findOpenPullRequestMock,
+          createPullRequest: createPullRequestMock,
+          jobSlug: slug,
+          jobCwd: tmpCwd,
+          patchJob: realDiskPatchJobSpy([]),
+        });
+      } finally {
+        restore();
+      }
+
+      assert.equal(pushBranchMock.mock.calls.length, 1);
+      assert.equal(findOpenPullRequestMock.mock.calls.length, 1);
+      assert.equal(createPullRequestMock.mock.calls.length, 0);
+      const record = readJob(tmpCwd, slug);
+      assert.equal(record.state, 'done');
+      assert.equal(record.prUrl, existingUrl);
+      assert.equal(record.prNumber, 99);
+      assert.match(logs.join('\n'), new RegExp(`pr:\\s+${escapeRegex(existingUrl)}`));
+      assert.doesNotMatch(logs.join('\n'), /merge:\s+git merge/);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('formatStatus — publish fields', () => {
+  it('prints pr: and base: rows when present on the record', () => {
+    const tmpCwd = makeTmpCwd('orch-format-pr-');
+    try {
+      const slug = 'format-pr-0000';
+      writeJob(tmpCwd, slug, {
+        slug,
+        task: 'Add publish',
+        agent: 'claude',
+        maxRounds: null,
+        cwd: tmpCwd,
+        pauseRequested: false,
+        branch: 'orch/format-pr-0000',
+        worktree: path.join(tmpCwd, 'wt'),
+        startedAt: new Date().toISOString(),
+        finishedAt: new Date().toISOString(),
+        exitCode: 0,
+        logPath: jobPaths(tmpCwd, slug).logPath,
+        pid: process.pid,
+        state: 'done',
+        phase: 'publish',
+        stage: 'publish',
+        round: null,
+        base: 'main',
+        remote: 'origin',
+        prUrl: 'https://github.com/owner/repo/pull/42',
+        prNumber: 42,
+        pushedAt: new Date().toISOString(),
+      });
+      const out = formatStatus(tmpCwd, readJob(tmpCwd, slug));
+      assert.match(out, /base:\s+main/);
+      assert.match(out, /pr:\s+https:\/\/github\.com\/owner\/repo\/pull\/42/);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('omits pr: and base: when those fields are absent', () => {
+    const tmpCwd = makeTmpCwd('orch-format-nopr-');
+    try {
+      const slug = 'format-nopr-0000';
+      writeJob(tmpCwd, slug, {
+        slug,
+        task: 'plain run',
+        agent: 'claude',
+        maxRounds: null,
+        cwd: tmpCwd,
+        pauseRequested: false,
+        branch: 'orch/format-nopr-0000',
+        worktree: path.join(tmpCwd, 'wt'),
+        startedAt: new Date().toISOString(),
+        finishedAt: new Date().toISOString(),
+        exitCode: 0,
+        logPath: jobPaths(tmpCwd, slug).logPath,
+        pid: process.pid,
+        state: 'done',
+        phase: 'commit',
+        stage: 'commit',
+        round: null,
+      });
+      const out = formatStatus(tmpCwd, readJob(tmpCwd, slug));
+      assert.doesNotMatch(out, /^base:/m);
+      assert.doesNotMatch(out, /^pr:/m);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('--pr flag guards and startup gh check', () => {
+  for (const conflicting of ['--ask', '--quick', '--dry-run']) {
+    it(`rejects --pr combined with ${conflicting} before any job is created`, async () => {
+      const tmpCwd = makeTmpCwd('orch-pr-guard-');
+      try {
+        const { code, stderr } = await runCli(
+          ['a trivial task', '--pr', conflicting],
+          { cwd: tmpCwd },
+        );
+        assert.notEqual(code, 0);
+        assert.match(stderr, /--pr cannot be combined/i);
+        assert.equal(fs.existsSync(path.join(tmpCwd, '.orch')), false);
+      } finally {
+        fs.rmSync(tmpCwd, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it('missing gh with --pr exits non-zero and creates no job', async () => {
+    const tmpCwd = makeTmpCwd('orch-pr-nogh-');
+    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-pr-fake-bin-'));
+    try {
+      // Agent binary present so the failure is specifically about gh, not the agent.
+      const agentPath = path.join(binDir, 'claude');
+      fs.writeFileSync(agentPath, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+
+      const { code, stderr } = await runCli(
+        ['Add publish phase', '--pr', '--agent', 'claude'],
+        {
+          cwd: tmpCwd,
+          env: { ...process.env, PATH: binDir },
+        },
+      );
+
+      assert.equal(code, 1);
+      assert.match(stderr, /gh/i);
+      assert.equal(fs.existsSync(path.join(tmpCwd, '.orch')), false);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+      fs.rmSync(binDir, { recursive: true, force: true });
+    }
+  });
+
+  it('unauthenticated gh with --pr exits non-zero and creates no job', async () => {
+    const tmpCwd = makeTmpCwd('orch-pr-unauth-');
+    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-pr-unauth-bin-'));
+    try {
+      fs.writeFileSync(path.join(binDir, 'claude'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      fs.writeFileSync(
+        path.join(binDir, 'gh'),
+        '#!/bin/sh\nif [ "$1" = "auth" ]; then echo "not logged in" >&2; exit 1; fi\nexit 0\n',
+        { mode: 0o755 },
+      );
+
+      const { code, stderr } = await runCli(
+        ['Add publish phase', '--pr', '--agent', 'claude'],
+        {
+          cwd: tmpCwd,
+          env: { ...process.env, PATH: binDir },
+        },
+      );
+
+      assert.equal(code, 1);
+      assert.match(stderr, /gh|auth|authenticated|login/i);
+      assert.equal(fs.existsSync(path.join(tmpCwd, '.orch')), false);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+      fs.rmSync(binDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('runDetached forwards --pr and --base', () => {
+  it('includes --pr and --base <branch> in the child argv when set', async () => {
+    const tmpCwd = makeTmpCwd('orch-detach-pr-');
+    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-detach-pr-bin-'));
+    const prevPath = process.env.PATH;
+    try {
+      // Detach with --pr must validate gh before allocate/spawn (same as foreground).
+      fs.writeFileSync(path.join(binDir, 'claude'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      fs.writeFileSync(
+        path.join(binDir, 'gh'),
+        '#!/bin/sh\nif [ "$1" = "auth" ]; then exit 0; fi\nexit 0\n',
+        { mode: 0o755 },
+      );
+      process.env.PATH = `${binDir}${path.delimiter}${prevPath}`;
+
+      const spawnMock = fakeDetachSpawn(424242);
+      const exitMock = mock.fn();
+      const logSpy = mock.method(console, 'log', () => {});
+      try {
+        await runDetached('Add publish phase', {
+          agent: 'claude',
+          maxRounds: 5,
+          cwd: tmpCwd,
+          pr: true,
+          base: 'develop',
+          spawn: spawnMock,
+          exit: exitMock,
+        });
+      } finally {
+        logSpy.mock.restore();
+      }
+
+      assert.equal(spawnMock.mock.calls.length, 1);
+      const [, args] = spawnMock.mock.calls[0].arguments;
+      assert.ok(args.includes('--pr'), 'child must receive --pr');
+      const baseIdx = args.indexOf('--base');
+      assert.ok(baseIdx >= 0, 'child must receive --base');
+      assert.equal(args[baseIdx + 1], 'develop');
+      assert.ok(!args.includes('--detach'));
+    } finally {
+      process.env.PATH = prevPath;
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+      fs.rmSync(binDir, { recursive: true, force: true });
     }
   });
 });
