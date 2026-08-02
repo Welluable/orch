@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { jobPaths, readJob, writeJob } from '../lib/jobs.js';
 
 /**
- * Contract for `.spec/server.md` phases 1–2 (serve jobs + products API):
+ * Contract for `.spec/server.md` phases 1–3 (serve jobs + products + scan/files):
  *
  * - `orch serve` binds home to `os.homedir()` (injectable `homedir` in tests),
  *   ensures `$HOME/.orch/products/`, refuses when `$HOME/.orch` is not writable,
@@ -23,7 +23,8 @@ import { jobPaths, readJob, writeJob } from '../lib/jobs.js';
  *   persist `source: { kind, id, remoteAddr, receivedAt }` on the job record.
  * - HTTP (no auth): `GET /api/healthz`; product routes below; `POST
  *   /api/products/:product/jobs` for an existing product dir; `GET /api/jobs`,
- *   `GET /api/jobs/:slug`, `GET /api/jobs/:slug/logs`, `POST .../pause|resume|stop`.
+ *   `GET /api/jobs/:slug`, `GET /api/jobs/:slug/logs`, `GET /api/jobs/:slug/files`,
+ *   `GET /api/products/:product/jobs`, `POST .../pause|resume|stop`.
  * - Phase 2 products: `GET`/`POST /api/products`, `GET`/`PATCH
  *   /api/products/:product` (no DELETE). Slug
  *   `/^[a-z0-9]+(?:-[a-z0-9]+)*$/` max 64; required `name` + `slug`.
@@ -33,8 +34,14 @@ import { jobPaths, readJob, writeJob } from '../lib/jobs.js';
  *   Existing slug → `409` for both init and clone. Write `product.json`.
  *   Failures after mkdir → best-effort rm + `502`. Stub `gh`/`git` via
  *   injectable `execFile` / `execFileSync` — no live GitHub.
+ * - Phase 3 remainder (unit 04): job scan only walks product.json-backed
+ *   product dirs; `GET /api/products/:product/jobs` returns `{ jobs }` (full
+ *   list for that product, unknown → 404); `GET /api/jobs/:slug/files` is
+ *   on-demand read-only git name-status from `run.json.worktree` →
+ *   `{ files: [{ path, status }] }`, or `{ files: [] }` when unavailable
+ *   (no staging `git add`).
  * - Durable `state: "queued"` jobs are re-enqueued on boot; shutdown does not
- *   kill children. Files API remains deferred (unit 04).
+ *   kill children.
  *
  * Implementation seam: `lib/serve.js` exports `startServe(options)`.
  */
@@ -1038,17 +1045,268 @@ describe('serve HTTP jobs API (scan + controls + logs)', () => {
     }
   });
 
-  it('keeps files API deferred (unit 04)', async () => {
+  it('GET /api/products/:product/jobs lists that product’s jobs; unknown → 404', async () => {
     const home = makeTmpHome();
     try {
-      seedProduct(home, 'solo');
+      const aDir = seedProduct(home, 'alpha');
+      const bDir = seedProduct(home, 'beta');
+      seedJob(aDir, 'a-job-1111', {
+        product: 'alpha',
+        task: 'alpha older',
+        startedAt: '2026-08-01T00:00:00.000Z',
+        state: 'done',
+        finishedAt: '2026-08-01T01:00:00.000Z',
+      });
+      seedJob(aDir, 'a-job-2222', {
+        product: 'alpha',
+        task: 'alpha newer',
+        startedAt: '2026-08-02T00:00:00.000Z',
+        state: 'running',
+        pid: process.pid,
+      });
+      seedJob(bDir, 'b-job-3333', {
+        product: 'beta',
+        task: 'beta only',
+        startedAt: '2026-08-03T00:00:00.000Z',
+        state: 'queued',
+      });
+
       const handle = await startTestServe(home);
       try {
-        const files = await jsonRequest(handle.baseUrl, 'GET', '/api/jobs/any/files');
+        const missing = await jsonRequest(handle.baseUrl, 'GET', '/api/products/nope/jobs');
+        assert.equal(missing.res.status, 404);
+
+        // Dir without product.json is not a product for this route.
+        const stray = path.join(productsDir(home), 'stray-dir');
+        fs.mkdirSync(stray, { recursive: true });
+        const noJson = await jsonRequest(handle.baseUrl, 'GET', '/api/products/stray-dir/jobs');
+        assert.equal(noJson.res.status, 404);
+
+        const { res, json } = await jsonRequest(handle.baseUrl, 'GET', '/api/products/alpha/jobs');
+        assert.equal(res.status, 200, `expected 200; got ${res.status}: ${JSON.stringify(json)}`);
+        const jobs = json?.jobs;
+        assert.ok(Array.isArray(jobs), 'GET product jobs must return { jobs: [...] }');
+        const slugs = jobs.map((j) => j.slug);
+        assert.ok(slugs.includes('a-job-1111'));
+        assert.ok(slugs.includes('a-job-2222'));
+        assert.ok(!slugs.includes('b-job-3333'), 'must not include other products’ jobs');
+        assert.equal(jobs[0].slug, 'a-job-2222', 'newest first');
+        assert.ok(jobs.every((j) => j.product === 'alpha'));
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('GET /api/products/:product/jobs returns the full list (not the product GET 20-slice)', async () => {
+    const home = makeTmpHome();
+    try {
+      const dir = seedProduct(home, 'busy');
+      for (let i = 0; i < 21; i += 1) {
+        const n = String(i).padStart(2, '0');
+        seedJob(dir, `busy-job-${n}aa`, {
+          product: 'busy',
+          task: `task ${i}`,
+          startedAt: `2026-07-${String((i % 28) + 1).padStart(2, '0')}T00:00:00.000Z`,
+          state: 'done',
+          finishedAt: `2026-07-${String((i % 28) + 1).padStart(2, '0')}T01:00:00.000Z`,
+          exitCode: 0,
+        });
+      }
+
+      const handle = await startTestServe(home);
+      try {
+        const productGet = await jsonRequest(handle.baseUrl, 'GET', '/api/products/busy');
+        assert.equal(productGet.res.status, 200);
+        const recent = productGet.json?.jobs ?? [];
+        assert.ok(Array.isArray(recent));
+        assert.ok(recent.length <= 20, `product GET must slice recent jobs; got ${recent.length}`);
+
+        const list = await jsonRequest(handle.baseUrl, 'GET', '/api/products/busy/jobs');
+        assert.equal(list.res.status, 200);
+        const jobs = list.json?.jobs;
+        assert.ok(Array.isArray(jobs));
+        assert.equal(jobs.length, 21, 'product jobs GET must return the full list');
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('job scan ignores product dirs that lack product.json', async () => {
+    const home = makeTmpHome();
+    try {
+      const realDir = seedProduct(home, 'real-app');
+      seedJob(realDir, 'real-job-ffff', {
+        product: 'real-app',
+        state: 'done',
+        startedAt: '2026-08-01T00:00:00.000Z',
+        finishedAt: '2026-08-01T01:00:00.000Z',
+        exitCode: 0,
+      });
+
+      // Bare directory under products/ with a run.json but no product.json.
+      const orphanDir = path.join(productsDir(home), 'orphan-app');
+      fs.mkdirSync(orphanDir, { recursive: true });
+      seedJob(orphanDir, 'orphan-job-gggg', {
+        product: 'orphan-app',
+        state: 'running',
+        startedAt: '2026-08-02T00:00:00.000Z',
+        pid: process.pid,
+      });
+
+      const handle = await startTestServe(home);
+      try {
+        const list = await jsonRequest(handle.baseUrl, 'GET', '/api/jobs');
+        assert.equal(list.res.status, 200);
+        const jobs = list.json?.jobs ?? list.json;
+        assert.ok(Array.isArray(jobs));
+        const slugs = jobs.map((j) => j.slug);
+        assert.ok(slugs.includes('real-job-ffff'));
         assert.ok(
-          files.res.status === 404 || files.res.status === 405 || files.res.status === 501,
-          `files API must be deferred; got ${files.res.status}`,
+          !slugs.includes('orphan-job-gggg'),
+          'scan must skip dirs without product.json',
         );
+
+        const orphan = await jsonRequest(handle.baseUrl, 'GET', '/api/jobs/orphan-job-gggg');
+        assert.equal(orphan.res.status, 404);
+
+        const real = await jsonRequest(handle.baseUrl, 'GET', '/api/jobs/real-job-ffff');
+        assert.equal(real.res.status, 200);
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('GET /api/jobs/:slug/files returns on-demand git name-status from the worktree', async () => {
+    const home = makeTmpHome();
+    try {
+      const productDir = seedProduct(home, 'files-app');
+      const worktree = path.join(home, 'files-app-files-job-hhhh');
+      fs.mkdirSync(path.join(worktree, '.git'), { recursive: true });
+      seedJob(productDir, 'files-job-hhhh', {
+        product: 'files-app',
+        state: 'running',
+        pid: process.pid,
+        worktree,
+        branch: 'orch/files-job-hhhh',
+      });
+
+      const baseExec = makeProductExec().execFile;
+      const calls = [];
+      const execFile = (cmd, args = [], options = {}) => {
+        calls.push({ command: cmd, args: [...args], options });
+        if (cmd === 'git' && args.includes('--name-status')) {
+          return 'M\tsrc/x.ts\nA\tlib/y.js\n';
+        }
+        if (cmd === 'git' && args.includes('--porcelain')) {
+          return ' M src/x.ts\n?? lib/y.js\n';
+        }
+        return baseExec(cmd, args, options);
+      };
+
+      const handle = await startTestServe(home, { execFile, execFileSync: execFile });
+      try {
+        const { res, json } = await jsonRequest(
+          handle.baseUrl,
+          'GET',
+          '/api/jobs/files-job-hhhh/files',
+        );
+        assert.equal(res.status, 200, `expected 200; got ${res.status}: ${JSON.stringify(json)}`);
+        assert.ok(Array.isArray(json?.files), 'files API must return { files: [...] }');
+        assert.ok(json.files.length >= 1, 'expected at least one changed file from stubbed git');
+        for (const entry of json.files) {
+          assert.equal(typeof entry.path, 'string');
+          assert.equal(typeof entry.status, 'string');
+          assert.ok(entry.path.length > 0);
+          assert.ok(entry.status.length > 0);
+        }
+        assert.ok(
+          json.files.some((f) => f.path === 'src/x.ts' && f.status === 'M'),
+          `expected M src/x.ts; got ${JSON.stringify(json.files)}`,
+        );
+
+        const gitInvokes = calls.filter((c) => c.command === 'git');
+        assert.ok(gitInvokes.length >= 1, 'files route must invoke git against the worktree');
+        assert.ok(
+          gitInvokes.every((c) => !c.args.includes('add')),
+          `files route must be read-only (no git add); got ${JSON.stringify(gitInvokes)}`,
+        );
+        assert.ok(
+          gitInvokes.some((c) => c.args.includes(worktree) || c.options?.cwd === worktree),
+          `git must target job worktree ${worktree}; got ${JSON.stringify(gitInvokes)}`,
+        );
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('GET /api/jobs/:slug/files returns { files: [] } when job/worktree/git unavailable', async () => {
+    const home = makeTmpHome();
+    try {
+      const productDir = seedProduct(home, 'empty-files');
+      seedJob(productDir, 'no-wt-iiii', {
+        product: 'empty-files',
+        state: 'queued',
+        worktree: null,
+      });
+      const missingWt = path.join(home, 'does-not-exist-wt');
+      seedJob(productDir, 'missing-wt-jjjj', {
+        product: 'empty-files',
+        state: 'running',
+        pid: process.pid,
+        worktree: missingWt,
+      });
+      const brokenWt = path.join(home, 'broken-wt-kkkk');
+      fs.mkdirSync(brokenWt, { recursive: true });
+      seedJob(productDir, 'git-fail-kkkk', {
+        product: 'empty-files',
+        state: 'running',
+        pid: process.pid,
+        worktree: brokenWt,
+      });
+
+      const baseExec = makeProductExec().execFile;
+      const execFile = (cmd, args = [], options = {}) => {
+        if (
+          cmd === 'git'
+          && (args.includes(brokenWt) || options?.cwd === brokenWt)
+          && (args.includes('--name-status') || args.includes('--porcelain') || args.includes('diff') || args.includes('status'))
+        ) {
+          const err = new Error('fatal: not a git repository');
+          err.stderr = 'fatal: not a git repository';
+          throw err;
+        }
+        return baseExec(cmd, args, options);
+      };
+
+      const handle = await startTestServe(home, { execFile, execFileSync: execFile });
+      try {
+        const unknown = await jsonRequest(handle.baseUrl, 'GET', '/api/jobs/no-such-slug/files');
+        assert.equal(unknown.res.status, 200);
+        assert.deepEqual(unknown.json, { files: [] });
+
+        const noWt = await jsonRequest(handle.baseUrl, 'GET', '/api/jobs/no-wt-iiii/files');
+        assert.equal(noWt.res.status, 200);
+        assert.deepEqual(noWt.json, { files: [] });
+
+        const missing = await jsonRequest(handle.baseUrl, 'GET', '/api/jobs/missing-wt-jjjj/files');
+        assert.equal(missing.res.status, 200);
+        assert.deepEqual(missing.json, { files: [] });
+
+        const gitFail = await jsonRequest(handle.baseUrl, 'GET', '/api/jobs/git-fail-kkkk/files');
+        assert.equal(gitFail.res.status, 200);
+        assert.deepEqual(gitFail.json, { files: [] });
       } finally {
         await handle.close();
       }
