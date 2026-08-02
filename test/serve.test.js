@@ -370,6 +370,10 @@ describe('orch serve CLI', () => {
     assert.match(help, /--max-rounds/);
     assert.match(help, /--base/);
     assert.match(help, /--github-owner/);
+    assert.match(help, /no auth|NO AUTH/i);
+    assert.match(help, /products|~\.?\/\.orch\/products|\.orch\/products/i);
+    assert.match(help, /gh auth|GitHub/i);
+    assert.match(help, /machine-ip|LAN|7333/i);
   });
 });
 
@@ -1797,6 +1801,85 @@ describe('serve handle surface', () => {
       }
     } finally {
       fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('02-serve-static — static UI delivery + packaging', () => {
+  it('package.json files includes the built UI under ui/', () => {
+    const pkg = JSON.parse(
+      fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'),
+    );
+    assert.ok(Array.isArray(pkg.files));
+    assert.ok(
+      pkg.files.some((entry) => String(entry).includes('ui')),
+      `expected package.json "files" to include ui; got ${JSON.stringify(pkg.files)}`,
+    );
+  });
+
+  it('GET / serves index.html from injectable staticDir; /api still JSON', async () => {
+    const home = makeTmpHome();
+    const staticRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-serve-static-'));
+    try {
+      fs.writeFileSync(
+        path.join(staticRoot, 'index.html'),
+        '<!doctype html><html><body>orch-ui</body></html>\n',
+      );
+      fs.mkdirSync(path.join(staticRoot, 'assets'), { recursive: true });
+      fs.writeFileSync(path.join(staticRoot, 'assets', 'app.js'), 'console.log("ui");\n');
+
+      const handle = await startTestServe(home, { staticDir: staticRoot });
+      try {
+        const index = await fetch(new URL('/', handle.baseUrl));
+        assert.equal(index.status, 200);
+        assert.match(index.headers.get('content-type') || '', /text\/html/);
+        const html = await index.text();
+        assert.match(html, /orch-ui/);
+
+        const asset = await fetch(new URL('/assets/app.js', handle.baseUrl));
+        assert.equal(asset.status, 200);
+        assert.match(asset.headers.get('content-type') || '', /javascript/);
+        assert.match(await asset.text(), /console\.log/);
+
+        const health = await jsonRequest(handle.baseUrl, 'GET', '/api/healthz');
+        assert.equal(health.res.status, 200);
+        assert.deepEqual(health.json, { ok: true });
+
+        const missing = await fetch(new URL('/no-such-asset.css', handle.baseUrl));
+        assert.equal(missing.status, 404);
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(staticRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('blocks path traversal outside staticDir', async () => {
+    const home = makeTmpHome();
+    const staticRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-serve-static-'));
+    try {
+      fs.writeFileSync(path.join(staticRoot, 'index.html'), '<html>ok</html>\n');
+      const secret = path.join(os.tmpdir(), `orch-serve-secret-${process.pid}.txt`);
+      fs.writeFileSync(secret, 'secret-data\n');
+
+      const handle = await startTestServe(home, { staticDir: staticRoot });
+      try {
+        const escaped = await fetch(
+          new URL(`/${'..%2F'.repeat(8)}${path.basename(secret)}`, handle.baseUrl),
+        );
+        // Must not leak the secret file; 404 JSON or empty is fine.
+        const body = await escaped.text();
+        assert.doesNotMatch(body, /secret-data/);
+        assert.notEqual(escaped.status, 200);
+      } finally {
+        await handle.close();
+      }
+      fs.unlinkSync(secret);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(staticRoot, { recursive: true, force: true });
     }
   });
 });

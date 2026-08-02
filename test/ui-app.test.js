@@ -18,8 +18,9 @@ import { fileURLToPath } from 'node:url';
  *   job→Job links + Run with uuid `id`), Job (poll/refresh of GET
  *   /api/jobs/:slug for state/prUrl — not logs-only SSE; logs, files
  *   file.path+file.status, Pause/Resume/Stop). No delete / continue.
- * - Mobile-responsive layout cues; root `package.json` `files` and
- *   `lib/serve.js` stay unchanged (static serve + packaging = unit 02).
+ * - Mobile-responsive layout cues; root `package.json` `files` includes the
+ *   built UI (`ui/out/**`) and `lib/serve.js` serves non-/api static export
+ *   (unit 02 packaging + static middleware).
  */
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -749,15 +750,19 @@ describe('01-ui-app mobile + packaging boundaries', () => {
     assert.ok(hasViewport, 'expected viewport meta export and/or responsive CSS for phone viewports');
   });
 
-  it('leaves root package.json files and lib/serve.js without UI static packaging', () => {
+  it('packages built UI and serves static export from lib/serve.js', () => {
     const rootPkg = readJson(path.join(root, 'package.json'));
-    assert.deepEqual(rootPkg.files, ['main.js', 'lib/**', 'agents/**']);
-    assert.ok(!rootPkg.files.some((f) => String(f).includes('ui')),
-      'root files must not include ui yet (unit 02)');
+    assert.ok(
+      rootPkg.files.some((f) => String(f).includes('ui')),
+      'root package.json files must include ui/out (or ui) for npm packaging',
+    );
 
     const serveSrc = read(path.join(root, 'lib', 'serve.js'));
-    assert.doesNotMatch(serveSrc, /ui\/out|path\.join\([^)]*['"]ui['"]/);
-    assert.doesNotMatch(serveSrc, /sendFile|express\.static|serve-static/);
+    assert.match(serveSrc, /ui\/out|staticDir/);
+    assert.ok(
+      /resolveStaticPath|sendStaticFile|contentTypeFor|DEFAULT_STATIC_DIR/.test(serveSrc),
+      'lib/serve.js must deliver the static Next export for non-/api routes',
+    );
   });
 
   it('ignores ui node_modules / build artifacts at repo or ui level', () => {

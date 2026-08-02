@@ -294,6 +294,12 @@ Job-control subcommands (see [Headless runs](#headless-runs)):
   if any job is still live (`running`/`pausing`/`paused` with an alive pid);
   run `orch stop <slug>` first, then clean.
 
+Serve (see [Serve (home products + mobile UI)](#serve-home-products--mobile-ui)):
+
+- `orch serve` — long-lived HTTP server against `$HOME/.orch/products/` with a
+  bundled mobile UI. Default `--host 0.0.0.0 --port 7333`. **No auth.** Requires
+  `gh auth login`. Served jobs always publish with `--pr`.
+
 Examples:
 
 ```bash
@@ -355,6 +361,50 @@ restriction on backgrounding, not on job records: every non-`--dry-run`
 invocation gets a `run.json`, `--detach` or not. Multiple `--detach` runs can
 execute concurrently against the same directory, each tracked under its own
 slug.
+
+## Serve (home products + mobile UI)
+
+`orch serve` is a long-lived process that manages **products** (git checkouts
+under `~/.orch/products/`), accepts jobs over HTTP, and ships a
+mobile-responsive web UI so you can start and watch orch sessions from a phone.
+
+```bash
+gh auth login                  # required — products always use GitHub
+orch serve                     # default: 0.0.0.0:7333, no auth
+# open http://127.0.0.1:7333/ locally, or http://<machine-ip>:7333/ from a phone
+```
+
+**Layout.** Home is always the OS user directory (`$HOME`). Products live only
+under `$HOME/.orch/products/<slug>/` with a `product.json` and a GitHub
+`origin`. There is no path argument and no linking of folders elsewhere on disk.
+
+**Creating products (UI or `POST /api/products`).**
+
+- **Blank (`init`):** local `git init` plus **`gh repo create` (always
+  private)** under the logged-in GitHub user (or `--github-owner` / per-request
+  `owner`), then push `main`. There is no local-only blank product.
+- **Clone:** `git clone <url>` into `$HOME/.orch/products/<slug>/`.
+
+**Jobs.** Every served job runs detached in that product's cwd and **always**
+enables `--pr` (publish). The UI shows status, PR URL, logs, files changed,
+and Pause / Resume / Stop. Continue-from-UI is not available — use
+`orch continue` on the CLI.
+
+**Security.** There is **no authentication** in v1. The default bind is
+`0.0.0.0` so phones on the same network can reach the UI. Startup prints a
+loud warning: anyone who can reach the port can create private GitHub repos
+and run agents. Trust your network / firewall; optionally put the host behind
+Tailscale or bind `--host 127.0.0.1` if you do not need LAN access.
+
+```bash
+orch serve --help
+orch serve --host 0.0.0.0 --port 7333
+orch serve --github-owner my-org --agent claude
+```
+
+Useful flags: `--port`, `--host` (default `0.0.0.0`), `--concurrency` (default
+`2`), `--max-queue` (default `64`), `--agent`, `--max-rounds`, `--base`,
+`--github-owner`.
 
 ## Fan-out
 
@@ -574,7 +624,9 @@ pkill -f 'opencode run' # --agent opencode
   Code), `agn`, or `opencode` (OpenCode `>= 1.17.18`).
 - Git, for any run that isn't `--ask` or `--quick` (worktrees and commits
   need it).
-- The GitHub CLI (`gh`) on `PATH` and authenticated, when using `--pr`.
+- The GitHub CLI (`gh`) on `PATH` and authenticated, when using `--pr` or
+  `orch serve` (run `gh auth login` first). Serve always needs GitHub because
+  products are private repos under `~/.orch/products/`.
 
 ## Development
 

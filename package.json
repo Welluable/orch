@@ -10,7 +10,8 @@
   "files": [
     "main.js",
     "lib/**",
-    "agents/**"
+    "agents/**",
+    "ui/out/**"
   ],
   "scripts": {
     "test": "node --test \"test/**/*.test.js\"",

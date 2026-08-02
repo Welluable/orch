@@ -4803,14 +4803,19 @@ Sequential (--seq):
 program
     .command('serve')
     .description(
-        'Run the home products HTTP server (jobs API; always --pr; no auth in v1)',
+        'Long-lived home products HTTP server + mobile UI. ' +
+        'Products live under ~/.orch/products/; requires gh auth login; ' +
+        'blank init creates private GitHub repos; served jobs always --pr. ' +
+        'Default bind 0.0.0.0:7333 with NO AUTH — anyone on the LAN who can ' +
+        'reach the port can create repos and run agents. Open the UI from a ' +
+        'phone at http://<machine-ip>:7333/.',
     )
-    .option('--port <n>', 'Listen port', (v) => {
+    .option('--port <n>', 'Listen port (default 7333)', (v) => {
         const n = Number.parseInt(v, 10);
         if (!Number.isInteger(n) || n < 0) throw new Error('--port must be a non-negative integer');
         return n;
     }, 7333)
-    .option('--host <addr>', 'Listen address', '0.0.0.0')
+    .option('--host <addr>', 'Listen address (default 0.0.0.0 — LAN reachable, no auth)', '0.0.0.0')
     .option('--concurrency <n>', 'Max live jobs across all products', (v) => {
         const n = Number.parseInt(v, 10);
         if (!Number.isInteger(n) || n < 1) throw new Error('--concurrency must be a positive integer');
@@ -4827,7 +4832,7 @@ program
     )
     .option('--max-rounds <n>', 'Default max writer⇄critic / writer⇄runner rounds', positiveIntParser('--max-rounds'), 5)
     .option('--base <branch>', 'Default remote base branch for publish')
-    .option('--github-owner <owner>', 'Default GitHub owner/org for product create (phase 2)')
+    .option('--github-owner <owner>', 'Default GitHub owner/org for blank product init (private gh repo create)')
     .action(async (options) => {
         const { startServe } = await import('./lib/serve.js');
         const cwd = process.cwd();
