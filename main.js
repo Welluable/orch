@@ -1068,6 +1068,7 @@ export async function runDetached(prompt, options = {}) {
         notify,
         pr = false,
         base,
+        jobSlug: preallocatedSlug,
         createRunContext: createRunContextFn = createRunContext,
         spawn: spawnFn = spawn,
         exit = (code) => process.exit(code),
@@ -1088,16 +1089,26 @@ export async function runDetached(prompt, options = {}) {
         ensureGhAuthenticated();
     }
 
-    const { slug } = allocateJob({
-        cwd,
-        prompt,
-        agent,
-        maxRounds,
-        state: 'starting',
-        createRunContext: createRunContextFn,
-        role: seq ? 'coordinator' : null,
-    });
-    const { logPath } = jobPaths(cwd, slug);
+    let slug = preallocatedSlug;
+    if (slug) {
+        const existing = readJob(cwd, slug);
+        if (!existing) {
+            throw new Error(`runDetached: unknown pre-allocated job ${slug}`);
+        }
+        patchJob(cwd, slug, { state: 'starting', task: prompt, agent, maxRounds });
+    } else {
+        ({ slug } = allocateJob({
+            cwd,
+            prompt,
+            agent,
+            maxRounds,
+            state: 'starting',
+            createRunContext: createRunContextFn,
+            role: seq ? 'coordinator' : null,
+        }));
+    }
+    const { dir, logPath } = jobPaths(cwd, slug);
+    fs.mkdirSync(dir, { recursive: true });
 
     const logFd = fs.openSync(logPath, 'a');
 
@@ -4787,6 +4798,68 @@ Sequential (--seq):
         }
 
         await runPipeline(prompt, options);
+    });
+
+program
+    .command('serve')
+    .description(
+        'Run the home products HTTP server (jobs API; always --pr; no auth in v1)',
+    )
+    .option('--port <n>', 'Listen port', (v) => {
+        const n = Number.parseInt(v, 10);
+        if (!Number.isInteger(n) || n < 0) throw new Error('--port must be a non-negative integer');
+        return n;
+    }, 7333)
+    .option('--host <addr>', 'Listen address', '0.0.0.0')
+    .option('--concurrency <n>', 'Max live jobs across all products', (v) => {
+        const n = Number.parseInt(v, 10);
+        if (!Number.isInteger(n) || n < 1) throw new Error('--concurrency must be a positive integer');
+        return n;
+    }, 2)
+    .option('--max-queue <n>', 'Max waiting (queued) jobs', (v) => {
+        const n = Number.parseInt(v, 10);
+        if (!Number.isInteger(n) || n < 1) throw new Error('--max-queue must be a positive integer');
+        return n;
+    }, 64)
+    .addOption(
+        new Option('--agent <agent>', 'Default agent backend for served jobs')
+            .choices(['cursor', 'claude', 'agn', 'opencode']),
+    )
+    .option('--max-rounds <n>', 'Default max writer⇄critic / writer⇄runner rounds', positiveIntParser('--max-rounds'), 5)
+    .option('--base <branch>', 'Default remote base branch for publish')
+    .option('--github-owner <owner>', 'Default GitHub owner/org for product create (phase 2)')
+    .action(async (options) => {
+        const { startServe } = await import('./lib/serve.js');
+        const cwd = process.cwd();
+        const agent = resolveAgentOrExit(options.agent, cwd);
+        try {
+            const handle = await startServe({
+                host: options.host,
+                port: options.port,
+                concurrency: options.concurrency,
+                maxQueue: options.maxQueue,
+                agent,
+                maxRounds: options.maxRounds,
+                base: options.base,
+                githubOwner: options.githubOwner,
+                runDetached,
+                isBinaryOnPath,
+                execFileSync,
+            });
+            const shutdown = async () => {
+                try {
+                    await handle.close();
+                } catch {
+                    // ignore close errors on signal
+                }
+                process.exit(0);
+            };
+            process.once('SIGINT', () => { void shutdown(); });
+            process.once('SIGTERM', () => { void shutdown(); });
+        } catch (err) {
+            console.error(`Error: ${err.message}`);
+            process.exit(1);
+        }
     });
 
 program
