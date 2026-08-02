@@ -7,7 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runFanoutPipeline, cascadeStopFanoutChildren } from '../main.js';
 import { readFanout, writeFanout, patchWorker, patchIntegration } from '../lib/fanout.js';
-import { readJob, writeJob, patchJob } from '../lib/jobs.js';
+import { jobPaths, readJob, writeJob, patchJob } from '../lib/jobs.js';
 import { allocateJob as realAllocateJob } from '../lib/job-lifecycle.js';
 import { exitCodeForSignal } from '../lib/agent.js';
 
@@ -1556,6 +1556,23 @@ describe('runFanoutPipeline lastOutcome capture on terminal states', () => {
     assert.equal(record.lastOutcome.phase, record.phase);
     assert.equal(record.lastOutcome.stage, record.stage);
     assert.equal(typeof record.lastOutcome.error, 'string');
-    assert.match(record.lastOutcome.error, /triage agent exploded/);
+    assert.match(
+      record.lastOutcome.error,
+      /failure\.log/,
+      'failed lastOutcome.error should be a pointer to failure.log, not a verbose dump',
+    );
+    assert.equal(record.failureLogPath, jobPaths(cwd, jobSlug).failureLogPath);
+    assert.equal(fs.existsSync(record.failureLogPath), true);
+    const failureBody = fs.readFileSync(record.failureLogPath, 'utf8');
+    assert.match(
+      failureBody,
+      /error:\s*triage agent exploded/,
+      'failure.log header error: must retain err.message for recover',
+    );
+    assert.doesNotMatch(
+      record.lastOutcome.error,
+      /triage agent exploded/,
+      'lastOutcome.error must not duplicate the durable header reason',
+    );
   });
 });

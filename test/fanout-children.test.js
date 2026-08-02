@@ -7,7 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runWorkerPipeline, runIntegratePipeline } from '../main.js';
 import { readFanout, writeFanout } from '../lib/fanout.js';
-import { readJob } from '../lib/jobs.js';
+import { jobPaths, readJob } from '../lib/jobs.js';
 import { allocateJob } from '../lib/job-lifecycle.js';
 
 /**
@@ -595,6 +595,24 @@ describe('runWorkerPipeline lastOutcome capture on terminal states', () => {
     assert.equal(record.lastOutcome.phase, 'code-loop');
     assert.equal(record.lastOutcome.stage, 'test-runner');
     assert.equal(typeof record.lastOutcome.error, 'string');
+    assert.match(
+      record.lastOutcome.error,
+      /failure\.log/,
+      'failed lastOutcome.error should be a pointer to failure.log, not a verbose dump',
+    );
+    assert.equal(record.failureLogPath, jobPaths(cwd, workerSlug).failureLogPath);
+    assert.equal(fs.existsSync(record.failureLogPath), true);
+    const failureBody = fs.readFileSync(record.failureLogPath, 'utf8');
+    assert.match(
+      failureBody,
+      /error:\s*test-runner failed; stopping before commit/,
+      'failure.log header error: must retain err.message for recover',
+    );
+    assert.doesNotMatch(
+      record.lastOutcome.error,
+      /test-runner failed; stopping before commit/,
+      'lastOutcome.error must not duplicate the durable header reason',
+    );
   });
 });
 
@@ -1072,7 +1090,24 @@ describe('runIntegratePipeline lastOutcome capture on terminal states', () => {
     assert.equal(record.lastOutcome.round, 2);
     assert.equal(record.lastOutcome.task, doc.task);
     assert.equal(typeof record.lastOutcome.error, 'string');
-    assert.match(record.lastOutcome.error, /code loop exhausted/);
+    assert.match(
+      record.lastOutcome.error,
+      /failure\.log/,
+      'failed lastOutcome.error should be a pointer to failure.log, not a verbose dump',
+    );
+    assert.equal(record.failureLogPath, jobPaths(cwd, integrationSlug).failureLogPath);
+    assert.equal(fs.existsSync(record.failureLogPath), true);
+    const failureBody = fs.readFileSync(record.failureLogPath, 'utf8');
+    assert.match(
+      failureBody,
+      /error:\s*code loop exhausted after 2 rounds/,
+      'failure.log header error: must retain err.message for recover',
+    );
+    assert.doesNotMatch(
+      record.lastOutcome.error,
+      /code loop exhausted/,
+      'lastOutcome.error must not duplicate the durable header reason',
+    );
   });
 });
 
