@@ -98,27 +98,27 @@ export function JobScreen({ jobSlug }: Props) {
       <div className="job-console-sidebar">
         <header className="page-header">
           <div>
-            <p className="muted" style={{ margin: '0 0 0.35rem' }}>
+            <p className="muted back-link">
               <Link href={productHref}>← Product</Link>
               {' · '}
               <Link href="/">Products</Link>
             </p>
             <h1 className="page-title mono">{jobSlug}</h1>
-            <div className="row" style={{ marginTop: '0.5rem' }}>
+            <div className="row mt-1">
               <span className="badge">{job?.state || '…'}</span>
               <button type="button" className="secondary" onClick={loadJob}>
                 Refresh
               </button>
             </div>
             {job?.prUrl ? (
-              <p style={{ marginTop: '0.75rem' }}>
+              <p className="mt-2">
                 PR:{' '}
                 <a href={job.prUrl} target="_blank" rel="noreferrer">
                   {job.prUrl}
                 </a>
               </p>
             ) : (
-              <p className="muted" style={{ marginTop: '0.75rem' }}>
+              <p className="muted mt-2">
                 No PR URL yet.
               </p>
             )}
@@ -156,18 +156,18 @@ export function JobScreen({ jobSlug }: Props) {
         </section>
 
         <section className="section-panel">
-          <div className="row" style={{ justifyContent: 'space-between' }}>
-            <h3 style={{ margin: 0 }}>Files</h3>
+          <div className="row row-between">
+            <h3 className="section-heading">Files</h3>
             <button type="button" className="secondary" onClick={() => void loadFiles()}>
               Reload files
             </button>
           </div>
           {files.length === 0 ? (
-            <p className="muted" style={{ marginTop: '0.75rem' }}>
+            <p className="muted mt-2">
               No files changed.
             </p>
           ) : (
-            <ul className="files" style={{ marginTop: '0.75rem' }}>
+            <ul className="files mt-2">
               {files.map((file) => (
                 <li key={`${file.path}:${file.status}`} className="list-row">
                   <span>{file.path}</span>

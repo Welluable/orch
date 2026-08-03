@@ -16,9 +16,6 @@ export const viewport: Viewport = {
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en">
-      <head>
-        {/* Mona Sans / Mona Sans Mono — system fallbacks via CSS --font / --mono */}
-      </head>
       <body>
         <Suspense fallback={<div className="app-shell"><main className="main">{children}</main></div>}>
           <AppChrome>{children}</AppChrome>
