@@ -1,187 +1,144 @@
 ---
 version: alpha
-name: GitHub
-description: "Join the world's most widely adopted, AI-powered developer platform where millions of developers, businesses, and the largest open source community build software that advances humanity."
-sourceUrl: "https://github.com"
+name: OpenAI
+description: "A light interface extracted from OpenAI accented with #8e8ea0, with a 8px spacing system and a system-ui type stack."
+sourceUrl: "https://openai.com"
 
 colors:
-  primary: "#8dd6ff"
-  on-primary: "#111111"
-  background: "#000000"
-  surface: "#0d1117"
-  border: "#ffffff"
-  text: "#ffffff"
+  primary: "#8e8ea0"
+  on-primary: "#ffffff"
+  text: "#8e8ea0"
   text-muted: "#000000"
-  accent: "#0d1117"
 
 typography:
   display:
-    fontFamily: "Mona Sans, MonaSansFallback, -apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif, Apple Color Emoji, Segoe UI Emoji"
-    fontSize: 40px
-    fontWeight: 460
-    lineHeight: 1.2
+    fontFamily: "system-ui, sans-serif"
+    fontSize: 48px
+    fontWeight: 700
+    lineHeight: 1.5
   heading:
-    fontFamily: "Mona Sans, MonaSansFallback, -apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif, Apple Color Emoji, Segoe UI Emoji"
-    fontSize: 22px
-    fontWeight: 400
-    lineHeight: 1.4
+    fontFamily: "system-ui, sans-serif"
+    fontSize: 32px
+    fontWeight: 600
+    lineHeight: 1.5
   body:
-    fontFamily: "Mona Sans, MonaSansFallback, -apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif, Apple Color Emoji, Segoe UI Emoji"
-    fontSize: 16px
-    fontWeight: 500
-    lineHeight: 1.5
-  mono:
-    fontFamily: "Mona Sans Mono, monospace"
+    fontFamily: "system-ui, sans-serif"
     fontSize: 16px
     fontWeight: 400
     lineHeight: 1.5
-    letterSpacing: 0.5px
 
 spacing:
-  base: 4px
-  scale: [4, 8, 12, 16, 20, 24, 32, 40, 48, 64]
+  base: 8px
+  scale: [8]
 
 radius:
-  sm: 6px
-  md: 8px
-  lg: 16px
-  xl: 24px
-
-shadows:
-  card: "rgba(209, 217, 224, 0.25) 0px 0px 0px 1px, rgba(37, 41, 46, 0.04) 0px 6px 12px -3px, rgba(37, 41, 46, 0.12) 0px 6px 18px 0px"
-  elevated: "rgba(209, 217, 224, 0.25) 0px 0px 0px 1px, rgba(37, 41, 46, 0.04) 0px 6px 12px -3px, rgba(37, 41, 46, 0.12) 0px 6px 18px 0px"
+  sm: 5px
 
 motion:
-  duration-fast: 80ms
+  duration-fast: 400ms
   duration-base: 400ms
-  duration-slow: 800ms
-  easing: "cubic-bezier(0.16, 1, 0.3, 1)"
+  duration-slow: 400ms
+  easing: "ease"
 
-breakpoints: [380px, 420px, 544px, 600px, 767px, 768px, 800px, 804px, 876px, 1012px, 1029px, 1150px, 1200px, 1280px, 1300px, 1400px, 1464px, 1600px, 1728px]
+breakpoints: [768px]
 ---
 
 ## Rationale
 
-GitHub's design system reflects its position as a **developer-first, AI-augmented collaborative platform**. The dark theme (black `#000000` background with `#0d1117` surfaces) reduces eye strain during extended coding sessions and establishes a professional, forward-thinking aesthetic that appeals to engineers. The measured color palette prioritizes **high contrast and clarity**—white text on near-black, with a bright cyan primary (`#8dd6ff`) that signals interactivity and draws attention to critical actions (sign-in, CTAs). The typography stack (Mona Sans as the primary font) is custom-built for the brand, signaling investment in distinctive visual identity while fallbacks ensure reliability across platforms. Spacing follows a strict 4px base unit with a thoughtful scale (4, 8, 12, 16, 20, 24, 32, 48, 64), enabling precise alignment and rhythm across thousands of repositories, pull requests, and collaborative interfaces. The system balances **density with breathing room**—necessary for information-heavy dashboards while maintaining legibility and cognitive load management for developers context-switching between code, discussions, and settings.
+OpenAI's design system reflects a product positioned at the intersection of advanced technology and human-centered interaction. The measured tokens reveal a deliberately restrained palette—a muted purple-gray primary (#8e8ea0) paired with stark black and white—that avoids the visual aggression typical of tech company branding. This choice suggests confidence: the interface doesn't need to shout. The typography stack defaults to system fonts (system-ui, sans-serif) rather than custom typefaces, prioritizing performance and immediate legibility over distinctive brand presence. Spacing and motion are minimal and consistent (8px base unit, uniform 400ms timing), creating a calm, predictable rhythm that supports focus during complex cognitive tasks like coding assistance. The absence of shadows and a single, modest border radius (5px) reinforces this minimalism—surfaces layer cleanly without depth effects that might add visual noise.
+
+The color palette's restraint is strategic for an AI coding agent. The muted primary color and black text avoid eye fatigue during extended use, while the light color mode keeps the interface approachable rather than austere. There are no secondary colors or accent hues in the measured tokens, suggesting either a highly focused single-purpose interface or a deliberately pared-down measurement set. The on-primary white (used for text atop the muted purple) provides sufficient contrast for readability while maintaining the overall soft aesthetic.
+
+Typography hierarchy is clear but not aggressive: a 3:2 ratio between heading (32px) and body (16px) scales comfortably, with generous 1.5 line height throughout supporting sustained reading. Display text (48px) is reserved for primary communication, but the consistent font weight progression (700 → 600 → 400) avoids jarring shifts. The system-ui default signals that this interface trusts the operating system's rendering—a choice that benefits developers and power users who expect native-like performance.
 
 ## 1. Visual Theme & Atmosphere
 
-GitHub operates in **dark mode by default**, creating a nocturnal, focused environment that mirrors many developers' work habits and IDEs. The near-black background (`#000000`) with slightly elevated surface cards (`#0d1117`) provides subtle depth without introducing bright, distracting elements. The accent color (`#484f58`—a muted slate) is used for secondary UI and disabled states, creating a clear visual hierarchy without competing for attention. The overall mood is **professional, technical, and minimal**—nothing frivolous. This aligns with GitHub's identity as the world's largest open-source collaboration platform where substance matters more than decoration. The sparse use of color (primarily cyan for actions, white for text) enforces focus and makes intentional interactive elements unmissable.
+OpenAI's measured design expresses **calculated simplicity**. The absence of decorative shadows, gradients, or rounded corners beyond 5px creates a flat, engineered aesthetic that aligns with the precision expected from an AI coding tool. This is not minimalism born of constraint but of conviction: every element serves function. The light mode with muted purples and blacks suggests a workspace rather than a consumer app—professional, sustained-use focused, and visually non-intrusive.
+
+The single breakpoint (768px) indicates a design system optimized for tablet and desktop workflows, with mobile likely treated as a secondary concern or responsive fallback. This reinforces positioning as a development-focused tool where large screens and complexity are assumed.
 
 ## 2. Color System
 
-**Primary**: `#8dd6ff` (bright cyan) is deployed on CTAs, links, and interactive affordances, creating strong visual separation against the dark background. This color choice is modern, energetic, and commonly associated with technology and code editors.
+**Primary color:** #8e8ea0 (muted purple-gray)  
+This is the dominant brand color, appearing in interactive elements and key affordances. It is distinctly desaturated—not a vibrant purple but a tone that sits between purple and gray, reducing chromatic stimulation over long sessions.
 
-**Background & Surfaces**: 
-- `#000000` (pure black) as the main canvas
-- `#0d1117` (charcoal) for elevated components (cards, modals, panels)
-This 2-level hierarchy ensures interactive content feels "floating" or "lifted" without introducing multiple tonal layers.
+**On-primary:** #ffffff  
+Text and icons placed atop primary backgrounds use pure white, creating sufficient contrast (estimated ~8:1) while maintaining visual softness.
 
-**Text**:
-- `#ffffff` (white) for primary content and high-emphasis text
-- `#000000` (black—unusually) marked as `text-muted`, suggesting this may be used for overlays or inverted states (white-on-primary backgrounds)
+**Text:** #8e8ea0  
+Body text uses the same muted purple as primary elements, creating visual unity but *not* maximum contrast. This suggests a preference for cohesion over maximum accessibility (see Accessibility section below).
 
-**Border & Accent**:
-- `#ffffff` (white borders) provide crisp edge definition in a dark context
-- `#484f58` (muted slate) for secondary UI, hover states, or disabled interactions
+**Text-muted:** #000000  
+Pure black is reserved for secondary or de-emphasized information, providing clear hierarchy through contrast intensity rather than color.
 
-This is a **deliberately desaturated palette**—no gradients or complex color relationships—enabling rapid visual processing and reducing cognitive load for long work sessions.
+**No secondary colors** are measured, indicating a highly unified, monochromatic system. Accent colors or status indicators (success, error, warning) likely use saturation or value shifts within this limited palette.
 
 ## 3. Typography
 
-GitHub employs a **tiered hierarchy** to manage vast amounts of structured content:
+The system uses four pre-defined scales:
 
-**Display** (40px, 460 weight, 1.2 line height): Reserved for page heroes and major section introductions. The lighter weight (460) keeps large text readable and elegant rather than heavy.
+- **Display (48px, weight 700, 1.5 line height):** Primary page headlines or hero messaging. Bold and spacious, designed for impact without aggression.
+- **Heading (32px, weight 600, 1.5 line height):** Section titles and major content divisions. Slightly lighter weight than display but still commanding.
+- **Body (16px, weight 400, 1.5 line height):** Standard reading text, interface labels, and code documentation. The 1.5 line height (24px total leading) is generous, supporting legibility during sustained reading and reducing eye fatigue.
 
-**Heading** (24px, 600 weight, 1.5 line height): Used for section titles, repository names, and issue/PR headers. The 1.5 line height prevents crowding and aids scanning.
+All scales use system-ui, sans-serif, deferring to the user's operating system default. This choice prioritizes rendering fidelity and native feel over brand distinctiveness. For a coding tool, this is appropriate—developers expect interfaces to feel "of the system," not branded.
 
-**Body** (16px, 500 weight, 1.5 line height): Standard reading text. Mid-weight and generous line height support long-form content (README files, discussions, documentation). The 16px baseline prioritizes legibility on diverse devices.
-
-**Mono** (12px, 400 weight, 1.5 line height, 0.5px letter spacing): Code blocks, file paths, and inline code. Smaller size saves horizontal space; letter spacing prevents visual blurring of symbols and operators critical to developers.
-
-**Font Stack**: Mona Sans (GitHub's custom typeface) with system fallbacks ensures brand consistency while remaining resilient. The monospace variant supports code rendering without requiring a third-party library.
+No monospace font is specified in the measured tokens, though any code display likely uses the browser/OS monospace default or a loaded font managed separately.
 
 ## 4. Components & Patterns
 
-GitHub's measured design supports:
+### Buttons and Interactive Elements
+Interactive elements likely use the primary color (#8e8ea0) with white text. The 5px border radius is applied universally, creating a subtle softness without whimsy. No shadows suggest flat affordances with reliance on color and proximity to signal interactivity.
 
-**Cards & Panels**: 
-- Deployed with `card` shadow (inset border at `rgba(209, 217, 224, 0.25)` + soft drop shadow)
-- `md` radius (8px) for file listings, issue cards, and commit previews
-- Creates visual grouping without harsh edges
+### Form Inputs
+Likely use the 5px radius and muted color scheme. States (focus, hover, error) probably shift text-muted (#000000) or adjust opacity rather than introducing new colors.
 
-**Interactive Elements**:
-- Primary CTAs (Sign in, Sign up, MCP Registry) use the cyan primary with white text and `md` radius
-- Secondary actions styled with border or inverted color to reduce visual weight
-- Hover and active states managed via motion (see Motion & Interaction)
+### Cards and Containers
+No shadows are specified, so content grouping relies on spacing (multiples of 8px), subtle borders, or background color shifts. This creates a clean, layered appearance without visual depth.
 
-**Navigation**:
-- Top-level nav likely uses the surface color with white text
-- Search bar (`Search code, repositories, users...`) is a prominent affordance, likely with cyan accent on focus
-
-**Feedback & Status**:
-- Saved searches, alerts, and secondary navigation use accent color (`#484f58`) for lower-priority information
-- Critical information (secret protection CTAs) likely emphasize primary cyan
+### Motion
+All motion uses the same 400ms duration with ease timing, creating a predictable, non-jarring experience. This uniform approach suggests micro-interactions (hover states, focus indicators, transitions) are present but understated.
 
 ## 5. Spacing & Layout
 
-The **4px base unit** is the foundation:
+The base unit is **8px**, with a single scale entry (8). This suggests a strict 8px grid system where all spacing is a multiple of 8 (8, 16, 24, 32, 40, 48, 56, 64px, etc.). 
 
-| Tier | Value | Use Case |
-|------|-------|----------|
-| 4px  | Tight spacing within components (icon padding, inline gaps) |
-| 8px  | Small padding/margins (button internal spacing) |
-| 12px | Form field padding, compact list items |
-| 16px | Standard container padding, moderate gaps |
-| 20px | Breathing room between sections |
-| 24px | Section dividers, major content breaks |
-| 32px | Large gaps between layout regions |
-| 48px | Hero section spacing, modal padding |
-| 64px | Page-level breaks |
+This is a hallmark of professional product design: it ensures consistency, simplifies responsive scaling, and makes layout math trivial. A developer-focused tool would benefit immensely from this predictability.
 
-This scale enables **pixel-perfect alignment** across responsive breakpoints while keeping file sizes predictable. The 19 measured breakpoints (380px to 1728px) suggest GitHub prioritizes mobile, tablet, desktop, and ultra-wide displays—necessary for a truly global developer audience accessing via phones during standups and on 4K monitors at workstations.
+The single breakpoint at **768px** likely represents the tablet/desktop threshold. Below 768px, the layout responds (possibly stacking sections, resizing typography proportionally). Above 768px, the full multi-column design is revealed. This suggests a mobile web presence but primary optimization for larger screens.
+
+Generous line-height (1.5x across all type scales) and consistent 8px spacing units combine to create a spacious, breathing layout that feels less dense than many modern web products.
 
 ## 6. Motion & Interaction
 
-**Timing**:
-- `durationFastMs: 80`: Micro-interactions (icon toggling, popover entry)
-- `durationBaseMs: 400`: Standard transitions (page navigation, modal open)
-- `durationSlowMs: 800`: Elaborate animations (hero parallax, staggered list reveals)
+All motion is standardized to **400ms (durationFastMs, durationBaseMs, durationSlowMs all equal 400ms)** with **ease** easing, creating a consistent, predictable feel.
 
-**Easing**: `cubic-bezier(0.165, 0.84, 0.44, 1)` is a **custom easing curve** leaning toward ease-out, creating snappy, natural motion that feels responsive without appearing stiff. This is faster on the way in, slower on the way out—ideal for UI that feels reactive to user input.
+This uniform timing is intentional: a coding interface should not surprise the user with inconsistent delays or jarring transitions. The 400ms duration is perceptible but not leisurely—fast enough to feel responsive, slow enough to be followed by the eye.
 
-**Use Cases**:
-- Focus states on inputs/buttons: 80ms opacity fade
-- Dropdown menus: 400ms slide + fade
-- Modals/overlays: 400ms scale-in with easing
-- Navigation transitions: 400ms–800ms staggered element reveals
+**Easing = ease** is the CSS default (cubic-bezier(0.25, 0.1, 0.25, 1)), which begins slowly, accelerates, and decelerates at the end. This is natural and non-fatiguing for repeated interactions.
 
-The motion system avoids being decorative; every transition serves to clarify relationships, confirm actions, or guide attention.
+No spring or bounce easing is present, reinforcing the serious, professional tone. Motion supports task completion, not delight.
+
+---
 
 ## Accessibility
 
 ### Contrast Ratios
 
-**Primary text pair** (`#ffffff` text on `#000000` background):
-- **Measured contrast: 21:1** (white on pure black)
-- **WCAG AAA compliant** (7:1 minimum for AAA; 4.5:1 for AA)
-- This exceeds all standards and is ideal for extended reading
+**Primary text (#8e8ea0) on a white background:** Estimated contrast ratio of ~3.5:1. This **fails WCAG AA** (4.5:1 minimum) and is borderline for WCAG AAA. This is a significant accessibility concern for a product intended for sustained reading and code review.
 
-**Interactive text** (white on `#8dd6ff` primary):
-- **Estimated contrast: ~3.2:1** (white text on bright cyan)
-- **Does NOT meet WCAG AA (4.5:1)** for body text
-- **Acceptable for UI labels/buttons** if button text is large (18px+) or bold; should be tested with actual rendering
-- Recommendation: Use white text on primary only for short labels; consider `on-primary: #111111` (dark text) for larger content areas
+**Black text (#000000) on white background:** Contrast ratio of 21:1, exceeding all WCAG thresholds. Using black for critical or sensitive information mitigates the muted color issue.
 
-**Muted text** (`text-muted: #000000` on background):
-- Likely **inverted for light-mode or overlay states**; on dark backgrounds this is unreadable and suggests tokens are context-aware
-- Never use black text on black background in dark mode
+**White text (#ffffff) on primary background (#8e8ea0):** Contrast ratio of ~8:1, exceeding all thresholds. Buttons and primary affordances are sufficiently accessible.
+
+**Recommendation:** If large bodies of text appear in the muted purple (#8e8ea0), this should be audited and likely remapped to pure black (#000000) or darkened to improve contrast. The current palette favors aesthetic unity over strict accessibility compliance.
 
 ### Minimum Requirements
 
-- **Touch target**: GitHub's UI should enforce 44×44px minimum for buttons, links, and form controls (measured spacing scale supports this—32px + 8px padding = 48px minimum)
-- **Focus indicator**: Implement a **2px solid white or cyan outline with 2px offset** for keyboard navigation. The bright primary cyan would provide sufficient contrast against dark backgrounds while maintaining brand consistency
-- **Keyboard navigation**: All CTAs (Sign in, Sign up, MCP Registry) and interactive components must be reachable via Tab and operable via Enter/Space
-- **ARIA labels**: Repository names, issue states, PR statuses, and save/bookmark buttons require semantic HTML or explicit `aria-label` attributes
-- **Color alone must not convey meaning**: Icons next to status text (closed PRs, draft issues) should include text labels, not color alone
-- **Motion**: Respect `prefers-reduced-motion` media query; disable 800ms slow animations for users who've opted out
+- **Touch target:** 44×44px minimum. With an 8px base unit, this equates to 5.5 base units—achievable via button padding (16px horizontal + 8px vertical padding = ~48px height) and reasonable minimum widths.
+- **Focus indicator:** Should be a 2px outline (likely in the primary #8e8ea0 color or black for higher visibility) with 2px offset from the button edge. The 400ms ease transition should smoothly reveal focus states.
+- **Keyboard navigation:** The system-ui font and flat, predictable spacing should support standard keyboard focus flows. No information should be color-only; interactive elements must have shape and text labels.
+
+---
+
+**Summary:** OpenAI's measured design is a masterclass in engineer-first aesthetics—minimal, consistent, performance-oriented. The trade-off is slightly reduced contrast in body text. For a coding-focused product, this balance is defensible; users of such tools are typically sighted and power-users. However, accessibility audits (especially automated contrast checks) should be performed before any public release.
