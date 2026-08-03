@@ -15,9 +15,11 @@ import { fileURLToPath } from 'node:url';
  *   responses; no auth headers or login UI.
  * - Screens: Products (`/` init + clone, navigate to Product on 201),
  *   Product (GET product detail or GET .../jobs — not Run POST alone — +
- *   job→Job links + Run with uuid `id`), Job (poll/refresh of GET
+ *   job→Job links + Run with uuid `id` + danger “Clean jobs” via POST
+ *   …/jobs/clean with confirm), Job (poll/refresh of GET
  *   /api/jobs/:slug for state/prUrl — not logs-only SSE; logs, files
- *   file.path+file.status, Pause/Resume/Stop). No delete / continue.
+ *   file.path+file.status, Pause/Resume/Stop). No per-job delete /
+ *   continue; no HTTP DELETE (bulk clean is POST).
  * - Mobile-responsive layout cues; root `package.json` `files` includes the
  *   built UI (`ui/out/**`) and `lib/serve.js` serves non-/api static export
  *   (unit 02 packaging + static middleware).
@@ -663,6 +665,62 @@ describe('01-ui-app Product screen', () => {
     // No Continue control labeled for users (forbid Continue button/link text).
     assert.doesNotMatch(src, /<(button|a|Link)[^>]*>\s*[^<]*\bContinue\b/);
     assert.doesNotMatch(src, />\s*Continue\s*</);
+  });
+
+  it('exposes a danger Clean jobs control that POSTs …/jobs/clean after confirm', () => {
+    const productSrc = exists(path.join(uiRoot, 'components', 'ProductScreen.tsx'))
+      ? read(path.join(uiRoot, 'components', 'ProductScreen.tsx'))
+      : allUiSourceText();
+    const src = allUiSourceText();
+
+    assert.ok(
+      />\s*Clean jobs\s*</.test(productSrc) || /['"`]Clean jobs['"`]/.test(productSrc),
+      'Product screen must expose a user-facing “Clean jobs” control label',
+    );
+
+    assert.ok(
+      /\/api\/products\/[^'"`\n]*\/jobs\/clean|\/jobs\/clean/.test(productSrc),
+      'Clean jobs must POST /api/products/:product/jobs/clean',
+    );
+    assert.ok(
+      /method\s*:\s*['"]POST['"]/.test(productSrc) &&
+        /\/jobs\/clean/.test(productSrc),
+      'Clean jobs must use POST (not DELETE) to …/jobs/clean',
+    );
+
+    assert.ok(
+      /window\.confirm|confirm\s*\(/.test(productSrc),
+      'Clean jobs must confirm with window.confirm before POST',
+    );
+
+    assert.ok(
+      /className=\{?['"`][^'"`]*\bdanger\b|className=\{[^}]*danger|\.danger|['"`]danger['"`]/.test(
+        productSrc,
+      ),
+      'Clean jobs control must use button.danger styling',
+    );
+
+    // Disabled when busy, loading, or no jobs (jobs.length === 0).
+    assert.ok(
+      /disabled=\{[^}]*(?:busy|loading|jobs\.length)/.test(productSrc) ||
+        /disabled=\{[^}]*jobs\.length\s*===\s*0/.test(productSrc) ||
+        (/\bbusy\b/.test(productSrc) &&
+          /\bloading\b/.test(productSrc) &&
+          /jobs\.length/.test(productSrc) &&
+          /disabled=/.test(productSrc)),
+      'Clean jobs must disable when busy, loading, or jobs.length === 0',
+    );
+
+    // Still no HTTP DELETE anywhere in the UI (bulk clean is POST).
+    assert.doesNotMatch(src, /method\s*:\s*['"]DELETE['"]/);
+    // No per-job delete control label on Job screen.
+    const jobSrc = exists(path.join(uiRoot, 'components', 'JobScreen.tsx'))
+      ? read(path.join(uiRoot, 'components', 'JobScreen.tsx'))
+      : '';
+    if (jobSrc) {
+      assert.doesNotMatch(jobSrc, />\s*Delete\s*</);
+      assert.doesNotMatch(jobSrc, /['"`]Delete job['"`]|['"`]Delete['"`]/);
+    }
   });
 });
 

@@ -24,7 +24,10 @@ import { jobPaths, readJob, writeJob } from '../lib/jobs.js';
  * - HTTP (no auth): `GET /api/healthz`; product routes below; `POST
  *   /api/products/:product/jobs` for an existing product dir; `GET /api/jobs`,
  *   `GET /api/jobs/:slug`, `GET /api/jobs/:slug/logs`, `GET /api/jobs/:slug/files`,
- *   `GET /api/products/:product/jobs`, `POST .../pause|resume|stop`.
+ *   `GET /api/products/:product/jobs`, `POST
+ *   /api/products/:product/jobs/clean` (product-scoped `cleanJobs`; 409 when
+ *   live jobs block; distinct from create-job POST …/jobs), `POST
+ *   .../pause|resume|stop`.
  * - Phase 2 products: `GET`/`POST /api/products`, `GET`/`PATCH
  *   /api/products/:product` (no DELETE). Slug
  *   `/^[a-z0-9]+(?:-[a-z0-9]+)*$/` max 64; required `name` + `slug`.
@@ -1132,6 +1135,137 @@ describe('serve HTTP jobs API (scan + controls + logs)', () => {
         `close must not signal child pid; got ${JSON.stringify(killed)}`,
       );
       assert.equal(readJob(productDir, 'live-job-eeee').state, 'running');
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('POST /api/products/:product/jobs/clean wipes that product’s jobs only', async () => {
+    const home = makeTmpHome();
+    try {
+      const aDir = seedProduct(home, 'clean-a');
+      const bDir = seedProduct(home, 'clean-b');
+      seedJob(aDir, 'a-done-1111', {
+        product: 'clean-a',
+        state: 'done',
+        finishedAt: '2026-08-01T00:00:00.000Z',
+        exitCode: 0,
+        pid: null,
+      });
+      seedJob(aDir, 'a-done-2222', {
+        product: 'clean-a',
+        state: 'done',
+        finishedAt: '2026-08-02T00:00:00.000Z',
+        exitCode: 0,
+        pid: null,
+      });
+      seedJob(bDir, 'b-done-3333', {
+        product: 'clean-b',
+        state: 'done',
+        finishedAt: '2026-08-01T00:00:00.000Z',
+        exitCode: 0,
+        pid: null,
+      });
+
+      const handle = await startTestServe(home);
+      try {
+        const { res, json } = await jsonRequest(
+          handle.baseUrl,
+          'POST',
+          '/api/products/clean-a/jobs/clean',
+        );
+        assert.equal(res.status, 200);
+        assert.equal(json?.ok, true);
+        assert.ok(Array.isArray(json?.removed));
+        assert.deepEqual([...json.removed].sort(), ['a-done-1111', 'a-done-2222']);
+
+        assert.equal(readJob(aDir, 'a-done-1111'), null);
+        assert.equal(readJob(aDir, 'a-done-2222'), null);
+        assert.deepEqual(fs.readdirSync(path.join(aDir, '.orch')), []);
+        assert.ok(readJob(bDir, 'b-done-3333'), 'other product jobs must remain');
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('POST /api/products/:product/jobs/clean is a no-op when the product has no jobs', async () => {
+    const home = makeTmpHome();
+    try {
+      seedProduct(home, 'empty-clean');
+      const handle = await startTestServe(home);
+      try {
+        const { res, json } = await jsonRequest(
+          handle.baseUrl,
+          'POST',
+          '/api/products/empty-clean/jobs/clean',
+        );
+        assert.equal(res.status, 200);
+        assert.equal(json?.ok, true);
+        assert.deepEqual(json?.removed, []);
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('POST /api/products/:product/jobs/clean → 404 for unknown product', async () => {
+    const home = makeTmpHome();
+    try {
+      const handle = await startTestServe(home);
+      try {
+        const { res, json } = await jsonRequest(
+          handle.baseUrl,
+          'POST',
+          '/api/products/nope/jobs/clean',
+        );
+        assert.equal(res.status, 404);
+        assert.equal(json?.error, 'product not found');
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('POST /api/products/:product/jobs/clean → 409 when a live job blocks clean', async () => {
+    const home = makeTmpHome();
+    try {
+      const productDir = seedProduct(home, 'live-clean');
+      seedJob(productDir, 'live-running-0000', {
+        product: 'live-clean',
+        state: 'running',
+        pid: process.pid,
+      });
+      seedJob(productDir, 'done-job-0001', {
+        product: 'live-clean',
+        state: 'done',
+        finishedAt: '2026-08-01T00:00:00.000Z',
+        exitCode: 0,
+        pid: null,
+      });
+
+      const handle = await startTestServe(home);
+      try {
+        const { res, json } = await jsonRequest(
+          handle.baseUrl,
+          'POST',
+          '/api/products/live-clean/jobs/clean',
+        );
+        assert.equal(res.status, 409);
+        assert.match(String(json?.error || ''), /live-running-0000/);
+        assert.match(String(json?.error || ''), /orch stop|cannot clean|live/i);
+
+        assert.ok(readJob(productDir, 'live-running-0000'), 'live job dir must remain');
+        assert.ok(readJob(productDir, 'done-job-0001'), 'sibling jobs must remain on refuse');
+      } finally {
+        await handle.close();
+      }
     } finally {
       fs.rmSync(home, { recursive: true, force: true });
     }

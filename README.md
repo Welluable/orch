@@ -395,8 +395,9 @@ under `$HOME/.orch/products/<slug>/` with a `product.json` and a GitHub
 
 **Jobs.** Every served job runs detached in that product's cwd and **always**
 enables `--pr` (publish). The UI shows status, PR URL, logs, files changed,
-and Pause / Resume / Stop. Continue-from-UI is not available — use
-`orch continue` on the CLI.
+and Pause / Resume / Stop, plus Clean jobs on the product page (wipes that
+product’s tracked runs; refuses while live). Continue-from-UI is not available —
+use `orch continue` on the CLI.
 
 **Security.** There is **no authentication** in v1. The default bind is
 `0.0.0.0` so phones on the same network can reach the UI. Startup prints a
