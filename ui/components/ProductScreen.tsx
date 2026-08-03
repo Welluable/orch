@@ -88,7 +88,7 @@ export function ProductScreen({ productSlug }: Props) {
     <div>
       <header className="page-header">
         <div>
-          <p className="muted" style={{ margin: '0 0 0.35rem' }}>
+          <p className="muted back-link">
             <Link href="/">← Products</Link>
           </p>
           <h1 className="page-title">{product?.name || productSlug}</h1>
@@ -116,8 +116,8 @@ export function ProductScreen({ productSlug }: Props) {
       </section>
 
       <section className="section-panel">
-        <div className="row" style={{ justifyContent: 'space-between' }}>
-          <h2 style={{ margin: 0 }}>Jobs</h2>
+        <div className="row row-between">
+          <h2 className="section-heading">Jobs</h2>
           <button
             type="button"
             className="danger"
