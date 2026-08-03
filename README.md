@@ -142,9 +142,10 @@ orch/<slug>                           # branch
 `research` and `planner` run in your invocation directory and write to the
 paths above. Implementer stages (test-writer, test-critic, code-writer,
 test-runner) run inside the worktree instead. The worktree is never deleted
-automatically — it's left in place after the run so you can inspect,
-continue, or merge the work whenever you're ready. With `--pr`, orch also
-writes `pr.md` and records `base` / `remote` / `pushedAt` / `prUrl` /
+automatically after a run — it's left in place so you can inspect, continue,
+or merge whenever you're ready. Use `orch jobs delete <slug>` when you want
+to remove a specific job and force-clean its worktree/branch. With `--pr`,
+orch also writes `pr.md` and records `base` / `remote` / `pushedAt` / `prUrl` /
 `prNumber` on `run.json`.
 
 `run.json` is written for every invocation — default, `--quick`, `--ask`, and
@@ -300,7 +301,12 @@ Job-control subcommands (see [Headless runs](#headless-runs)):
 - `orch jobs clean` — deletes every run tracked under `.orch/` in the current
   directory, after a `y/N` confirmation prompt. Refuses (without prompting)
   if any job is still live (`running`/`pausing`/`paused` with an alive pid);
-  run `orch stop <slug>` first, then clean.
+  run `orch stop <slug>` first, then clean. Does **not** remove git worktrees.
+- `orch jobs delete <slug> [-y|--yes]` — deletes one run's `.orch/<slug>/`
+  directory after a `y/N` confirmation (`--yes` skips the prompt). Force-
+  removes that job's git worktree and local `orch/<slug>` branch when present
+  (recorded path, or the on-disk createWorktree sibling). Refuses live jobs;
+  run `orch stop <slug>` first. Leaf-only — does not cascade to children.
 
 Serve (see [Serve (home products + mobile UI)](#serve-home-products--mobile-ui)):
 
@@ -354,6 +360,7 @@ orch continue swift-lagoon-49ea "follow-up polish"  # new work on a done run
 orch logs swift-lagoon-49ea -f # follow orch.log until the run finishes
 orch stop swift-lagoon-49ea   # SIGTERM the run
 orch jobs clean                # delete every tracked run under .orch/ (asks to confirm; refuses if live)
+orch jobs delete <slug> --yes  # delete one run + force-remove its worktree/branch if present
 ```
 
 Pausing is cooperative and happens at stage boundaries (before the first

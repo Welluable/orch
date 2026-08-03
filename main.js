@@ -39,6 +39,7 @@ import {
     cascadeResume,
     stopJob,
     cleanJobs,
+    deleteJob,
     liveSlugsBlockingClean,
     isPidAlive,
     reopenJob,
@@ -5458,6 +5459,71 @@ jobsCmd
         try {
             const removed = cleanJobs(cwd);
             console.log(`deleted ${removed.length} job${removed.length === 1 ? '' : 's'} from .orch/`);
+        } catch (err) {
+            console.error(`Error: ${err.message}`);
+            process.exit(1);
+        }
+    });
+
+jobsCmd
+    .command('delete')
+    .argument('<slug>', 'Run slug to delete')
+    .option('-y, --yes', 'Skip the confirmation prompt')
+    .description(
+        'Delete one orch job from .orch/ and force-remove its worktree/branch if present ' +
+        '(refuses while that job is live; orch stop <slug> first)',
+    )
+    .action(async (slug, options) => {
+        const cwd = process.cwd();
+        const record = readJob(cwd, slug);
+        if (!record) {
+            console.error(`Error: unknown run ${slug}`);
+            process.exit(1);
+            return;
+        }
+
+        // Refuse before prompting so we never ask to delete a live job.
+        const live = liveSlugsBlockingClean(cwd);
+        if (live.includes(slug)) {
+            console.error(
+                `Error: cannot delete live job ${slug}. ` +
+                `Stop it first with: orch stop ${slug}`,
+            );
+            process.exit(1);
+            return;
+        }
+
+        if (!options.yes) {
+            const rl = readline.createInterface({ input, output });
+            let answer;
+            try {
+                answer = await rl.question('Are you sure? [y/N] ');
+            } finally {
+                rl.close();
+            }
+
+            if (!/^y(es)?$/i.test(answer.trim())) {
+                console.log('aborted');
+                return;
+            }
+        }
+
+        try {
+            const result = deleteJob(cwd, slug);
+            if (result.status === 'missing') {
+                console.error(`Error: unknown run ${slug}`);
+                process.exit(1);
+                return;
+            }
+            if (result.status === 'blocked') {
+                console.error(
+                    `Error: cannot delete live job ${slug}. ` +
+                    `Stop it first with: orch stop ${slug}`,
+                );
+                process.exit(1);
+                return;
+            }
+            console.log(`deleted ${slug}`);
         } catch (err) {
             console.error(`Error: ${err.message}`);
             process.exit(1);
