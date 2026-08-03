@@ -24,9 +24,10 @@ orch: commit: a1b2c3d on orch/verbose-flag-x7q2
 
 ## Why orch?
 
-- **Triage respects small work.** A one-line typo fix doesn't get a worktree,
-  a test-writer, or a five-round loop — triage routes it straight to a
-  `quick-fix` agent editing your current tree.
+- **Triage respects small work.** A one-line typo fix doesn't get research,
+  a planner, or a five-round loop — triage routes it straight to a
+  `quick-fix` agent (in-place without `--pr`; in a worktree with `--pr`
+  so a PR can still open).
 - **Verify before you implement.** Tests or acceptance criteria are written
   and frozen before any implementation code exists, so "done" means "passes
   the check," not "the agent said so."
@@ -74,7 +75,7 @@ From there, either a short path or the full phase sequence runs.
 | Phase | What happens |
 | --- | --- |
 | Triage | Classifies the task as a quick fix or complex work needing the full pipeline. |
-| Quick-fix | A single agent edits the current working tree directly; no artifacts, no worktree. |
+| Quick-fix | A single agent edits directly; without `--pr`, in the current tree (no artifacts/worktree). With `--pr`, in a fresh worktree, then commit + publish. |
 | Research | Reads the codebase and invocation-directory context, writes `research.md`. |
 | Plan | Turns research into a concrete task checklist, writes `task.md`. |
 | Worktree | Creates a sibling git worktree and an `orch/<slug>` branch for isolated implementation. |
@@ -90,11 +91,14 @@ or all of this table — see [Execution modes](#execution-modes).
 
 Triage looks at the task text and decides whether it's a small, safe change
 or something that needs the full pipeline. Small changes route to a
-`quick-fix` agent that edits your current working tree directly — no
-artifacts, no worktree, no fix plan. `--quick` forces this same direct-edit
-path without asking triage first. `--ask` is separate again: it skips triage
-entirely and every write pipeline, spawning one read-only agent that answers
-your question and prints the reply.
+`quick-fix` agent. Without `--pr`, that agent edits your current working
+tree directly — no artifacts, no worktree. With `--pr`, orch still skips
+research/planner/loops, but creates a worktree, runs quick-fix there,
+commits, and publishes a PR. `--quick` forces the in-place direct-edit
+path without asking triage first (and cannot be combined with `--pr`).
+`--ask` is separate again: it skips triage entirely and every write
+pipeline, spawning one read-only agent that answers your question and
+prints the reply.
 
 ### Verification loops
 
@@ -177,7 +181,7 @@ agent CLI does all the actual reading and writing of files.
 | `--ask` | Skips triage and all write pipelines; one read-only agent answers and orch prints the reply. | You want an answer about the codebase, not a change. |
 | `--dry-run` | Checks the selected agent CLI is on `PATH` and exits without running the pipeline. | You want to sanity-check your setup before a real run. |
 | `--detach` | Runs the pipeline in a background process and returns immediately, printing the run slug. Manage it with `orch list/status/pause/resume/stop/logs`. | You want to kick off a run and keep using your shell, or run several tasks concurrently. |
-| `--pr` | After a successful commit on the complex path, pushes `orch/<slug>` and opens a pull request with `gh`. | You want a PR instead of a local merge hint (required later for served jobs). |
+| `--pr` | Always create a worktree, commit, push `orch/<slug>`, and open a PR with `gh` — including when triage routes to quick-fix (research/planner skipped on that path). | You want a PR instead of a local merge hint (required later for served jobs). |
 
 For `--ask`, Cursor uses `--mode ask`, Claude uses `--permission-mode plan`,
 `agn` is prompt-only best-effort (it has no dedicated read-only flag), and
@@ -192,11 +196,14 @@ directory, each with its own slug.
 
 ### Pull requests
 
-`orch "<task>" --pr` adds a publish phase after commit: push
+`orch "<task>" --pr` always ends with a worktree-based publish: push
 `orch/<slug>` to `origin`, then open a PR with `gh` (or reuse an existing
-open PR for that head). The PR title is the first line of the task; the
+open PR for that head). When triage chooses quick-fix, orch still
+creates the worktree and publishes — it only skips research, planner, and
+the test/code loops. The PR title is the first line of the task; the
 body is assembled mechanically into `.orch/<slug>/pr.md` from the task
-text, `task.md`, and the files-changed rollup — no agent writes it.
+text, `task.md` (when present), and the files-changed rollup — no agent
+writes it.
 
 `--base <branch>` names a remote branch (`main`, not `origin/main`). With
 `--pr` it is both the worktree start point (`origin/<base>`) and the PR
@@ -206,10 +213,10 @@ the remote default via `origin/HEAD`.
 
 `--pr` requires `gh` on `PATH` and authenticated (`gh auth status`); that
 check runs before any job is created. It cannot be combined with `--ask`,
-`--quick`, or `--dry-run`. Skips (still `done`): triage → quick-fix, or
-nothing to commit. Failures (job `failed` at `phase: "publish"`, commit
-kept): push rejected or `gh pr create` failed. The local `merge: git merge …`
-hint is suppressed when a PR URL is reported.
+`--quick`, or `--dry-run`. Skip (still `done`): nothing to commit.
+Failures (job `failed` at `phase: "publish"`, commit kept): push rejected
+or `gh pr create` failed. The local `merge: git merge …` hint is
+suppressed when a PR URL is reported.
 
 ## CLI Reference
 
@@ -230,9 +237,10 @@ Usage: orch [options] [command] <task...>
   tree; creates no artifacts, worktrees, or commits.
 - `--detach` — runs the pipeline in the background and returns immediately,
   printing `started <slug> (pid <pid>)`; rejects `--ask`/`--quick`/`--dry-run`.
-- `--pr` — after a successful commit, push `orch/<slug>` and open a pull
-  request with `gh`; requires `gh` on `PATH` and authenticated; rejects
-  `--ask`/`--quick`/`--dry-run`. See [Pull requests](#pull-requests).
+- `--pr` — always create a worktree, commit, push `orch/<slug>`, and open a
+  pull request with `gh` (including triage → quick-fix); requires `gh` on
+  `PATH` and authenticated; rejects `--ask`/`--quick`/`--dry-run`. See
+  [Pull requests](#pull-requests).
 - `--base <branch>` — remote base branch for the worktree start point
   (`origin/<branch>`) and, with `--pr`, the pull request base; defaults to
   the remote's default branch when `--pr` is set without `--base`.
