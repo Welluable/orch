@@ -1,12 +1,13 @@
 import { describe, it, mock } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runPipeline, runDetached } from '../main.js';
 import { readJob, writeJob, listJobs, patchJob as realPatchJob, checkpointPause as realCheckpointPause } from '../lib/jobs.js';
+import { createWorktree } from '../lib/worktree.js';
 
 /**
  * Contract this file pins down for the headless-run additions to main.js
@@ -557,6 +558,12 @@ describe('--help reflects the headless surface', () => {
     assert.equal(code, 0);
     assert.match(stdout, /\bclean\b/);
   });
+
+  it('lists the jobs delete subcommand', async () => {
+    const { code, stdout } = await runCli(['jobs', '--help']);
+    assert.equal(code, 0);
+    assert.match(stdout, /\bdelete\b/);
+  });
 });
 
 describe('orch jobs clean', () => {
@@ -669,6 +676,264 @@ describe('orch jobs clean', () => {
       assert.equal(fs.existsSync(path.join(tmpCwd, '.orch', 'done-clean-0001', 'run.json')), true);
     } finally {
       fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('orch jobs delete', () => {
+  it('shows usage for jobs delete --help including --yes', async () => {
+    const { code, stdout } = await runCli(['jobs', 'delete', '--help']);
+    assert.equal(code, 0);
+    assert.match(stdout, /delete/);
+    assert.match(stdout, /<slug>/);
+    assert.match(stdout, /--yes|-y/);
+  });
+
+  it('exits non-zero for an unknown slug without prompting', async () => {
+    const tmpCwd = makeTmpCwd('orch-jobs-delete-missing-');
+    try {
+      const { code, stdout, stderr } = await runCli(
+        ['jobs', 'delete', 'nobody-here-0000'],
+        { cwd: tmpCwd, stdin: 'y\n' },
+      );
+      assert.notEqual(code, 0);
+      const combined = `${stdout}\n${stderr}`;
+      assert.match(combined, /nobody-here-0000/);
+      assert.equal(/Are you sure\? \[y\/N\]/.test(stdout), false);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('aborts without deleting when the answer is N / empty', async () => {
+    const tmpCwd = makeTmpCwd('orch-jobs-delete-abort-');
+    try {
+      writeJob(tmpCwd, 'keep-me-0000', {
+        slug: 'keep-me-0000',
+        task: 'keep',
+        agent: 'claude',
+        state: 'done',
+        startedAt: new Date().toISOString(),
+        finishedAt: new Date().toISOString(),
+        exitCode: 0,
+        pid: process.pid,
+        worktree: null,
+        branch: null,
+      });
+
+      const { code, stdout } = await runCli(
+        ['jobs', 'delete', 'keep-me-0000'],
+        { cwd: tmpCwd, stdin: '\n' },
+      );
+      assert.equal(code, 0);
+      assert.match(stdout, /Are you sure\? \[y\/N\]/);
+      assert.match(stdout, /aborted/);
+      assert.equal(fs.existsSync(path.join(tmpCwd, '.orch', 'keep-me-0000', 'run.json')), true);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('deletes the named job when confirmed with y and leaves siblings', async () => {
+    const tmpCwd = makeTmpCwd('orch-jobs-delete-yes-');
+    try {
+      writeJob(tmpCwd, 'drop-me-0000', {
+        slug: 'drop-me-0000',
+        task: 'drop',
+        agent: 'claude',
+        state: 'done',
+        startedAt: new Date().toISOString(),
+        finishedAt: new Date().toISOString(),
+        exitCode: 0,
+        pid: process.pid,
+        worktree: null,
+        branch: null,
+      });
+      writeJob(tmpCwd, 'keep-me-0001', {
+        slug: 'keep-me-0001',
+        task: 'keep',
+        agent: 'claude',
+        state: 'done',
+        startedAt: new Date().toISOString(),
+        finishedAt: new Date().toISOString(),
+        exitCode: 0,
+        pid: process.pid,
+        worktree: null,
+        branch: null,
+      });
+
+      const { code, stdout } = await runCli(
+        ['jobs', 'delete', 'drop-me-0000'],
+        { cwd: tmpCwd, stdin: 'y\n' },
+      );
+      assert.equal(code, 0);
+      assert.match(stdout, /Are you sure\? \[y\/N\]/);
+      assert.match(stdout, /deleted.*drop-me-0000|drop-me-0000.*deleted/i);
+      assert.equal(fs.existsSync(path.join(tmpCwd, '.orch', 'drop-me-0000')), false);
+      assert.equal(fs.existsSync(path.join(tmpCwd, '.orch', 'keep-me-0001', 'run.json')), true);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('skips the confirm prompt with --yes', async () => {
+    const tmpCwd = makeTmpCwd('orch-jobs-delete-flag-yes-');
+    try {
+      writeJob(tmpCwd, 'wipe-me-0000', {
+        slug: 'wipe-me-0000',
+        task: 'wipe',
+        agent: 'claude',
+        state: 'done',
+        startedAt: new Date().toISOString(),
+        finishedAt: new Date().toISOString(),
+        exitCode: 0,
+        pid: process.pid,
+        worktree: null,
+        branch: null,
+      });
+
+      const { code, stdout } = await runCli(
+        ['jobs', 'delete', 'wipe-me-0000', '--yes'],
+        { cwd: tmpCwd },
+      );
+      assert.equal(code, 0);
+      assert.equal(/Are you sure\? \[y\/N\]/.test(stdout), false);
+      assert.match(stdout, /deleted.*wipe-me-0000|wipe-me-0000.*deleted/i);
+      assert.equal(fs.existsSync(path.join(tmpCwd, '.orch', 'wipe-me-0000')), false);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses a live-pid job before the confirm prompt (non-zero, dir untouched)', async () => {
+    const tmpCwd = makeTmpCwd('orch-jobs-delete-live-');
+    try {
+      writeJob(tmpCwd, 'live-delete-0000', {
+        slug: 'live-delete-0000',
+        task: 'still running',
+        agent: 'claude',
+        state: 'running',
+        startedAt: new Date().toISOString(),
+        finishedAt: null,
+        exitCode: null,
+        pid: process.pid,
+        worktree: null,
+        branch: null,
+      });
+
+      const { code, stdout, stderr } = await runCli(
+        ['jobs', 'delete', 'live-delete-0000'],
+        { cwd: tmpCwd, stdin: 'y\n' },
+      );
+
+      assert.notEqual(code, 0);
+      const combined = `${stdout}\n${stderr}`;
+      assert.match(combined, /live-delete-0000/);
+      assert.match(combined, /orch stop/);
+      assert.equal(/Are you sure\? \[y\/N\]/.test(stdout), false);
+      assert.equal(fs.existsSync(path.join(tmpCwd, '.orch', 'live-delete-0000', 'run.json')), true);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  function initTmpGitRepo(prefix) {
+    const parent = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+    const repoDir = path.join(parent, 'repo');
+    fs.mkdirSync(repoDir);
+    execFileSync('git', ['init', '-q'], { cwd: repoDir });
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: repoDir });
+    execFileSync('git', ['config', 'user.name', 'Test'], { cwd: repoDir });
+    fs.writeFileSync(path.join(repoDir, 'README.md'), 'hello\n');
+    execFileSync('git', ['add', '.'], { cwd: repoDir });
+    execFileSync('git', ['commit', '-q', '-m', 'init'], { cwd: repoDir });
+    return { parent, repoDir };
+  }
+
+  it('force-removes the recorded worktree and orch/<slug> branch with --yes', async () => {
+    const { parent, repoDir } = initTmpGitRepo('orch-jobs-delete-wt-');
+    const slug = 'cli-wt-0000';
+    try {
+      const created = createWorktree({ cwd: repoDir, slug });
+      assert.ok(fs.existsSync(created.worktreePath));
+
+      writeJob(repoDir, slug, {
+        slug,
+        task: 'had a worktree',
+        agent: 'claude',
+        state: 'done',
+        startedAt: new Date().toISOString(),
+        finishedAt: new Date().toISOString(),
+        exitCode: 0,
+        pid: process.pid,
+        cwd: repoDir,
+        worktree: created.worktreePath,
+        branch: created.branch,
+      });
+
+      const { code, stdout } = await runCli(
+        ['jobs', 'delete', slug, '--yes'],
+        { cwd: repoDir },
+      );
+
+      assert.equal(code, 0);
+      assert.match(stdout, new RegExp(`deleted.*${slug}|${slug}.*deleted`, 'i'));
+      assert.equal(fs.existsSync(path.join(repoDir, '.orch', slug)), false);
+      assert.equal(fs.existsSync(created.worktreePath), false);
+
+      const branchList = execFileSync('git', ['branch', '--list', `orch/${slug}`], {
+        cwd: repoDir,
+        encoding: 'utf8',
+      });
+      assert.equal(branchList.trim(), '');
+    } finally {
+      fs.rmSync(parent, { recursive: true, force: true });
+      const leftover = path.join(path.dirname(repoDir), `${path.basename(repoDir)}-${slug}`);
+      fs.rmSync(leftover, { recursive: true, force: true });
+    }
+  });
+
+  it('force-removes an on-disk createWorktree sibling when record.worktree is null', async () => {
+    const { parent, repoDir } = initTmpGitRepo('orch-jobs-delete-sib-');
+    const slug = 'cli-sib-0000';
+    try {
+      const created = createWorktree({ cwd: repoDir, slug });
+      assert.ok(fs.existsSync(created.worktreePath));
+
+      // Stale/ask-shaped record: no worktree/branch fields, but sibling still on disk.
+      writeJob(repoDir, slug, {
+        slug,
+        task: 'orphan sibling',
+        agent: 'claude',
+        state: 'done',
+        startedAt: new Date().toISOString(),
+        finishedAt: new Date().toISOString(),
+        exitCode: 0,
+        pid: process.pid,
+        cwd: repoDir,
+        worktree: null,
+        branch: null,
+      });
+
+      const { code, stdout } = await runCli(
+        ['jobs', 'delete', slug, '--yes'],
+        { cwd: repoDir },
+      );
+
+      assert.equal(code, 0);
+      assert.match(stdout, new RegExp(`deleted.*${slug}|${slug}.*deleted`, 'i'));
+      assert.equal(fs.existsSync(path.join(repoDir, '.orch', slug)), false);
+      assert.equal(fs.existsSync(created.worktreePath), false);
+
+      const branchList = execFileSync('git', ['branch', '--list', `orch/${slug}`], {
+        cwd: repoDir,
+        encoding: 'utf8',
+      });
+      assert.equal(branchList.trim(), '');
+    } finally {
+      fs.rmSync(parent, { recursive: true, force: true });
+      const leftover = path.join(path.dirname(repoDir), `${path.basename(repoDir)}-${slug}`);
+      fs.rmSync(leftover, { recursive: true, force: true });
     }
   });
 });
