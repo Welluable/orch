@@ -16,8 +16,9 @@ import { fileURLToPath } from 'node:url';
  * - Screens: Products (`/` init + clone, navigate to Product on 201),
  *   Product (GET product detail or GET .../jobs — not Run POST alone — +
  *   job→Job links + Run with uuid `id`), Job (poll/refresh of GET
- *   /api/jobs/:slug for state/prUrl — not logs-only SSE; logs, files
- *   file.path+file.status, Pause/Resume/Stop). No delete / continue.
+ *   /api/jobs/:slug for state/prUrl — not logs-only SSE; also poll/refresh
+ *   GET /api/jobs/:slug/files so the Files card updates without manual Reload;
+ *   logs, files file.path+file.status, Pause/Resume/Stop). No delete / continue.
  * - Mobile-responsive layout cues; root `package.json` `files` includes the
  *   built UI (`ui/out/**`) and `lib/serve.js` serves non-/api static export
  *   (unit 02 packaging + static middleware).
@@ -197,6 +198,140 @@ function fnHitsJobStatus(src, fn) {
   );
   const m = re.exec(src);
   return m ? mentionsJobStatusApi(m[1]) : false;
+}
+
+/** True when `s` references GET /api/jobs/:slug/files (not bare status or /logs). */
+function mentionsJobFilesApi(s) {
+  return (
+    /\/api\/jobs\/\$\{[^}]+\}\/files\b/.test(s) ||
+    /\/api\/jobs\/['"`]\s*\+\s*[^;]+\/files\b/.test(s) ||
+    /\/api\/jobs\/[^'"\`\n]*\/files\b/.test(s) ||
+    /['"`]\/files['"`]/.test(s) && /\/api\/jobs\//.test(s)
+  );
+}
+
+/** Function/const whose body (≤1200 chars) hits the job *files* API. */
+function fnHitsJobFiles(src, fn) {
+  const re = new RegExp(
+    `(?:function\\s+${fn}\\b|(?:const|let|var)\\s+${fn}\\s*=)([\\s\\S]{0,1200})`,
+  );
+  const m = re.exec(src);
+  return m ? mentionsJobFilesApi(m[1]) : false;
+}
+
+/**
+ * Job files poll/refresh of GET /api/jobs/:slug/files.
+ * Manual Reload-only (button without a timer) is insufficient — the Files card
+ * must refresh on an interval (or equivalent) while the Job screen is open.
+ */
+function hasJobFilesPollOrRefresh(src) {
+  let timerTiedToFiles = false;
+  eachTimerFirstArg(src, (arg) => {
+    if (timerTiedToFiles) return;
+    const trimmed = arg.trim();
+    const named = /^([A-Za-z_$][\w$]*)$/.exec(trimmed);
+    if (named && fnHitsJobFiles(src, named[1])) {
+      timerTiedToFiles = true;
+      return;
+    }
+    if (mentionsJobFilesApi(arg)) {
+      timerTiedToFiles = true;
+      return;
+    }
+    for (const call of arg.matchAll(/\b([A-Za-z_$][\w$]*)\s*\(/g)) {
+      const name = call[1];
+      if (
+        name === 'function' ||
+        name === 'async' ||
+        name === 'if' ||
+        name === 'while' ||
+        name === 'for' ||
+        name === 'switch' ||
+        name === 'catch'
+      ) {
+        continue;
+      }
+      if (fnHitsJobFiles(src, name)) {
+        timerTiedToFiles = true;
+        return;
+      }
+    }
+  });
+  if (timerTiedToFiles) return true;
+
+  if (
+    /\brefetchInterval\b/.test(src) &&
+    [...src.matchAll(/\brefetchInterval\b/g)].some((m) => {
+      const win = src.slice(Math.max(0, m.index - 500), m.index + 500);
+      return mentionsJobFilesApi(win);
+    })
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Visit every `function <name>(...){...}` body in `src` (minified builds reuse
+ * single-letter names; first-match alone is unsafe).
+ */
+function eachFnBodyNamed(src, name, visit) {
+  const re = new RegExp(
+    `(?:async\\s+)?function\\s+${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\([^)]*\\)\\s*\\{`,
+    'g',
+  );
+  let m;
+  while ((m = re.exec(src))) {
+    let i = m.index + m[0].length;
+    let depth = 1;
+    const start = i;
+    for (; i < src.length && depth > 0; i += 1) {
+      const ch = src[i];
+      if (ch === '{') depth += 1;
+      else if (ch === '}') depth -= 1;
+    }
+    visit(src.slice(start, i - 1));
+  }
+}
+
+/**
+ * True when a Job-style setInterval(()=>{a().catch();b().catch();...},2500)
+ * invokes at least one loader whose *own* body GETs .../files.
+ *
+ * Unlike first-match extractFnBody, accepts any same-named function body that
+ * contains /files (minified name collisions across IIFEs/modules).
+ */
+function pollIntervalInvokesFilesLoader(src) {
+  // Prefer looking near each setInterval (same chunk) rather than whole-bundle first match.
+  for (const m of src.matchAll(/setInterval\(\(\)=>\{([\s\S]*?)\},(?:2500|2e3|2\.5e3)\)/g)) {
+    const intervalBody = m[1];
+    if (/\/files/.test(intervalBody)) return true;
+
+    const names = [
+      ...intervalBody.matchAll(/\b([A-Za-z_$][\w$]*)\(\)\.catch\(/g),
+    ].map((x) => x[1]);
+    // Scope lookup to the setInterval's surrounding chunk when possible.
+    const windowStart = Math.max(0, m.index - 8000);
+    const windowEnd = Math.min(src.length, m.index + m[0].length + 2000);
+    const scoped = src.slice(windowStart, windowEnd);
+
+    for (const name of names) {
+      let hit = false;
+      eachFnBodyNamed(scoped, name, (fnBody) => {
+        if (hit) return;
+        if (/\/files/.test(fnBody)) hit = true;
+      });
+      if (hit) return true;
+      // Fallback: any same-named body in the full src (cross-IIFE reuse).
+      eachFnBodyNamed(src, name, (fnBody) => {
+        if (hit) return;
+        if (/\/files/.test(fnBody)) hit = true;
+      });
+      if (hit) return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -416,6 +551,73 @@ describe('01-ui-app contract helpers (false-pass guards)', () => {
       `),
       true,
       'Refresh control calling a status loader must pass',
+    );
+  });
+
+  it('hasJobFilesPollOrRefresh rejects mount-only / Reload-only files fetches', () => {
+    assert.equal(
+      hasJobFilesPollOrRefresh(`
+        async function loadFiles() { await fetch(\`/api/jobs/\${slug}/files\`); }
+        loadFiles();
+        <button onClick={loadFiles}>Reload files</button>
+      `),
+      false,
+      'one-shot + manual Reload files must not count as files poll',
+    );
+    assert.equal(
+      hasJobFilesPollOrRefresh(`
+        async function loadJob() { await fetch(\`/api/jobs/\${slug}\`); }
+        setInterval(loadJob, 2500);
+      `),
+      false,
+      'status-only interval must not count as files poll',
+    );
+  });
+
+  it('hasJobFilesPollOrRefresh accepts timer wired to job files API', () => {
+    assert.equal(
+      hasJobFilesPollOrRefresh(`
+        async function loadFiles() { await fetch(\`/api/jobs/\${slug}/files\`); }
+        setInterval(loadFiles, 2500);
+      `),
+      true,
+      'setInterval(loadFiles) where loadFiles GETs .../files must pass',
+    );
+    assert.equal(
+      hasJobFilesPollOrRefresh(`
+        async function loadJob() { await fetch(\`/api/jobs/\${slug}\`); }
+        async function loadFiles() { await fetch(\`/api/jobs/\${slug}/files\`); }
+        setInterval(() => { loadJob(); loadFiles(); }, 2500);
+      `),
+      true,
+      'setInterval that also calls loadFiles must pass',
+    );
+  });
+
+  it('built-export files-poll lookup survives minified same-name collisions', () => {
+    // Minified bundles reuse single-letter names across IIFEs/modules. Looking up
+    // only the *first* `function y(` misses the real async loader that GETs /files.
+    const colliding = [
+      'function y(){return 1}',
+      'function g(){fetch("/api/jobs/"+s)}',
+      'async function y(){await fetch("/api/jobs/"+s+"/files")}',
+      'setInterval(()=>{g().catch(()=>{}),y().catch(()=>{})},2500)',
+    ].join(';');
+    assert.equal(
+      pollIntervalInvokesFilesLoader(colliding),
+      true,
+      'must accept when *any* same-named function body hits /files, not only the first match',
+    );
+
+    const statusOnly = [
+      'function y(){return 1}',
+      'async function y(){await fetch("/api/jobs/"+s)}',
+      'setInterval(()=>{y().catch(()=>{})},2500)',
+    ].join(';');
+    assert.equal(
+      pollIntervalInvokesFilesLoader(statusOnly),
+      false,
+      'must reject when no same-named body GETs /files',
     );
   });
 
@@ -689,6 +891,14 @@ describe('01-ui-app Job screen', () => {
         'are insufficient',
     );
 
+    // Files card must poll GET /api/jobs/:slug/files (not mount/Reload-only).
+    assert.ok(
+      hasJobFilesPollOrRefresh(src),
+      'Job screen must poll or refresh GET /api/jobs/:slug/files on a timer ' +
+        '(same interval as status/logs or equivalent) so the Files card updates ' +
+        'without relying on manual Reload files',
+    );
+
     // Pause / Resume / Stop must be user-facing control labels (not only /pause paths).
     assert.ok(
       />\s*Pause\s*</.test(src) || /['"`]Pause['"`]/.test(src),
@@ -762,6 +972,41 @@ describe('01-ui-app mobile + packaging boundaries', () => {
     assert.ok(
       /resolveStaticPath|sendStaticFile|contentTypeFor|DEFAULT_STATIC_DIR/.test(serveSrc),
       'lib/serve.js must deliver the static Next export for non-/api routes',
+    );
+  });
+
+  it('built ui/out Job poll refreshes /files (not a stale export)', () => {
+    const outDir = path.join(uiRoot, 'out');
+    assert.ok(exists(outDir), 'expected ui/out static export (run npm run build in ui/)');
+
+    const jsFiles = [];
+    function walk(dir) {
+      for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, ent.name);
+        if (ent.isDirectory()) walk(full);
+        else if (/\.js$/.test(ent.name)) jsFiles.push(full);
+      }
+    }
+    walk(outDir);
+    assert.ok(
+      jsFiles.some((f) => /\/files/.test(read(f))),
+      'ui/out must reference GET .../files',
+    );
+
+    // Per-chunk + any-same-named-body lookup (see pollIntervalInvokesFilesLoader).
+    // First-match extractFnBody on concatenated outSrc false-fails after rebuild
+    // when minified single-letter names collide (many function y(/g(/…).
+    let pollsFiles = false;
+    for (const file of jsFiles) {
+      if (pollIntervalInvokesFilesLoader(read(file))) {
+        pollsFiles = true;
+        break;
+      }
+    }
+    assert.ok(
+      pollsFiles,
+      'ui/out setInterval must call a loader that GETs /api/jobs/.../files ' +
+        '(rebuild ui/ after adding loadFiles to the Job poll — source alone is not served)',
     );
   });
 
