@@ -692,6 +692,95 @@ async function runCodeLoop({
     return codeAccepted;
 }
 
+/**
+ * Commit worktree changes and, when `pr` is set and the commit landed,
+ * write pr.md, publish, and patch job/status. Shared by the complex path
+ * and the abbreviated simple+`--pr` path.
+ */
+function commitAndMaybePublish({
+    prompt,
+    runContext,
+    worktree,
+    resolvedBase,
+    pr,
+    agent,
+    jobPatch,
+    collectWorktreeChangesFn,
+    commitWorktreeFn,
+    publishFn,
+}) {
+    jobPatch({ phase: 'commit', stage: 'commit', round: null });
+    const message = `orch: ${runContext.slug} ${prompt.split('\n')[0]}`;
+    const worktreeChanges = collectWorktreeChangesFn({
+        worktreePath: worktree.worktreePath,
+    });
+    printFilesChanged(worktreeChanges);
+    const commitResult = commitWorktreeFn({
+        worktreePath: worktree.worktreePath,
+        branch: worktree.branch,
+        message,
+    });
+
+    if (commitResult.committed) {
+        fs.appendFileSync(
+            runContext.statusPath,
+            `\n## Commit\n\n- SHA: \`${commitResult.sha}\`\n- Branch: \`${commitResult.branch}\`\n`,
+        );
+        console.log(`commit: ${commitResult.sha.slice(0, 7)} on ${commitResult.branch}`);
+
+        if (pr) {
+            jobPatch({ phase: 'publish', stage: 'publish', round: null });
+            const plan = fs.existsSync(runContext.taskPath)
+                ? fs.readFileSync(runContext.taskPath, 'utf8')
+                : '';
+            const bodyPath = path.join(runContext.artifactDir, 'pr.md');
+            fs.writeFileSync(
+                bodyPath,
+                buildPrBody({
+                    task: prompt,
+                    plan,
+                    changes: worktreeChanges,
+                    slug: runContext.slug,
+                    agent,
+                    version,
+                }),
+            );
+            const prResult = publishFn({
+                worktreePath: worktree.worktreePath,
+                remote: 'origin',
+                branch: worktree.branch,
+                base: resolvedBase,
+                title: buildPrTitle(prompt),
+                bodyPath,
+            });
+            jobPatch({
+                pushedAt: new Date().toISOString(),
+                prUrl: prResult.url,
+                prNumber: prResult.number,
+            });
+            fs.appendFileSync(
+                runContext.statusPath,
+                `\n## Pull request\n\n- ${prResult.url}\n`,
+            );
+            console.log(`pr:     ${prResult.url}`);
+        } else {
+            console.log(`merge:  git merge ${commitResult.branch}`);
+        }
+        console.log(`next:   orch continue ${runContext.slug} "…"`);
+    } else {
+        fs.appendFileSync(
+            runContext.statusPath,
+            `\n## Commit\n\n- No changes to commit on \`${commitResult.branch}\`.\n`,
+        );
+        console.log(`commit: no changes on ${commitResult.branch}`);
+        if (pr) {
+            console.log('pr: skipped (no changes)');
+        }
+    }
+
+    return commitResult;
+}
+
 export async function runPipeline(prompt, options) {
     const verbose = Boolean(options.verbose);
     const maxRounds = options.maxRounds ?? 5;
@@ -834,13 +923,58 @@ export async function runPipeline(prompt, options) {
         const parsed = parseTriageJson(triageContent);
 
         if (parsed?.simple === true) {
+            // Without --pr: in-place quick-fix (no run context / worktree / commit).
+            if (!options.pr) {
+                jobPatch({ phase: 'quick-fix', stage: 'quick-fix', round: null });
+                const quickFix = quickFixAgentArgs({
+                    prompt,
+                    cwd: invocationCwd,
+                    fix_plan: parsed.fix_plan,
+                });
+                const quickFixTracker = new FileTracker({ cwd: invocationCwd });
+                const quickFixAgent = new AgentClass(
+                    quickFix.name,
+                    quickFix.instructions,
+                    quickFix.prompt,
+                    { ...quickFix.options, fileTracker: quickFixTracker },
+                );
+
+                const quickFixResult = await quickFixAgent.run({ verbose });
+                await jobCheckpoint();
+                const { content: quickFixContent, summary: quickFixSummary } = splitStageSummary(quickFixResult.result);
+                printStageSummary('quick-fix', resolveStageSummary('quick-fix', quickFixSummary, quickFixContent), quickFixTracker.getFiles());
+                jobPatch({ state: 'done', exitCode: 0, finishedAt: new Date().toISOString() });
+                return;
+            }
+
+            // With --pr: abbreviated worktree → quick-fix → commit → publish
+            // (no research, planner, or test/code loops).
+            const runContext = createRunContextFn(
+                jobSlug ? { cwd: invocationCwd, slug: jobSlug } : { cwd: invocationCwd },
+            );
+            console.log(`task ${runContext.slug} is started`);
+
+            jobPatch({ phase: 'worktree', stage: 'worktree', round: null });
+            const worktree = createWorktreeFn({
+                cwd: invocationCwd,
+                slug: runContext.slug,
+                ...(resolvedBase ? { base: `origin/${resolvedBase}` } : {}),
+            });
+            jobPatch({ branch: worktree.branch, worktree: worktree.worktreePath });
+
+            fs.mkdirSync(path.dirname(runContext.statusPath), { recursive: true });
+            fs.writeFileSync(
+                runContext.statusPath,
+                `# Status\n\n- Slug: \`${runContext.slug}\`\n- Branch: \`${worktree.branch}\`\n- Worktree: \`${worktree.worktreePath}\`\n`,
+            );
+
             jobPatch({ phase: 'quick-fix', stage: 'quick-fix', round: null });
             const quickFix = quickFixAgentArgs({
                 prompt,
-                cwd: invocationCwd,
+                cwd: worktree.worktreePath,
                 fix_plan: parsed.fix_plan,
             });
-            const quickFixTracker = new FileTracker({ cwd: invocationCwd });
+            const quickFixTracker = new FileTracker({ cwd: worktree.worktreePath });
             const quickFixAgent = new AgentClass(
                 quickFix.name,
                 quickFix.instructions,
@@ -852,10 +986,27 @@ export async function runPipeline(prompt, options) {
             await jobCheckpoint();
             const { content: quickFixContent, summary: quickFixSummary } = splitStageSummary(quickFixResult.result);
             printStageSummary('quick-fix', resolveStageSummary('quick-fix', quickFixSummary, quickFixContent), quickFixTracker.getFiles());
-            if (options.pr) {
-                console.log('pr: skipped (quick fix, no branch)');
-            }
-            jobPatch({ state: 'done', exitCode: 0, finishedAt: new Date().toISOString() });
+
+            commitAndMaybePublish({
+                prompt,
+                runContext,
+                worktree,
+                resolvedBase,
+                pr: true,
+                agent: options.agent,
+                jobPatch,
+                collectWorktreeChangesFn,
+                commitWorktreeFn,
+                publishFn,
+            });
+
+            patchTerminalJob(patchJobFn, jobCwd, jobSlug, {
+                state: 'done',
+                exitCode: 0,
+                summary: quickFixSummary ?? '',
+                error: null,
+                task: prompt,
+            });
             return;
         }
 
@@ -954,74 +1105,18 @@ export async function runPipeline(prompt, options) {
             acceptedVerification,
         });
 
-        jobPatch({ phase: 'commit', stage: 'commit', round: null });
-        const message = `orch: ${runContext.slug} ${prompt.split('\n')[0]}`;
-        const worktreeChanges = collectWorktreeChangesFn({
-            worktreePath: worktree.worktreePath,
+        commitAndMaybePublish({
+            prompt,
+            runContext,
+            worktree,
+            resolvedBase,
+            pr: options.pr,
+            agent: options.agent,
+            jobPatch,
+            collectWorktreeChangesFn,
+            commitWorktreeFn,
+            publishFn,
         });
-        printFilesChanged(worktreeChanges);
-        const commitResult = commitWorktreeFn({
-            worktreePath: worktree.worktreePath,
-            branch: worktree.branch,
-            message,
-        });
-
-        if (commitResult.committed) {
-            fs.appendFileSync(
-                runContext.statusPath,
-                `\n## Commit\n\n- SHA: \`${commitResult.sha}\`\n- Branch: \`${commitResult.branch}\`\n`,
-            );
-            console.log(`commit: ${commitResult.sha.slice(0, 7)} on ${commitResult.branch}`);
-
-            if (options.pr) {
-                jobPatch({ phase: 'publish', stage: 'publish', round: null });
-                const plan = fs.existsSync(runContext.taskPath)
-                    ? fs.readFileSync(runContext.taskPath, 'utf8')
-                    : '';
-                const bodyPath = path.join(runContext.artifactDir, 'pr.md');
-                fs.writeFileSync(
-                    bodyPath,
-                    buildPrBody({
-                        task: prompt,
-                        plan,
-                        changes: worktreeChanges,
-                        slug: runContext.slug,
-                        agent: options.agent,
-                        version,
-                    }),
-                );
-                const prResult = publishFn({
-                    worktreePath: worktree.worktreePath,
-                    remote: 'origin',
-                    branch: worktree.branch,
-                    base: resolvedBase,
-                    title: buildPrTitle(prompt),
-                    bodyPath,
-                });
-                jobPatch({
-                    pushedAt: new Date().toISOString(),
-                    prUrl: prResult.url,
-                    prNumber: prResult.number,
-                });
-                fs.appendFileSync(
-                    runContext.statusPath,
-                    `\n## Pull request\n\n- ${prResult.url}\n`,
-                );
-                console.log(`pr:     ${prResult.url}`);
-            } else {
-                console.log(`merge:  git merge ${commitResult.branch}`);
-            }
-            console.log(`next:   orch continue ${runContext.slug} "…"`);
-        } else {
-            fs.appendFileSync(
-                runContext.statusPath,
-                `\n## Commit\n\n- No changes to commit on \`${commitResult.branch}\`.\n`,
-            );
-            console.log(`commit: no changes on ${commitResult.branch}`);
-            if (options.pr) {
-                console.log('pr: skipped (no changes)');
-            }
-        }
 
         patchTerminalJob(patchJobFn, jobCwd, jobSlug, {
             state: 'done',
@@ -4537,7 +4632,7 @@ program
     .option('--ask', 'Ask a read-only question about the codebase; print the reply and exit (skips triage and all write pipelines)')
     .option('--quick', 'Skip triage, run quick-fix directly in the current working tree; create no artifacts, worktrees, or commits')
     .option('--detach', 'Run the pipeline in the background and return immediately; manage it with orch list/status/pause/resume/stop/logs. Cannot be combined with --ask, --quick, or --dry-run')
-    .option('--pr', 'After a successful commit, push orch/<slug> and open a pull request with gh. Requires gh on PATH and authenticated. Cannot be combined with --ask, --quick, or --dry-run')
+    .option('--pr', 'Always create a worktree, commit, push orch/<slug>, and open a pull request with gh (including triage → quick-fix; skips research/planner on that path). Requires gh on PATH and authenticated. Cannot be combined with --ask, --quick, or --dry-run')
     .option('--base <branch>', 'Remote base branch for the worktree start point and (with --pr) the pull request base; defaults to the remote\'s default branch when --pr is set')
     .option('--max-rounds <n>', 'Max writer⇄critic and writer⇄runner iterations per implementer loop (ignored with --ask and --quick)', positiveIntParser('--max-rounds'), 5)
     .option('--fan-out', 'Decompose into parallel workers, then integrate once. Cannot be combined with --ask, --quick, --dry-run, or --seq')

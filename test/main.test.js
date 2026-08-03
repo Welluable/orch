@@ -3037,6 +3037,8 @@ describe('runPipeline failure.log persistence without -v', () => {
  * Contract for `.spec/publish.md` (unit 01-publish): `--pr` / `--base` flags,
  * publish DI after commit, skip/failure rules, merge-hint suppression, status
  * rows, detach argv forwarding, and startup `gh` validation.
+ * Simple triage + `--pr` must take the abbreviated worktree→commit→publish path
+ * (no research/planner); without `--pr`, simple stays in-place quick-fix.
  */
 describe('runPipeline publish (--pr)', () => {
   function collectLogs() {
@@ -3292,18 +3294,32 @@ describe('runPipeline publish (--pr)', () => {
     }
   });
 
-  it('skip: triage → quick-fix with --pr prints a skip line and ends done', async () => {
-    const tmpCwd = makeTmpCwd('orch-publish-skip-quick-');
+  it('simple + --pr: worktree + commit + publish (no research/planner); logs pr url; job gains PR fields', async () => {
+    const tmpCwd = makeTmpCwd('orch-publish-simple-pr-');
     try {
-      const slug = 'publish-skip-quick-0000';
+      const slug = 'publish-simple-pr-0000';
       seedForegroundJob(tmpCwd, slug, 'fix the typo');
+      const runContext = fakeRunContext(tmpCwd, slug);
+      fs.mkdirSync(runContext.artifactDir, { recursive: true });
+      const worktree = fakeWorktree(tmpCwd, slug);
+      const order = [];
       const MockAgentClass = createMockAgentClass({
         triage: SIMPLE_TRIAGE,
         'quick-fix': { ok: true, result: withSummary('fixed', QUICK_FIX_SUMMARY) },
-      });
-      const publishMock = mock.fn(() => {
-        throw new Error('publish must not run on quick-fix skip');
-      });
+        research: { ok: true, result: 'must not run' },
+        planner: { ok: true, result: 'must not run' },
+      }, { order });
+      const createRunContextMock = mock.fn(() => runContext);
+      const createWorktreeMock = mock.fn(() => worktree);
+      const commitWorktreeMock = mock.fn(() => fakeCommitResult(worktree.branch));
+      const collectWorktreeChangesMock = mock.fn(() => sampleChanges);
+      const publishMock = mock.fn(() => ({
+        url: 'https://github.com/owner/repo/pull/77',
+        number: 77,
+      }));
+      const resolveBaseBranchMock = mock.fn(() => 'main');
+      const fetchBaseMock = mock.fn(() => {});
+      const patchCalls = [];
 
       const { logs, restore } = collectLogs();
       const exitSpy = mock.method(process, 'exit', () => {});
@@ -3312,15 +3328,96 @@ describe('runPipeline publish (--pr)', () => {
           agent: 'claude',
           pr: true,
           AgentClass: MockAgentClass,
-          createRunContext: mock.fn(() => {
-            throw new Error('createRunContext must not be called on quick-fix');
-          }),
-          createWorktree: mock.fn(() => {
-            throw new Error('createWorktree must not be called on quick-fix');
-          }),
+          createRunContext: createRunContextMock,
+          createWorktree: createWorktreeMock,
+          commitWorktree: commitWorktreeMock,
+          collectWorktreeChanges: collectWorktreeChangesMock,
+          resolveBaseBranch: resolveBaseBranchMock,
+          fetchBase: fetchBaseMock,
           publish: publishMock,
-          resolveBaseBranch: mock.fn(() => 'main'),
-          fetchBase: mock.fn(() => {}),
+          jobSlug: slug,
+          jobCwd: tmpCwd,
+          patchJob: realDiskPatchJobSpy(patchCalls),
+        });
+      } finally {
+        restore();
+        exitSpy.mock.restore();
+      }
+
+      assert.deepEqual(order, ['triage', 'quick-fix']);
+      assert.equal(createRunContextMock.mock.calls.length, 1);
+      assert.equal(createWorktreeMock.mock.calls.length, 1);
+      assert.equal(createWorktreeMock.mock.calls[0].arguments[0].base, 'origin/main');
+      assert.equal(createWorktreeMock.mock.calls[0].arguments[0].slug, slug);
+      assert.equal(commitWorktreeMock.mock.calls.length, 1);
+      assert.equal(commitWorktreeMock.mock.calls[0].arguments[0].worktreePath, worktree.worktreePath);
+      assert.equal(publishMock.mock.calls.length, 1);
+      assert.equal(publishMock.mock.calls[0].arguments[0].worktreePath, worktree.worktreePath);
+      assert.equal(publishMock.mock.calls[0].arguments[0].branch, worktree.branch);
+      assert.equal(publishMock.mock.calls[0].arguments[0].base, 'main');
+
+      const quickFix = MockAgentClass.instances.find((i) => agentRole(i.name) === 'quick-fix');
+      assert.ok(quickFix, 'quick-fix agent must run');
+      assert.equal(quickFix.options?.cwd, worktree.worktreePath);
+      assert.ok(quickFix.options?.fileTracker, 'quick-fix should receive fileTracker on worktree cwd');
+      assert.equal(quickFix.options.fileTracker.cwd, path.resolve(worktree.worktreePath));
+
+      const joined = logs.join('\n');
+      assert.match(joined, /pr:\s+https:\/\/github\.com\/owner\/repo\/pull\/77/);
+      assert.doesNotMatch(joined, /pr:\s+skipped \(quick fix, no branch\)/);
+
+      const record = readJob(tmpCwd, slug);
+      assert.equal(record.state, 'done');
+      assert.equal(record.exitCode, 0);
+      assert.equal(record.prUrl, 'https://github.com/owner/repo/pull/77');
+      assert.equal(record.prNumber, 77);
+      assert.ok(record.pushedAt, 'pushedAt must be set');
+      assert.equal(record.branch, worktree.branch);
+      assert.equal(record.worktree, worktree.worktreePath);
+      assert.equal(record.base, 'main');
+
+      assert.equal(fs.existsSync(path.join(runContext.artifactDir, 'pr.md')), true);
+      const status = fs.readFileSync(runContext.statusPath, 'utf8');
+      assert.match(status, /## (Pull request|PR)/i);
+      assert.match(status, /github\.com\/owner\/repo\/pull\/77/);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('simple without --pr: still in-place quick-fix — no worktree, commit, or publish', async () => {
+    const tmpCwd = makeTmpCwd('orch-publish-simple-nopr-');
+    try {
+      const slug = 'publish-simple-nopr-0000';
+      seedForegroundJob(tmpCwd, slug, 'fix the typo');
+      const order = [];
+      const MockAgentClass = createMockAgentClass({
+        triage: SIMPLE_TRIAGE,
+        'quick-fix': { ok: true, result: withSummary('fixed', QUICK_FIX_SUMMARY) },
+      }, { order });
+      const createRunContextMock = mock.fn(() => {
+        throw new Error('createRunContext must not run for simple without --pr');
+      });
+      const createWorktreeMock = mock.fn(() => {
+        throw new Error('createWorktree must not run for simple without --pr');
+      });
+      const commitWorktreeMock = mock.fn(() => {
+        throw new Error('commitWorktree must not run for simple without --pr');
+      });
+      const publishMock = mock.fn(() => {
+        throw new Error('publish must not run for simple without --pr');
+      });
+
+      const { logs, restore } = collectLogs();
+      const exitSpy = mock.method(process, 'exit', () => {});
+      try {
+        await runPipeline('fix the typo', {
+          agent: 'claude',
+          AgentClass: MockAgentClass,
+          createRunContext: createRunContextMock,
+          createWorktree: createWorktreeMock,
+          commitWorktree: commitWorktreeMock,
+          publish: publishMock,
           jobSlug: slug,
           jobCwd: tmpCwd,
           patchJob: realDiskPatchJobSpy([]),
@@ -3330,12 +3427,92 @@ describe('runPipeline publish (--pr)', () => {
         exitSpy.mock.restore();
       }
 
+      assert.deepEqual(order, ['triage', 'quick-fix']);
+      assert.equal(createRunContextMock.mock.calls.length, 0);
+      assert.equal(createWorktreeMock.mock.calls.length, 0);
+      assert.equal(commitWorktreeMock.mock.calls.length, 0);
       assert.equal(publishMock.mock.calls.length, 0);
+
+      const quickFix = MockAgentClass.instances.find((i) => agentRole(i.name) === 'quick-fix');
+      assert.equal(quickFix.options?.cwd, process.cwd());
+
       const joined = logs.join('\n');
-      assert.match(joined, /pr:\s+skipped \(quick fix, no branch\)/);
+      assert.doesNotMatch(joined, /^pr:/m);
+
       const record = readJob(tmpCwd, slug);
       assert.equal(record.state, 'done');
       assert.equal(record.exitCode, 0);
+      assert.equal(record.prUrl, undefined);
+      assert.equal(record.prNumber, undefined);
+      assert.equal(record.pushedAt, undefined);
+      // Seeded as null and left untouched on the in-place simple path.
+      assert.equal(record.branch, null);
+      assert.equal(record.worktree, null);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('skip: simple + --pr with committed: false prints no-changes skip and does not publish', async () => {
+    const tmpCwd = makeTmpCwd('orch-publish-simple-pr-clean-');
+    try {
+      const slug = 'publish-simple-pr-clean-0000';
+      seedForegroundJob(tmpCwd, slug, 'fix the typo');
+      const runContext = fakeRunContext(tmpCwd, slug);
+      fs.mkdirSync(runContext.artifactDir, { recursive: true });
+      const worktree = fakeWorktree(tmpCwd, slug);
+      const order = [];
+      const MockAgentClass = createMockAgentClass({
+        triage: SIMPLE_TRIAGE,
+        'quick-fix': { ok: true, result: withSummary('fixed', QUICK_FIX_SUMMARY) },
+      }, { order });
+      const publishMock = mock.fn(() => {
+        throw new Error('publish must not run when there is nothing to commit');
+      });
+      const createRunContextMock = mock.fn(() => runContext);
+      const createWorktreeMock = mock.fn(() => worktree);
+      const commitWorktreeMock = mock.fn(() => ({
+        committed: false,
+        sha: null,
+        branch: worktree.branch,
+      }));
+
+      const { logs, restore } = collectLogs();
+      const exitSpy = mock.method(process, 'exit', () => {});
+      try {
+        await runPipeline('fix the typo', {
+          agent: 'claude',
+          pr: true,
+          AgentClass: MockAgentClass,
+          createRunContext: createRunContextMock,
+          createWorktree: createWorktreeMock,
+          commitWorktree: commitWorktreeMock,
+          collectWorktreeChanges: mock.fn(() => null),
+          resolveBaseBranch: mock.fn(() => 'main'),
+          fetchBase: mock.fn(() => {}),
+          publish: publishMock,
+          jobSlug: slug,
+          jobCwd: tmpCwd,
+          patchJob: realDiskPatchJobSpy([]),
+        });
+      } finally {
+        restore();
+        exitSpy.mock.restore();
+      }
+
+      assert.deepEqual(order, ['triage', 'quick-fix']);
+      assert.equal(createRunContextMock.mock.calls.length, 1);
+      assert.equal(createWorktreeMock.mock.calls.length, 1);
+      assert.equal(commitWorktreeMock.mock.calls.length, 1);
+      assert.equal(publishMock.mock.calls.length, 0);
+      assert.match(logs.join('\n'), /pr:\s+skipped \(no changes\)/);
+      assert.doesNotMatch(logs.join('\n'), /pr:\s+skipped \(quick fix, no branch\)/);
+
+      const record = readJob(tmpCwd, slug);
+      assert.equal(record.state, 'done');
+      assert.equal(record.exitCode, 0);
+      assert.equal(record.prUrl, undefined);
+      assert.equal(fs.existsSync(path.join(runContext.artifactDir, 'pr.md')), false);
     } finally {
       fs.rmSync(tmpCwd, { recursive: true, force: true });
     }
