@@ -33,7 +33,8 @@ import { jobPaths, readJob, writeJob } from '../lib/jobs.js';
  *   `/^[a-z0-9]+(?:-[a-z0-9]+)*$/` max 64; required `name` + `slug`.
  *   Init = `git init -b main` → empty commit → private `gh repo create`
  *   (owner: request → `--github-owner` → `gh` login) → `git remote add origin`
- *   → push `main`; clone = `git clone` into `$HOME/.orch/products/<slug>/`
+ *   with SSH URL `git@github.com:<owner>/<slug>.git` → push `main`; clone =
+ *   `git clone` into `$HOME/.orch/products/<slug>/`
  *   (empty remotes healed onto `main` + push + set-head; non-empty optional
  *   set-head --auto). Existing slug → `409` for both init and clone. Write
  *   `product.json`. Failures after mkdir → best-effort rm + `502`. Stub
@@ -280,8 +281,10 @@ function firstGitCallIndex(calls, predicate) {
   return calls.findIndex((c) => c.command === 'git' && predicate(c.args));
 }
 
-/** Locked init steps from `.spec/server.md`: init -b main → empty commit → remote add → push main. */
+/** Locked init steps: init -b main → empty commit → remote add (SSH) → push main. */
 function assertInitGitPipeline(calls, { owner, slug }) {
+  const expectedSshUrl = `git@github.com:${owner}/${slug}.git`;
+
   const initIdx = firstGitCallIndex(
     calls,
     (args) => {
@@ -311,6 +314,16 @@ function assertInitGitPipeline(calls, { owner, slug }) {
   assert.ok(
     remoteIdx >= 0,
     `expected git remote add origin; git calls=${JSON.stringify(gitCalls(calls))}`,
+  );
+  const remoteArgs = calls[remoteIdx].args;
+  assert.ok(
+    remoteArgs.includes(expectedSshUrl),
+    `init remote add origin must use SSH URL ${expectedSshUrl}; args=${remoteArgs.join(' ')}`,
+  );
+  assert.equal(
+    remoteArgs.includes(`https://github.com/${owner}/${slug}.git`),
+    false,
+    'init must not add HTTPS origin (HTTPS push 403 after gh create)',
   );
 
   const pushIdx = firstGitCallIndex(
@@ -1759,6 +1772,8 @@ describe('serve products API (phase 2)', () => {
         assert.equal(product.source, 'init');
         assert.equal(product.remote?.visibility, 'private');
         assert.equal(product.remote?.owner, 'acme');
+        assert.equal(product.remote?.url, 'git@github.com:acme/my-app.git');
+        assert.equal(product.remote?.provider, 'github');
         assert.ok(product.createdAt);
 
         const onDisk = readProductJson(home, 'my-app');
@@ -1767,10 +1782,12 @@ describe('serve products API (phase 2)', () => {
         assert.equal(onDisk.source, 'init');
         assert.equal(onDisk.remote.visibility, 'private');
         assert.equal(onDisk.remote.owner, 'acme');
+        assert.equal(onDisk.remote.url, 'git@github.com:acme/my-app.git');
+        assert.equal(onDisk.remote.provider, 'github');
         assert.ok(fs.statSync(path.join(productsDir(home), 'my-app')).isDirectory());
 
         // Spec-locked init: git init -b main → empty commit → gh repo create --private
-        // → git remote add origin → push main (order matters).
+        // → git remote add origin (SSH) → push main (order matters).
         assertInitGitPipeline(calls, { owner: 'acme', slug: 'my-app' });
         // Request owner wins — must not need gh api user for owner resolution.
         assert.equal(ghApiUserCalls(calls).length, 0);
@@ -1801,6 +1818,8 @@ describe('serve products API (phase 2)', () => {
           const creates = ghRepoCreateCalls(calls);
           assert.ok(creates[0].args.some((a) => String(a).includes('req-org/owner-req')));
           assert.equal(ghApiUserCalls(calls).length, 0);
+          assert.equal(readProductJson(home, 'owner-req').remote.url, 'git@github.com:req-org/owner-req.git');
+          assertInitGitPipeline(calls, { owner: 'req-org', slug: 'owner-req' });
         } finally {
           await handle.close();
         }
