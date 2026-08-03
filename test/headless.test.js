@@ -75,6 +75,14 @@ function runCli(args, { cwd = process.cwd(), env = process.env, stdin = null } =
   });
 }
 
+/** Foreground CLI env: drop inherited job slug so allocate tests are not vacuous under an orch worker. */
+function foregroundCliEnv(overrides = {}) {
+  const env = { ...process.env, ...overrides };
+  delete env.ORCH_JOB_SLUG;
+  delete env.ORCH_DETACHED;
+  return env;
+}
+
 function agentRole(name) {
   return String(name).replace(/\s+\d+\/\d+$/, '');
 }
@@ -343,7 +351,7 @@ describe('Commander action wiring: job records are universal, not just --detach 
 
       const { code, stdout } = await runCli(
         ['where is the CLI entrypoint?', '--agent', 'claude', '--ask'],
-        { cwd: tmpCwd, env: { ...process.env, PATH: `${binDir}:${process.env.PATH}` } },
+        { cwd: tmpCwd, env: foregroundCliEnv({ PATH: `${binDir}:${process.env.PATH}` }) },
       );
 
       assert.equal(code, 0);
@@ -377,7 +385,7 @@ describe('Commander action wiring: job records are universal, not just --detach 
 
       const { code } = await runCli(
         ['fix the typo', '--agent', 'claude', '--quick'],
-        { cwd: tmpCwd, env: { ...process.env, PATH: `${binDir}:${process.env.PATH}` } },
+        { cwd: tmpCwd, env: foregroundCliEnv({ PATH: `${binDir}:${process.env.PATH}` }) },
       );
 
       assert.equal(code, 0);
@@ -411,7 +419,7 @@ describe('Commander action wiring: job records are universal, not just --detach 
 
       const { code } = await runCli(
         ['fix the typo', '--agent', 'claude'],
-        { cwd: tmpCwd, env: { ...process.env, PATH: `${binDir}:${process.env.PATH}` } },
+        { cwd: tmpCwd, env: foregroundCliEnv({ PATH: `${binDir}:${process.env.PATH}` }) },
       );
 
       assert.equal(code, 0);
@@ -437,7 +445,7 @@ describe('Commander action wiring: job records are universal, not just --detach 
     try {
       const { code, stderr } = await runCli(
         ['a trivial task', '--agent', 'claude'],
-        { cwd: tmpCwd, env: { ...process.env, PATH: '/nonexistent-empty-path-for-tests' } },
+        { cwd: tmpCwd, env: foregroundCliEnv({ PATH: '/nonexistent-empty-path-for-tests' }) },
       );
 
       assert.equal(code, 1);
@@ -454,6 +462,77 @@ describe('Commander action wiring: job records are universal, not just --detach 
       // wait on, so allocation starts them straight in "running" — unlike
       // runDetached's detach-parent, which starts in "starting".
       assert.equal(record.state, 'running');
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('with ORCH_JOB_SLUG already set, does not allocate a second run.json / orch list entry (detached child path)', async () => {
+    // Mirrors --seq's ORCH_JOB_SLUG reuse and continue-detach's child-skip
+    // pattern: parent owns allocateJob; the re-invoked child must only
+    // setJobSlug/options.jobSlug and run the pipeline. Empty PATH fails
+    // after the allocate decision so we can observe whether a second
+    // slug appeared without needing a full agent run.
+    const tmpCwd = makeTmpCwd('orch-action-reuse-slug-');
+    try {
+      const slug = 'preallocated-child-0000';
+      const artifactDir = path.join(tmpCwd, '.orch', slug);
+      fs.mkdirSync(artifactDir, { recursive: true });
+      writeJob(tmpCwd, slug, {
+        slug,
+        task: 'a trivial task',
+        agent: 'claude',
+        maxRounds: 5,
+        cwd: tmpCwd,
+        pauseRequested: false,
+        branch: null,
+        worktree: null,
+        startedAt: new Date().toISOString(),
+        finishedAt: null,
+        exitCode: null,
+        logPath: path.join(artifactDir, 'orch.log'),
+        pid: process.pid,
+        state: 'running',
+        phase: null,
+        stage: null,
+        round: null,
+      });
+
+      const before = listJobs(tmpCwd);
+      assert.equal(before.length, 1);
+
+      const { code, stderr } = await runCli(
+        ['a trivial task', '--agent', 'claude'],
+        {
+          cwd: tmpCwd,
+          env: {
+            ...process.env,
+            ORCH_JOB_SLUG: slug,
+            ORCH_DETACHED: '1',
+            PATH: '/nonexistent-empty-path-for-tests',
+          },
+        },
+      );
+      assert.equal(code, 1);
+      assert.match(
+        stderr,
+        /claude not found/i,
+        'must reach the agent PATH check; otherwise the no-second-allocate assertion is vacuous',
+      );
+
+      const after = listJobs(tmpCwd);
+      assert.equal(
+        after.length,
+        1,
+        'child with ORCH_JOB_SLUG set must not create a second run.json / orch list entry',
+      );
+      assert.equal(after[0].slug, slug);
+      assert.deepEqual(
+        fs.readdirSync(path.join(tmpCwd, '.orch')).filter((name) =>
+          fs.statSync(path.join(tmpCwd, '.orch', name)).isDirectory(),
+        ),
+        [slug],
+      );
     } finally {
       fs.rmSync(tmpCwd, { recursive: true, force: true });
     }

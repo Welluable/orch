@@ -4880,14 +4880,21 @@ Sequential (--seq):
         }
 
         if (!options.dryRun) {
-            const { slug } = allocateJob({
-                cwd: process.cwd(),
-                prompt,
-                agent: options.agent,
-                maxRounds: options.ask || options.quick ? null : options.maxRounds,
-                state: 'running',
-                pid: process.pid,
-            });
+            // Detached (and other) children already carry ORCH_JOB_SLUG from the
+            // parent allocation — reuse it so triage/pipeline does not create a
+            // second run.json / orch list entry. Mirrors the --seq guard above.
+            let slug = process.env.ORCH_JOB_SLUG;
+            if (!slug) {
+                const alloc = allocateJob({
+                    cwd: process.cwd(),
+                    prompt,
+                    agent: options.agent,
+                    maxRounds: options.ask || options.quick ? null : options.maxRounds,
+                    state: 'running',
+                    pid: process.pid,
+                });
+                slug = alloc.slug;
+            }
             options.jobSlug = slug;
             setJobSlug(slug);
         }
