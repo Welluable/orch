@@ -99,31 +99,40 @@ export function ProductsScreen({ onOpenProduct }: Props) {
 
   return (
     <div>
-      <div className="card">
-        <h2>Products</h2>
+      <header className="page-header">
+        <div>
+          <h1 className="page-title">Products</h1>
+          <p className="page-subtitle">Initialize or clone repositories to run jobs.</p>
+        </div>
+      </header>
+
+      <section className="section-panel">
+        <h2>All products</h2>
         {loading ? <p className="muted">Loading…</p> : null}
         {!loading && products.length === 0 ? (
           <p className="muted">No products yet.</p>
         ) : null}
         <ul className="list">
           {products.map((p) => (
-            <li key={p.slug}>
-              <a
-                href={`/?product=${encodeURIComponent(p.slug)}`}
-                onClick={(ev) => {
-                  ev.preventDefault();
-                  onOpenProduct(p.slug);
-                }}
-              >
-                <strong>{p.name || p.slug}</strong>
-              </a>
-              <div className="meta mono">{p.slug}</div>
+            <li key={p.slug} className="list-row product-row">
+              <div>
+                <a
+                  href={`/?product=${encodeURIComponent(p.slug)}`}
+                  onClick={(ev) => {
+                    ev.preventDefault();
+                    onOpenProduct(p.slug);
+                  }}
+                >
+                  <strong>{p.name || p.slug}</strong>
+                </a>
+                <div className="meta mono">{p.slug}</div>
+              </div>
             </li>
           ))}
         </ul>
-      </div>
+      </section>
 
-      <div className="card">
+      <section className="section-panel">
         <h2>New blank</h2>
         <form className="stack" onSubmit={createInit}>
           <label>
@@ -158,9 +167,9 @@ export function ProductsScreen({ onOpenProduct }: Props) {
             {initBusy ? 'Creating…' : 'Create blank'}
           </button>
         </form>
-      </div>
+      </section>
 
-      <div className="card">
+      <section className="section-panel">
         <h2>Clone from GitHub</h2>
         <form className="stack" onSubmit={createClone}>
           <label>
@@ -199,7 +208,7 @@ export function ProductsScreen({ onOpenProduct }: Props) {
             {cloneBusy ? 'Cloning…' : 'Clone'}
           </button>
         </form>
-      </div>
+      </section>
 
       {error ? <p className="error">{error}</p> : null}
     </div>

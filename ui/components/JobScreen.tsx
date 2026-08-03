@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { api, apiText, ApiError } from '@/lib/api';
 import type { FileEntry, Job } from '@/lib/types';
@@ -15,6 +15,7 @@ export function JobScreen({ jobSlug }: Props) {
   const [files, setFiles] = useState<FileEntry[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [controlBusy, setControlBusy] = useState(false);
+  const logsRef = useRef<HTMLPreElement>(null);
 
   async function loadJob() {
     const { data } = await api<{ job: Job }>(
@@ -62,6 +63,12 @@ export function JobScreen({ jobSlug }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- poll loadJob/loadLogs/loadFiles for status/prUrl/logs/files
   }, [jobSlug, refreshAll]);
 
+  useEffect(() => {
+    const el = logsRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [logs]);
+
   async function control(action: 'pause' | 'resume' | 'stop') {
     setControlBusy(true);
     setError(null);
@@ -87,82 +94,101 @@ export function JobScreen({ jobSlug }: Props) {
     : '/';
 
   return (
-    <div>
-      <div className="card">
-        <p className="muted">
-          <Link href={productHref}>← Product</Link>
-          {' · '}
-          <Link href="/">Products</Link>
-        </p>
-        <h2 className="mono">{jobSlug}</h2>
-        <div className="row" style={{ marginTop: '0.5rem' }}>
-          <span className="badge">{job?.state || '…'}</span>
-          <button type="button" className="secondary" onClick={loadJob}>
-            Refresh
-          </button>
-        </div>
-        {job?.prUrl ? (
-          <p style={{ marginTop: '0.75rem' }}>
-            PR:{' '}
-            <a href={job.prUrl} target="_blank" rel="noreferrer">
-              {job.prUrl}
-            </a>
-          </p>
-        ) : (
-          <p className="muted" style={{ marginTop: '0.75rem' }}>
-            No PR URL yet.
-          </p>
-        )}
+    <div className="job-console">
+      <div className="job-console-sidebar">
+        <header className="page-header">
+          <div>
+            <p className="muted" style={{ margin: '0 0 0.35rem' }}>
+              <Link href={productHref}>← Product</Link>
+              {' · '}
+              <Link href="/">Products</Link>
+            </p>
+            <h1 className="page-title mono">{jobSlug}</h1>
+            <div className="row" style={{ marginTop: '0.5rem' }}>
+              <span className="badge">{job?.state || '…'}</span>
+              <button type="button" className="secondary" onClick={loadJob}>
+                Refresh
+              </button>
+            </div>
+            {job?.prUrl ? (
+              <p style={{ marginTop: '0.75rem' }}>
+                PR:{' '}
+                <a href={job.prUrl} target="_blank" rel="noreferrer">
+                  {job.prUrl}
+                </a>
+              </p>
+            ) : (
+              <p className="muted" style={{ marginTop: '0.75rem' }}>
+                No PR URL yet.
+              </p>
+            )}
+          </div>
+        </header>
+
+        <section className="section-panel">
+          <h3>Controls</h3>
+          <div className="row">
+            <button
+              type="button"
+              className="secondary"
+              disabled={controlBusy}
+              onClick={() => control('pause')}
+            >
+              Pause
+            </button>
+            <button
+              type="button"
+              className="secondary"
+              disabled={controlBusy}
+              onClick={() => control('resume')}
+            >
+              Resume
+            </button>
+            <button
+              type="button"
+              className="danger"
+              disabled={controlBusy}
+              onClick={() => control('stop')}
+            >
+              Stop
+            </button>
+          </div>
+        </section>
+
+        <section className="section-panel">
+          <div className="row" style={{ justifyContent: 'space-between' }}>
+            <h3 style={{ margin: 0 }}>Files</h3>
+            <button type="button" className="secondary" onClick={() => void loadFiles()}>
+              Reload files
+            </button>
+          </div>
+          {files.length === 0 ? (
+            <p className="muted" style={{ marginTop: '0.75rem' }}>
+              No files changed.
+            </p>
+          ) : (
+            <ul className="files" style={{ marginTop: '0.75rem' }}>
+              {files.map((file) => (
+                <li key={`${file.path}:${file.status}`} className="list-row">
+                  <span>{file.path}</span>
+                  <span className="badge">{file.status}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
       </div>
 
-      <div className="card">
-        <h3>Controls</h3>
-        <div className="row">
-          <button type="button" className="secondary" disabled={controlBusy} onClick={() => control('pause')}>
-            Pause
-          </button>
-          <button type="button" className="secondary" disabled={controlBusy} onClick={() => control('resume')}>
-            Resume
-          </button>
-          <button type="button" className="danger" disabled={controlBusy} onClick={() => control('stop')}>
-            Stop
-          </button>
-        </div>
-      </div>
-
-      <div className="card">
-        <div className="row" style={{ justifyContent: 'space-between' }}>
-          <h3 style={{ margin: 0 }}>Logs</h3>
+      <div className="logs-panel terminal">
+        <div className="logs-toolbar">
+          <h3>Logs</h3>
           <button type="button" className="secondary" onClick={() => void loadLogs()}>
             Reload logs
           </button>
         </div>
-        <pre className="logs" style={{ marginTop: '0.75rem' }}>
+        <pre className="logs mono" ref={logsRef}>
           {logs || '(empty)'}
         </pre>
-      </div>
-
-      <div className="card">
-        <div className="row" style={{ justifyContent: 'space-between' }}>
-          <h3 style={{ margin: 0 }}>Files</h3>
-          <button type="button" className="secondary" onClick={() => void loadFiles()}>
-            Reload files
-          </button>
-        </div>
-        {files.length === 0 ? (
-          <p className="muted" style={{ marginTop: '0.75rem' }}>
-            No files changed.
-          </p>
-        ) : (
-          <ul className="files" style={{ marginTop: '0.75rem' }}>
-            {files.map((file) => (
-              <li key={`${file.path}:${file.status}`}>
-                <span>{file.path}</span>
-                <span className="badge">{file.status}</span>
-              </li>
-            ))}
-          </ul>
-        )}
       </div>
 
       {error ? <p className="error">{error}</p> : null}

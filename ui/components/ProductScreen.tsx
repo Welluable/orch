@@ -86,17 +86,19 @@ export function ProductScreen({ productSlug }: Props) {
 
   return (
     <div>
-      <div className="card">
-        <p className="muted">
-          <Link href="/">← Products</Link>
-        </p>
-        <h2>{product?.name || productSlug}</h2>
-        <p className="meta mono">{productSlug}</p>
-        {loading ? <p className="muted">Loading…</p> : null}
-      </div>
+      <header className="page-header">
+        <div>
+          <p className="muted" style={{ margin: '0 0 0.35rem' }}>
+            <Link href="/">← Products</Link>
+          </p>
+          <h1 className="page-title">{product?.name || productSlug}</h1>
+          <p className="page-subtitle mono">{productSlug}</p>
+          {loading ? <p className="muted">Loading…</p> : null}
+        </div>
+      </header>
 
-      <div className="card">
-        <h3>Run</h3>
+      <section className="section-panel">
+        <h2>Run</h2>
         <form className="stack" onSubmit={runJob}>
           <label>
             Task
@@ -111,11 +113,11 @@ export function ProductScreen({ productSlug }: Props) {
             {busy ? 'Starting…' : 'Run'}
           </button>
         </form>
-      </div>
+      </section>
 
-      <div className="card">
+      <section className="section-panel">
         <div className="row" style={{ justifyContent: 'space-between' }}>
-          <h3>Jobs</h3>
+          <h2 style={{ margin: 0 }}>Jobs</h2>
           <button
             type="button"
             className="danger"
@@ -128,17 +130,19 @@ export function ProductScreen({ productSlug }: Props) {
         {jobs.length === 0 ? <p className="muted">No jobs yet.</p> : null}
         <ul className="list">
           {jobs.map((job) => (
-            <li key={job.slug}>
-              <Link href={`/?job=${encodeURIComponent(job.slug)}`}>
-                <strong className="mono">{job.slug}</strong>
-              </Link>
-              <div className="meta">
-                <span className="badge">{job.state || 'unknown'}</span>
+            <li key={job.slug} className="list-row job-row">
+              <div>
+                <Link
+                  href={`/?product=${encodeURIComponent(productSlug)}&job=${encodeURIComponent(job.slug)}`}
+                >
+                  <strong className="mono">{job.slug}</strong>
+                </Link>
               </div>
+              <span className="badge">{job.state || 'unknown'}</span>
             </li>
           ))}
         </ul>
-      </div>
+      </section>
 
       {error ? <p className="error">{error}</p> : null}
     </div>
