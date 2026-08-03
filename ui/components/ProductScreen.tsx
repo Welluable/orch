@@ -2,6 +2,7 @@
 
 import { FormEvent, useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
+import { v4 as uuidv4 } from 'uuid';
 import { api, ApiError } from '@/lib/api';
 import type { Job, Product } from '@/lib/types';
 
@@ -43,7 +44,7 @@ export function ProductScreen({ productSlug }: Props) {
     setBusy(true);
     setError(null);
     try {
-      const id = crypto.randomUUID();
+      const id = uuidv4();
       await api<{ slug: string; job: Job }>(
         `/api/products/${encodeURIComponent(productSlug)}/jobs`,
         {
