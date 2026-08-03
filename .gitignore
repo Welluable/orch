@@ -1,3 +1,4 @@
 node_modules/
 .orch/
 .spec
+product.json
