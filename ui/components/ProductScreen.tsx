@@ -61,6 +61,29 @@ export function ProductScreen({ productSlug }: Props) {
     }
   }
 
+  async function cleanAllJobs() {
+    if (
+      !window.confirm(
+        'Clean all jobs for this product? This cannot be undone.',
+      )
+    ) {
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      await api<{ ok: boolean; removed: string[] }>(
+        `/api/products/${encodeURIComponent(productSlug)}/jobs/clean`,
+        { method: 'POST' },
+      );
+      await load();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'clean failed');
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <div>
       <div className="card">
@@ -91,7 +114,17 @@ export function ProductScreen({ productSlug }: Props) {
       </div>
 
       <div className="card">
-        <h3>Jobs</h3>
+        <div className="row" style={{ justifyContent: 'space-between' }}>
+          <h3>Jobs</h3>
+          <button
+            type="button"
+            className="danger"
+            disabled={busy || loading || jobs.length === 0}
+            onClick={() => void cleanAllJobs()}
+          >
+            Clean jobs
+          </button>
+        </div>
         {jobs.length === 0 ? <p className="muted">No jobs yet.</p> : null}
         <ul className="list">
           {jobs.map((job) => (
