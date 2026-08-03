@@ -51,9 +51,12 @@ export function JobScreen({ jobSlug }: Props) {
       void loadJob().catch(() => {
         /* keep last known status on poll errors */
       });
+      void loadLogs().catch(() => {
+        /* keep last known logs on poll errors */
+      });
     }, 2500);
     return () => clearInterval(timer);
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- poll loadJob for status/prUrl
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- poll loadJob/loadLogs for status/prUrl/logs
   }, [jobSlug, refreshAll]);
 
   async function control(action: 'pause' | 'resume' | 'stop') {
