@@ -2,3 +2,5 @@ node_modules/
 .orch/
 .spec
 product.json
+ui/out/
+ui/.next/
