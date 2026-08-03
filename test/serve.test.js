@@ -41,9 +41,12 @@ import { jobPaths, readJob, writeJob } from '../lib/jobs.js';
  * - Phase 3 remainder (unit 04): job scan only walks product.json-backed
  *   product dirs; `GET /api/products/:product/jobs` returns `{ jobs }` (full
  *   list for that product, unknown → 404); `GET /api/jobs/:slug/files` is
- *   on-demand read-only git name-status from `run.json.worktree` →
- *   `{ files: [{ path, status }] }`, or `{ files: [] }` when unavailable
- *   (no staging `git add`).
+ *   on-demand read-only git status from `run.json.worktree` →
+ *   `{ files: [{ path, status }] }` including **untracked** (`??`) as well as
+ *   tracked dirty paths (no staging `git add`). After orch commits clean the
+ *   worktree, the list still surfaces files from commits on the job branch
+ *   since `run.json.base` (union of dirty + committed-since-base). Unavailable
+ *   job/worktree/git → `{ files: [] }`.
  * - Durable `state: "queued"` jobs are re-enqueued on boot; shutdown does not
  *   kill children.
  *
@@ -1455,7 +1458,7 @@ describe('serve HTTP jobs API (scan + controls + logs)', () => {
           assert.ok(entry.status.length > 0);
         }
         assert.ok(
-          json.files.some((f) => f.path === 'src/x.ts' && f.status === 'M'),
+          json.files.some((f) => f.path === 'src/x.ts' && /M/.test(f.status)),
           `expected M src/x.ts; got ${JSON.stringify(json.files)}`,
         );
 
@@ -1468,6 +1471,174 @@ describe('serve HTTP jobs API (scan + controls + logs)', () => {
         assert.ok(
           gitInvokes.some((c) => c.args.includes(worktree) || c.options?.cwd === worktree),
           `git must target job worktree ${worktree}; got ${JSON.stringify(gitInvokes)}`,
+        );
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('GET /api/jobs/:slug/files includes untracked files without git add', async () => {
+    const home = makeTmpHome();
+    try {
+      const productDir = seedProduct(home, 'untracked-files');
+      const worktree = path.join(home, 'untracked-files-job-ut01');
+      fs.mkdirSync(path.join(worktree, '.git'), { recursive: true });
+      seedJob(productDir, 'files-job-ut01', {
+        product: 'untracked-files',
+        state: 'running',
+        pid: process.pid,
+        worktree,
+        branch: 'orch/files-job-ut01',
+      });
+
+      const baseExec = makeProductExec().execFile;
+      const calls = [];
+      const execFile = (cmd, args = [], options = {}) => {
+        calls.push({ command: cmd, args: [...args], options });
+        // Dirty tracked + brand-new untracked — name-status alone cannot see ??.
+        if (cmd === 'git' && args.includes('--name-status') && !args.includes('--porcelain')) {
+          return 'M\tsrc/tracked.ts\n';
+        }
+        if (cmd === 'git' && args.includes('--porcelain')) {
+          return ' M src/tracked.ts\n?? src/brand-new.ts\n';
+        }
+        return baseExec(cmd, args, options);
+      };
+
+      const handle = await startTestServe(home, { execFile, execFileSync: execFile });
+      try {
+        const { res, json } = await jsonRequest(
+          handle.baseUrl,
+          'GET',
+          '/api/jobs/files-job-ut01/files',
+        );
+        assert.equal(res.status, 200, `expected 200; got ${res.status}: ${JSON.stringify(json)}`);
+        assert.ok(Array.isArray(json?.files), 'files API must return { files: [...] }');
+        assert.ok(
+          json.files.some((f) => f.path === 'src/tracked.ts' && /M/.test(String(f.status))),
+          `expected modified tracked file; got ${JSON.stringify(json.files)}`,
+        );
+        assert.ok(
+          json.files.some(
+            (f) =>
+              f.path === 'src/brand-new.ts'
+              && (/\?/.test(String(f.status)) || /^A\b/.test(String(f.status))),
+          ),
+          `expected untracked/new file src/brand-new.ts; got ${JSON.stringify(json.files)}`,
+        );
+
+        const gitInvokes = calls.filter((c) => c.command === 'git');
+        assert.ok(gitInvokes.length >= 1, 'files route must invoke git');
+        assert.ok(
+          gitInvokes.every((c) => !c.args.includes('add')),
+          `files route must stay read-only (no git add); got ${JSON.stringify(gitInvokes)}`,
+        );
+        assert.ok(
+          gitInvokes.some(
+            (c) =>
+              c.args.includes('--porcelain')
+              || (c.args.includes('status') && c.args.includes('--porcelain')),
+          ),
+          `files route must use read-only porcelain/status so untracked files appear; got ${JSON.stringify(gitInvokes)}`,
+        );
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('GET /api/jobs/:slug/files still lists files after worktree commit (union with base)', async () => {
+    const home = makeTmpHome();
+    try {
+      const productDir = seedProduct(home, 'committed-files');
+      const worktree = path.join(home, 'committed-files-job-pc01');
+      fs.mkdirSync(path.join(worktree, '.git'), { recursive: true });
+      seedJob(productDir, 'files-job-pc01', {
+        product: 'committed-files',
+        state: 'running',
+        pid: process.pid,
+        worktree,
+        branch: 'orch/files-job-pc01',
+        base: 'main',
+      });
+
+      const baseExec = makeProductExec().execFile;
+      const calls = [];
+      const execFile = (cmd, args = [], options = {}) => {
+        calls.push({ command: cmd, args: [...args], options });
+        if (cmd !== 'git') return baseExec(cmd, args, options);
+
+        // Clean worktree after orch commitWorktree — dirty-only listing would be [].
+        if (args.includes('--porcelain')) {
+          return '';
+        }
+        // Plain dirty diff vs HEAD is empty once committed.
+        if (
+          args.includes('--name-status')
+          && args.includes('HEAD')
+          && !args.some((a) => typeof a === 'string' && (a.includes('main') || a.includes('..')))
+        ) {
+          return '';
+        }
+        // Committed-since-base (or equivalent range) still has the job's files.
+        if (
+          args.includes('--name-status')
+          || args.includes('--name-only')
+        ) {
+          const rangeish = args.some(
+            (a) =>
+              typeof a === 'string'
+              && (a.includes('main') || a.includes('..') || a.includes('orch/files-job-pc01')),
+          );
+          if (rangeish || args.includes('log')) {
+            return args.includes('--name-only')
+              ? 'src/feature.ts\nlib/util.js\n'
+              : 'A\tsrc/feature.ts\nM\tlib/util.js\n';
+          }
+        }
+        if (args.includes('log')) {
+          return 'A\tsrc/feature.ts\nM\tlib/util.js\n';
+        }
+        return baseExec(cmd, args, options);
+      };
+
+      const handle = await startTestServe(home, { execFile, execFileSync: execFile });
+      try {
+        const { res, json } = await jsonRequest(
+          handle.baseUrl,
+          'GET',
+          '/api/jobs/files-job-pc01/files',
+        );
+        assert.equal(res.status, 200, `expected 200; got ${res.status}: ${JSON.stringify(json)}`);
+        assert.ok(Array.isArray(json?.files), 'files API must return { files: [...] }');
+        assert.ok(
+          json.files.length >= 1,
+          `after commit, files since job base must still list; got ${JSON.stringify(json.files)}`,
+        );
+        assert.ok(
+          json.files.some((f) => f.path === 'src/feature.ts'),
+          `expected src/feature.ts from commits since base; got ${JSON.stringify(json.files)}`,
+        );
+        assert.ok(
+          json.files.some((f) => f.path === 'lib/util.js'),
+          `expected lib/util.js from commits since base; got ${JSON.stringify(json.files)}`,
+        );
+        for (const entry of json.files) {
+          assert.equal(typeof entry.path, 'string');
+          assert.equal(typeof entry.status, 'string');
+          assert.ok(entry.path.length > 0);
+          assert.ok(entry.status.length > 0);
+        }
+
+        const gitInvokes = calls.filter((c) => c.command === 'git');
+        assert.ok(
+          gitInvokes.every((c) => !c.args.includes('add')),
+          `files route must stay read-only (no git add); got ${JSON.stringify(gitInvokes)}`,
         );
       } finally {
         await handle.close();
