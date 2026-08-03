@@ -30,10 +30,11 @@ import { jobPaths, readJob, writeJob } from '../lib/jobs.js';
  *   `/^[a-z0-9]+(?:-[a-z0-9]+)*$/` max 64; required `name` + `slug`.
  *   Init = `git init -b main` → empty commit → private `gh repo create`
  *   (owner: request → `--github-owner` → `gh` login) → `git remote add origin`
- *   → push `main`; clone = `git clone` into `$HOME/.orch/products/<slug>/`.
- *   Existing slug → `409` for both init and clone. Write `product.json`.
- *   Failures after mkdir → best-effort rm + `502`. Stub `gh`/`git` via
- *   injectable `execFile` / `execFileSync` — no live GitHub.
+ *   → push `main`; clone = `git clone` into `$HOME/.orch/products/<slug>/`
+ *   (empty remotes healed onto `main` + push + set-head; non-empty optional
+ *   set-head --auto). Existing slug → `409` for both init and clone. Write
+ *   `product.json`. Failures after mkdir → best-effort rm + `502`. Stub
+ *   `gh`/`git` via injectable `execFile` / `execFileSync` — no live GitHub.
  * - Phase 3 remainder (unit 04): job scan only walks product.json-backed
  *   product dirs; `GET /api/products/:product/jobs` returns `{ jobs }` (full
  *   list for that product, unknown → 404); `GET /api/jobs/:slug/files` is
@@ -146,14 +147,18 @@ function okGhExecFileSync(cmd, args) {
 /**
  * Fake sync/async-compatible exec for product init/clone (and boot auth).
  * Records calls; simulates git clone by creating the destination directory.
+ * When `emptyClone` is true, `git rev-parse --verify HEAD` fails until an
+ * allow-empty commit runs (empty-remote healing path).
  */
 function makeProductExec({
   login = 'login-user',
   failRepoCreate = false,
   failClone = false,
   failAfterMkdir = null,
+  emptyClone = false,
 } = {}) {
   const calls = [];
+  let emptyCloneHasHead = !emptyClone;
   const execFile = (cmd, args = [], options = {}) => {
     calls.push({ command: cmd, args: [...args], options });
     if (cmd === 'which') return '/usr/bin/' + args[0];
@@ -192,7 +197,27 @@ function makeProductExec({
         }
         return '';
       }
-      // init / commit / remote / push / remote set-url — succeed by default
+      if (
+        args.includes('rev-parse')
+        && args.includes('--verify')
+        && args.includes('HEAD')
+      ) {
+        if (!emptyCloneHasHead) {
+          const err = new Error('fatal: Needed a single revision');
+          err.stderr = 'fatal: Needed a single revision';
+          throw err;
+        }
+        return 'deadbeef\n';
+      }
+      if (
+        emptyClone
+        && (args[0] === 'commit' || args.includes('commit'))
+        && args.includes('--allow-empty')
+      ) {
+        emptyCloneHasHead = true;
+        return '';
+      }
+      // init / commit / remote / push / checkout / set-head / remote set-url — succeed
       return '';
     }
     throw new Error(`unexpected execFile: ${cmd} ${args.join(' ')}`);
@@ -305,6 +330,69 @@ function assertInitGitPipeline(calls, { owner, slug }) {
     creates[0].args.some((a) => a === `${owner}/${slug}` || String(a).endsWith(`${owner}/${slug}`)),
     `repo create must target ${owner}/${slug}; args=${creates[0].args.join(' ')}`,
   );
+}
+
+/** Locked empty-clone heal from `.spec/server.md`: checkout -B main → empty commit → push -u → set-head main. */
+function assertEmptyCloneHealPipeline(calls) {
+  const cloneIdx = firstGitCallIndex(
+    calls,
+    (args) => args[0] === 'clone' || args.includes('clone'),
+  );
+  assert.ok(cloneIdx >= 0, `expected git clone; git calls=${JSON.stringify(gitCalls(calls))}`);
+
+  const checkoutIdx = firstGitCallIndex(
+    calls,
+    (args) =>
+      (args[0] === 'checkout' || args.includes('checkout'))
+      && args.includes('-B')
+      && args.includes('main'),
+  );
+  assert.ok(
+    checkoutIdx >= 0,
+    `expected git checkout -B main; git calls=${JSON.stringify(gitCalls(calls))}`,
+  );
+
+  const commitIdx = firstGitCallIndex(
+    calls,
+    (args) =>
+      (args[0] === 'commit' || args.includes('commit')) && args.includes('--allow-empty'),
+  );
+  assert.ok(
+    commitIdx >= 0,
+    `expected empty commit (git commit --allow-empty); git calls=${JSON.stringify(gitCalls(calls))}`,
+  );
+
+  const pushIdx = firstGitCallIndex(
+    calls,
+    (args) =>
+      (args[0] === 'push' || args.includes('push'))
+      && args.includes('-u')
+      && args.includes('origin')
+      && args.includes('main'),
+  );
+  assert.ok(
+    pushIdx >= 0,
+    `expected git push -u origin main; git calls=${JSON.stringify(gitCalls(calls))}`,
+  );
+
+  const setHeadIdx = firstGitCallIndex(
+    calls,
+    (args) =>
+      args.includes('remote')
+      && args.includes('set-head')
+      && args.includes('origin')
+      && args.includes('main')
+      && !args.includes('--auto'),
+  );
+  assert.ok(
+    setHeadIdx >= 0,
+    `expected git remote set-head origin main; git calls=${JSON.stringify(gitCalls(calls))}`,
+  );
+
+  assert.ok(cloneIdx < checkoutIdx, 'git clone must precede checkout -B main');
+  assert.ok(checkoutIdx < commitIdx, 'checkout -B main must precede empty commit');
+  assert.ok(commitIdx < pushIdx, 'empty commit must precede push -u origin main');
+  assert.ok(pushIdx < setHeadIdx, 'push must precede set-head origin main');
 }
 
 async function startTestServe(home, overrides = {}) {
@@ -1493,6 +1581,52 @@ describe('serve products API (phase 2)', () => {
           cloneCalls[0].args.some((a) => path.resolve(String(a)) === path.resolve(dest)),
           `clone dest must be ${dest}; args=${cloneCalls[0].args.join(' ')}`,
         );
+        // Non-empty clone: no heal push / set-head main; optional set-head --auto only.
+        assert.equal(
+          firstGitCallIndex(
+            calls,
+            (args) =>
+              (args[0] === 'push' || args.includes('push')) && args.includes('main'),
+          ),
+          -1,
+          'non-empty clone must not push main',
+        );
+        assert.equal(
+          firstGitCallIndex(
+            calls,
+            (args) =>
+              args.includes('remote')
+              && args.includes('set-head')
+              && args.includes('main')
+              && !args.includes('--auto'),
+          ),
+          -1,
+          'non-empty clone must not set-head origin main',
+        );
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('POST /api/products clone heals empty remotes onto main with upstream', async () => {
+    const home = makeTmpHome();
+    try {
+      const { execFile, calls } = makeProductExec({ emptyClone: true });
+      const handle = await startTestServe(home, { execFile, execFileSync: execFile });
+      try {
+        const url = 'https://github.com/org/empty-remote.git';
+        const { res, json } = await jsonRequest(handle.baseUrl, 'POST', '/api/products', {
+          body: { name: 'Empty Remote', slug: 'empty-remote', source: 'clone', url },
+        });
+        assert.equal(res.status, 201, `expected 201; got ${res.status}: ${JSON.stringify(json)}`);
+        const product = json?.product ?? json;
+        assert.equal(product.slug, 'empty-remote');
+        assert.equal(product.source, 'clone');
+        assert.ok(fs.existsSync(path.join(productsDir(home), 'empty-remote', 'product.json')));
+        assertEmptyCloneHealPipeline(calls);
       } finally {
         await handle.close();
       }

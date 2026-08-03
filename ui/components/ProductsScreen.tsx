@@ -189,8 +189,10 @@ export function ProductsScreen({ onOpenProduct }: Props) {
               value={cloneUrl}
               onChange={(e) => setCloneUrl(e.target.value)}
               required
-              type="url"
+              type="text"
+              placeholder="git@github.com:owner/repo.git"
               autoComplete="off"
+              spellCheck={false}
             />
           </label>
           <button type="submit" disabled={cloneBusy}>
