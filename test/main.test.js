@@ -7,7 +7,11 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runPipeline, formatStatus, runDetached } from '../main.js';
 import { jobPaths, readJob, writeJob, patchJob as realPatchJob } from '../lib/jobs.js';
-import { askSessionPaths, readAskSession } from '../lib/ask-session.js';
+import {
+  askSessionPaths,
+  readAskSession,
+  writeAskSession,
+} from '../lib/ask-session.js';
 import * as agentLib from '../lib/agent.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1789,6 +1793,372 @@ describe('runPipeline --ask (read-only Q&A)', () => {
     assert.equal(patchJobMock.mock.calls.length, 0);
   });
 });
+
+/**
+ * Unit 02-ask-continue-cli: `orch --ask --from <slug>` multiturn via the same
+ * ask session (`.orch/<slug>/ask.json`). Distinct from write-pipeline
+ * `orch continue` (which rejects `--ask`).
+ *
+ * `runPipeline(followUp, { ask: true, fromSlug, jobSlug: fromSlug, ... })`
+ * loads prior turns with `readAskSession`, folds a short transcript into the
+ * ask-agent prompt, keeps the agent read-only, and on success calls
+ * `recordAskExchange` with the follow-up string only (never the
+ * context-augmented blob). Missing/unknown sessions exit 1; failed asks leave
+ * ask.json unchanged.
+ */
+describe('runPipeline --ask --from (ask-session continue)', () => {
+  function seedAskSessionDoc(tmpCwd, slug, overrides = {}) {
+    const now = '2026-08-05T10:00:00.000Z';
+    const session = {
+      slug,
+      createdAt: now,
+      updatedAt: now,
+      agent: 'claude',
+      turns: [
+        { role: 'user', content: 'where is the CLI entrypoint?', at: now },
+        { role: 'assistant', content: 'The entrypoint is main.js.', at: now },
+      ],
+      ...overrides,
+    };
+    writeAskSession(tmpCwd, slug, session);
+    return session;
+  }
+
+  it('with fromSlug: prepends prior ask.json turns into the ask agent prompt, keeps readOnly, and appends only the follow-up Q&A on success', async () => {
+    const tmpCwd = makeTmpCwd('orch-ask-from-ok-');
+    try {
+      const slug = 'ask-from-ok-0000';
+      const followUp = 'what about triage?';
+      const answer = 'Triage lives in the triage agent stage.';
+      const prior = seedAskSessionDoc(tmpCwd, slug);
+      seedForegroundJob(tmpCwd, slug, prior.turns[0].content);
+
+      const MockAgentClass = createMockAgentClass({
+        ask: { ok: true, result: withSummary(answer, 'Named the triage stage.') },
+      });
+
+      const logSpy = mock.method(console, 'log', () => {});
+      const errorSpy = mock.method(console, 'error', () => {});
+      const exitSpy = mock.method(process, 'exit', () => {});
+      try {
+        await runPipeline(followUp, {
+          agent: 'claude',
+          ask: true,
+          fromSlug: slug,
+          AgentClass: MockAgentClass,
+          createRunContext: mock.fn(() => fakeRunContext(tmpCwd)),
+          createWorktree: mock.fn(() => fakeWorktree(tmpCwd)),
+          commitWorktree: mock.fn(() => fakeCommitResult('orch/stub')),
+          jobSlug: slug,
+          jobCwd: tmpCwd,
+          patchJob: realDiskPatchJobSpy([]),
+        });
+      } finally {
+        logSpy.mock.restore();
+        errorSpy.mock.restore();
+        exitSpy.mock.restore();
+      }
+
+      assert.equal(exitSpy.mock.calls.length, 0);
+      assert.equal(MockAgentClass.instances.length, 1);
+      const askAgent = MockAgentClass.instances[0];
+      assert.equal(askAgent.name, 'ask');
+      assert.equal(askAgent.options?.readOnly, true);
+      // Ask agent cwd is the invocation cwd (same as plain --ask); jobCwd is for ask.json I/O.
+      assert.equal(askAgent.options?.cwd, process.cwd());
+
+      // Prior transcript + follow-up are folded into the agent prompt string.
+      assert.match(askAgent.prompt, /where is the CLI entrypoint/);
+      assert.match(askAgent.prompt, /The entrypoint is main\.js/);
+      assert.match(askAgent.prompt, /what about triage/);
+      assert.match(askAgent.prompt, /user|assistant/i);
+
+      const session = readAskSession(tmpCwd, slug);
+      assert.ok(session);
+      assert.equal(session.turns.length, 4);
+      assert.deepEqual(
+        session.turns.map((t) => ({ role: t.role, content: t.content })),
+        [
+          { role: 'user', content: 'where is the CLI entrypoint?' },
+          { role: 'assistant', content: 'The entrypoint is main.js.' },
+          { role: 'user', content: followUp },
+          { role: 'assistant', content: answer },
+        ],
+      );
+      // Stored user turn must be the follow-up only — never the context blob.
+      assert.equal(session.turns[2].content, followUp);
+      assert.doesNotMatch(session.turns[2].content, /The entrypoint is main\.js/);
+      assert.doesNotMatch(session.turns[3].content, /<<<SUMMARY>>>/);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('with fromSlug: options.agent (CLI) wins over mismatched session.agent for the run and recordAskExchange', async () => {
+    const tmpCwd = makeTmpCwd('orch-ask-from-agent-cli-');
+    try {
+      const slug = 'ask-from-agent-cli-0000';
+      const followUp = 'prefer the CLI agent';
+      const answer = 'ran with claude, not session agn';
+      seedAskSessionDoc(tmpCwd, slug, { agent: 'agn' });
+      seedForegroundJob(tmpCwd, slug, 'prior');
+
+      const MockAgentClass = createMockAgentClass({
+        ask: { ok: true, result: withSummary(answer, 'CLI agent preferred.') },
+      });
+
+      const logSpy = mock.method(console, 'log', () => {});
+      const errorSpy = mock.method(console, 'error', () => {});
+      const exitSpy = mock.method(process, 'exit', () => {});
+      try {
+        await runPipeline(followUp, {
+          agent: 'claude',
+          ask: true,
+          fromSlug: slug,
+          AgentClass: MockAgentClass,
+          createRunContext: mock.fn(() => fakeRunContext(tmpCwd)),
+          createWorktree: mock.fn(() => fakeWorktree(tmpCwd)),
+          commitWorktree: mock.fn(() => fakeCommitResult('orch/stub')),
+          jobSlug: slug,
+          jobCwd: tmpCwd,
+          patchJob: realDiskPatchJobSpy([]),
+        });
+      } finally {
+        logSpy.mock.restore();
+        errorSpy.mock.restore();
+        exitSpy.mock.restore();
+      }
+
+      assert.equal(exitSpy.mock.calls.length, 0);
+      const printed = logSpy.mock.calls.map((c) => c.arguments.join(' ')).join('\n');
+      assert.match(printed, /agent:\s+claude/);
+      assert.doesNotMatch(printed, /agent:\s+agn/);
+
+      const session = readAskSession(tmpCwd, slug);
+      assert.equal(
+        session.agent,
+        'claude',
+        'recordAskExchange must store options.agent, not the prior session.agent',
+      );
+      assert.equal(session.turns[2].content, followUp);
+      assert.equal(session.turns[3].content, answer);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('with fromSlug: failed ask leaves ask.json unchanged (no invented assistant turn)', async () => {
+    const tmpCwd = makeTmpCwd('orch-ask-from-fail-');
+    try {
+      const slug = 'ask-from-fail-0000';
+      const prior = seedAskSessionDoc(tmpCwd, slug);
+      seedForegroundJob(tmpCwd, slug, prior.turns[0].content);
+      const before = readAskSession(tmpCwd, slug);
+
+      const MockAgentClass = createMockAgentClass({
+        ask: { ok: false, result: 'agent crashed' },
+      });
+
+      const logSpy = mock.method(console, 'log', () => {});
+      const errorSpy = mock.method(console, 'error', () => {});
+      const exitSpy = mock.method(process, 'exit', () => {});
+      try {
+        await runPipeline('and how does planner work?', {
+          agent: 'claude',
+          ask: true,
+          fromSlug: slug,
+          AgentClass: MockAgentClass,
+          createRunContext: mock.fn(() => fakeRunContext(tmpCwd)),
+          createWorktree: mock.fn(() => fakeWorktree(tmpCwd)),
+          commitWorktree: mock.fn(() => fakeCommitResult('orch/stub')),
+          jobSlug: slug,
+          jobCwd: tmpCwd,
+          patchJob: realDiskPatchJobSpy([]),
+        });
+      } finally {
+        logSpy.mock.restore();
+        errorSpy.mock.restore();
+        exitSpy.mock.restore();
+      }
+
+      assert.equal(exitSpy.mock.calls.length, 1);
+      assert.equal(exitSpy.mock.calls[0].arguments[0], 1);
+      assert.deepEqual(readAskSession(tmpCwd, slug), before);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('with fromSlug: missing ask session exits 1 and never constructs an ask agent', async () => {
+    const tmpCwd = makeTmpCwd('orch-ask-from-miss-');
+    try {
+      const slug = 'ask-from-miss-0000';
+      seedForegroundJob(tmpCwd, slug, 'unused');
+      const MockAgentClass = createMockAgentClass({
+        ask: { ok: true, result: 'should not run' },
+      });
+
+      const logSpy = mock.method(console, 'log', () => {});
+      const errorSpy = mock.method(console, 'error', () => {});
+      const exitSpy = mock.method(process, 'exit', () => {});
+      try {
+        await runPipeline('follow-up', {
+          agent: 'claude',
+          ask: true,
+          fromSlug: slug,
+          AgentClass: MockAgentClass,
+          createRunContext: mock.fn(() => fakeRunContext(tmpCwd)),
+          createWorktree: mock.fn(() => fakeWorktree(tmpCwd)),
+          commitWorktree: mock.fn(() => fakeCommitResult('orch/stub')),
+          jobSlug: slug,
+          jobCwd: tmpCwd,
+          patchJob: realDiskPatchJobSpy([]),
+        });
+      } finally {
+        logSpy.mock.restore();
+        errorSpy.mock.restore();
+        exitSpy.mock.restore();
+      }
+
+      assert.equal(MockAgentClass.instances.length, 0);
+      assert.equal(exitSpy.mock.calls.length, 1);
+      assert.equal(exitSpy.mock.calls[0].arguments[0], 1);
+      const errText = errorSpy.mock.calls.map((c) => c.arguments.map(String).join(' ')).join('\n');
+      assert.match(errText, /ask\.json|unknown|no ask|session|not found/i);
+      assert.equal(readAskSession(tmpCwd, slug), null);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('with fromSlug: malformed ask.json fails clearly without inventing turns', async () => {
+    const tmpCwd = makeTmpCwd('orch-ask-from-badjson-');
+    try {
+      const slug = 'ask-from-badjson-0000';
+      seedForegroundJob(tmpCwd, slug, 'unused');
+      const { dir, askJsonPath } = askSessionPaths(tmpCwd, slug);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(askJsonPath, '{ not valid json');
+
+      const MockAgentClass = createMockAgentClass({
+        ask: { ok: true, result: 'should not run' },
+      });
+
+      const logSpy = mock.method(console, 'log', () => {});
+      const errorSpy = mock.method(console, 'error', () => {});
+      const exitSpy = mock.method(process, 'exit', () => {});
+      try {
+        await runPipeline('follow-up', {
+          agent: 'claude',
+          ask: true,
+          fromSlug: slug,
+          AgentClass: MockAgentClass,
+          createRunContext: mock.fn(() => fakeRunContext(tmpCwd)),
+          createWorktree: mock.fn(() => fakeWorktree(tmpCwd)),
+          commitWorktree: mock.fn(() => fakeCommitResult('orch/stub')),
+          jobSlug: slug,
+          jobCwd: tmpCwd,
+          patchJob: realDiskPatchJobSpy([]),
+        });
+      } finally {
+        logSpy.mock.restore();
+        errorSpy.mock.restore();
+        exitSpy.mock.restore();
+      }
+
+      assert.equal(MockAgentClass.instances.length, 0);
+      assert.ok(
+        exitSpy.mock.calls.length >= 1 || errorSpy.mock.calls.length >= 1,
+        'malformed ask.json must surface as a failure',
+      );
+      if (exitSpy.mock.calls.length >= 1) {
+        assert.equal(exitSpy.mock.calls[0].arguments[0], 1);
+      }
+      assert.equal(fs.readFileSync(askJsonPath, 'utf8'), '{ not valid json');
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('without fromSlug, plain --ask still sends the raw prompt (regression)', async () => {
+    const MockAgentClass = createMockAgentClass({
+      ask: { ok: true, result: 'answer' },
+    });
+    const prompt = 'where is the CLI entrypoint?';
+
+    const logSpy = mock.method(console, 'log', () => {});
+    const errorSpy = mock.method(console, 'error', () => {});
+    const exitSpy = mock.method(process, 'exit', () => {});
+    try {
+      await runPipeline(prompt, {
+        agent: 'claude',
+        ask: true,
+        AgentClass: MockAgentClass,
+        createRunContext: mock.fn(() => fakeRunContext(process.cwd())),
+        createWorktree: mock.fn(() => fakeWorktree(process.cwd())),
+        commitWorktree: mock.fn(() => fakeCommitResult('orch/stub')),
+      });
+    } finally {
+      logSpy.mock.restore();
+      errorSpy.mock.restore();
+      exitSpy.mock.restore();
+    }
+
+    assert.equal(MockAgentClass.instances[0].prompt, prompt);
+  });
+});
+
+describe('CLI --ask --from gates', () => {
+  it('rejects --ask --from with an empty follow-up prompt', async () => {
+    const tmpCwd = makeTmpCwd('orch-ask-from-empty-');
+    try {
+      const slug = 'ask-from-empty-0000';
+      writeAskSession(tmpCwd, slug, {
+        slug,
+        createdAt: '2026-08-05T10:00:00.000Z',
+        updatedAt: '2026-08-05T10:00:00.000Z',
+        agent: 'claude',
+        turns: [
+          { role: 'user', content: 'q1', at: '2026-08-05T10:00:00.000Z' },
+          { role: 'assistant', content: 'a1', at: '2026-08-05T10:00:00.000Z' },
+        ],
+      });
+      const { code, stderr } = await runCli(
+        ['--ask', '--from', slug, '--agent', 'claude'],
+        { cwd: tmpCwd },
+      );
+      assert.notEqual(code, 0);
+      assert.match(stderr + '', /missing required argument|task cannot be empty|follow-?up|prompt/i);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  for (const conflicting of ['--detach', '--seq', '--fan-out']) {
+    it(`rejects --ask --from combined with ${conflicting}`, async () => {
+      const tmpCwd = makeTmpCwd('orch-ask-from-conflict-');
+      try {
+        const slug = 'ask-from-conflict-0000';
+        writeAskSession(tmpCwd, slug, {
+          slug,
+          createdAt: '2026-08-05T10:00:00.000Z',
+          updatedAt: '2026-08-05T10:00:00.000Z',
+          agent: 'claude',
+          turns: [],
+        });
+        const { code, stderr } = await runCli(
+          ['follow-up', '--ask', '--from', slug, conflicting, '--agent', 'claude'],
+          { cwd: tmpCwd },
+        );
+        assert.notEqual(code, 0);
+        assert.match(stderr + '', /cannot be combined|Error:/i);
+      } finally {
+        fs.rmSync(tmpCwd, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
 describe('runPipeline --quick (skip triage → quick-fix)', () => {
   it('spawns only a quick-fix agent — never triage, ask, research, or implementers', async () => {
     const order = [];

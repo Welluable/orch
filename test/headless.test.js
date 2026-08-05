@@ -7,7 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runPipeline, runDetached } from '../main.js';
 import { readJob, writeJob, listJobs, patchJob as realPatchJob, checkpointPause as realCheckpointPause } from '../lib/jobs.js';
-import { readAskSession } from '../lib/ask-session.js';
+import { readAskSession, writeAskSession } from '../lib/ask-session.js';
 
 /**
  * Contract this file pins down for the headless-run additions to main.js
@@ -47,8 +47,10 @@ import { readAskSession } from '../lib/ask-session.js';
  *   pre-injecting `jobSlug`/`jobCwd` into direct `runPipeline(...)` calls
  *   (as the rest of this file and test/main.test.js do) cannot catch, since
  *   that seam is a no-op if the CLI action never calls the allocator at all.
- *   For `--ask`, the same slug dir also gets `ask.json` (turns + slug
- *   metadata) after a successful answer — see unit 01-ask-session.
+   *   For `--ask`, the same slug dir also gets `ask.json` (turns + slug
+   *   metadata) after a successful answer — see unit 01-ask-session.
+   *   `--ask --from <slug>` reuses that slug (no second allocateJob), loads
+   *   prior turns, and appends the follow-up exchange — unit 02-ask-continue-cli.
  */
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -387,6 +389,246 @@ describe('Commander action wiring: job records are universal, not just --detach 
       assert.match(session.turns[1].content, /the entrypoint is main\.js/i);
       assert.doesNotMatch(session.turns[1].content, /<<<SUMMARY>>>/);
       assert.equal(record.turns, undefined, 'transcript must not be embedded in run.json');
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+      fs.rmSync(binDir, { recursive: true, force: true });
+    }
+  });
+
+  it('--ask --from <slug>: reuses the same slug (no new allocateJob), appends follow-up Q&A to ask.json', async () => {
+    const tmpCwd = makeTmpCwd('orch-action-ask-from-');
+    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-fake-bin-'));
+    try {
+      const slug = 'ask-continue-cli-0000';
+      const now = '2026-08-05T10:00:00.000Z';
+      writeAskSession(tmpCwd, slug, {
+        slug,
+        createdAt: now,
+        updatedAt: now,
+        agent: 'claude',
+        turns: [
+          { role: 'user', content: 'where is the CLI entrypoint?', at: now },
+          { role: 'assistant', content: 'The entrypoint is main.js.', at: now },
+        ],
+      });
+      // Prior run.json may already exist from the first ask; seed a done job so
+      // --ask --from must reopen/reuse rather than allocate a sibling slug.
+      writeJob(tmpCwd, slug, {
+        slug,
+        task: 'where is the CLI entrypoint?',
+        agent: 'claude',
+        maxRounds: null,
+        cwd: tmpCwd,
+        pauseRequested: false,
+        branch: null,
+        worktree: null,
+        startedAt: now,
+        finishedAt: now,
+        exitCode: 0,
+        logPath: path.join(tmpCwd, '.orch', slug, 'orch.log'),
+        pid: null,
+        state: 'done',
+        phase: 'ask',
+        stage: null,
+        round: null,
+      });
+
+      writeFakeAgentBinary(binDir, 'claude', path.join(tmpCwd, '.fake-calls'), [
+        'Triage decides simple vs research.',
+      ]);
+
+      const followUp = 'what about triage?';
+      const { code, stdout } = await runCli(
+        [followUp, '--ask', '--from', slug, '--agent', 'claude'],
+        { cwd: tmpCwd, env: foregroundCliEnv({ PATH: `${binDir}:${process.env.PATH}` }) },
+      );
+
+      assert.equal(code, 0);
+      assert.match(stdout, /Triage decides simple vs research/);
+
+      const orchDir = path.join(tmpCwd, '.orch');
+      const slugs = fs.readdirSync(orchDir).filter((name) => {
+        try {
+          return fs.statSync(path.join(orchDir, name)).isDirectory();
+        } catch {
+          return false;
+        }
+      });
+      assert.deepEqual(
+        slugs,
+        [slug],
+        '--ask --from must reuse <slug>, not allocateJob a second slug',
+      );
+
+      const session = readAskSession(tmpCwd, slug);
+      assert.ok(session);
+      assert.equal(session.turns.length, 4);
+      assert.equal(session.turns[2].role, 'user');
+      assert.equal(session.turns[2].content, followUp);
+      assert.equal(session.turns[3].role, 'assistant');
+      assert.match(session.turns[3].content, /Triage decides simple vs research/i);
+      assert.doesNotMatch(session.turns[2].content, /The entrypoint is main\.js/);
+
+      const record = readJob(tmpCwd, slug);
+      assert.equal(record.phase, 'ask');
+      assert.equal(record.state, 'done');
+      assert.equal(record.exitCode, 0);
+      assert.equal(record.turns, undefined);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+      fs.rmSync(binDir, { recursive: true, force: true });
+    }
+  });
+
+  it('--ask --from unknown slug exits 1 with a clear error (no new slug allocated)', async () => {
+    const tmpCwd = makeTmpCwd('orch-action-ask-from-miss-');
+    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-fake-bin-'));
+    try {
+      writeFakeAgentBinary(binDir, 'claude', path.join(tmpCwd, '.fake-calls'), ['should not run']);
+
+      const { code, stderr } = await runCli(
+        ['follow-up', '--ask', '--from', 'no-such-ask-0000', '--agent', 'claude'],
+        { cwd: tmpCwd, env: foregroundCliEnv({ PATH: `${binDir}:${process.env.PATH}` }) },
+      );
+
+      assert.equal(code, 1);
+      assert.match(stderr + '', /ask\.json|unknown|no ask|session|not found/i);
+      assert.doesNotMatch(stderr + '', /--from requires --seq/i);
+      assert.equal(
+        fs.existsSync(path.join(tmpCwd, '.orch')),
+        false,
+        'missing ask session must not allocate a new job slug',
+      );
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+      fs.rmSync(binDir, { recursive: true, force: true });
+    }
+  });
+
+  it('--ask --from without --agent falls back to session.agent (not a fresh config default alone)', async () => {
+    const tmpCwd = makeTmpCwd('orch-action-ask-from-agent-');
+    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-fake-bin-'));
+    const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-ask-from-home-'));
+    try {
+      const slug = 'ask-from-agent-0000';
+      const now = '2026-08-05T10:00:00.000Z';
+      writeAskSession(tmpCwd, slug, {
+        slug,
+        createdAt: now,
+        updatedAt: now,
+        agent: 'claude',
+        turns: [
+          { role: 'user', content: 'q1', at: now },
+          { role: 'assistant', content: 'a1', at: now },
+        ],
+      });
+      writeJob(tmpCwd, slug, {
+        slug,
+        task: 'q1',
+        agent: 'claude',
+        maxRounds: null,
+        cwd: tmpCwd,
+        pauseRequested: false,
+        branch: null,
+        worktree: null,
+        startedAt: now,
+        finishedAt: now,
+        exitCode: 0,
+        logPath: path.join(tmpCwd, '.orch', slug, 'orch.log'),
+        pid: null,
+        state: 'done',
+        phase: 'ask',
+        stage: null,
+        round: null,
+      });
+
+      writeFakeAgentBinary(binDir, 'claude', path.join(tmpCwd, '.fake-calls'), ['a2']);
+
+      const { code } = await runCli(
+        ['q2', '--ask', '--from', slug],
+        {
+          cwd: tmpCwd,
+          env: foregroundCliEnv({
+            PATH: `${binDir}:${process.env.PATH}`,
+            HOME: isolatedHome,
+          }),
+        },
+      );
+
+      assert.equal(code, 0);
+      const session = readAskSession(tmpCwd, slug);
+      assert.equal(session.agent, 'claude');
+      assert.equal(session.turns.length, 4);
+      assert.equal(session.turns[2].content, 'q2');
+      assert.match(session.turns[3].content, /a2/i);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+      fs.rmSync(binDir, { recursive: true, force: true });
+      fs.rmSync(isolatedHome, { recursive: true, force: true });
+    }
+  });
+
+  it('--ask --from with --agent prefers CLI agent over mismatched session.agent for the run and recordAskExchange', async () => {
+    // session.agent is agn; only a fake `claude` is on PATH. Preferring the
+    // session agent would fail (agn missing). CLI --agent must win.
+    const tmpCwd = makeTmpCwd('orch-action-ask-from-agent-cli-');
+    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-fake-bin-'));
+    try {
+      const slug = 'ask-from-agent-cli-0000';
+      const now = '2026-08-05T10:00:00.000Z';
+      writeAskSession(tmpCwd, slug, {
+        slug,
+        createdAt: now,
+        updatedAt: now,
+        agent: 'agn',
+        turns: [
+          { role: 'user', content: 'q1', at: now },
+          { role: 'assistant', content: 'a1', at: now },
+        ],
+      });
+      writeJob(tmpCwd, slug, {
+        slug,
+        task: 'q1',
+        agent: 'agn',
+        maxRounds: null,
+        cwd: tmpCwd,
+        pauseRequested: false,
+        branch: null,
+        worktree: null,
+        startedAt: now,
+        finishedAt: now,
+        exitCode: 0,
+        logPath: path.join(tmpCwd, '.orch', slug, 'orch.log'),
+        pid: null,
+        state: 'done',
+        phase: 'ask',
+        stage: null,
+        round: null,
+      });
+
+      writeFakeAgentBinary(binDir, 'claude', path.join(tmpCwd, '.fake-calls'), [
+        'answer from CLI --agent claude',
+      ]);
+
+      const { code, stdout } = await runCli(
+        ['q2', '--ask', '--from', slug, '--agent', 'claude'],
+        { cwd: tmpCwd, env: foregroundCliEnv({ PATH: `${binDir}:${process.env.PATH}` }) },
+      );
+
+      assert.equal(code, 0);
+      assert.match(stdout, /agent:\s+claude/);
+      assert.match(stdout, /answer from CLI --agent claude/i);
+      assert.doesNotMatch(stdout, /agent:\s+agn/);
+
+      const session = readAskSession(tmpCwd, slug);
+      assert.equal(
+        session.agent,
+        'claude',
+        'recordAskExchange must persist the CLI --agent, not the prior session.agent',
+      );
+      assert.equal(session.turns.length, 4);
+      assert.equal(session.turns[2].content, 'q2');
+      assert.match(session.turns[3].content, /answer from CLI --agent claude/i);
     } finally {
       fs.rmSync(tmpCwd, { recursive: true, force: true });
       fs.rmSync(binDir, { recursive: true, force: true });
