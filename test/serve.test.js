@@ -30,9 +30,11 @@ import { writeSeq } from '../lib/seq.js';
  *   `GET /api/products/:product/jobs`, `POST
  *   /api/products/:product/jobs/clean` (product-scoped `cleanJobs`; 409 when
  *   live jobs block; distinct from create-job POST …/jobs), `POST
- *   .../pause|resume|stop`. When `.orch/<slug>/seq.json` exists, GET job and
- *   list payloads include `job.seq` (`state` + normalized `units`); omit when
- *   missing.
+ *   .../pause|resume|stop|start`. Start is for plan-only decompose jobs with
+ *   `job.seq.state === 'planned'`: reuses the slug via `runDetached({ fromSlug })`
+ *   (same as `orch --seq --from <slug>`); rejects live / non-planned with 409.
+ *   When `.orch/<slug>/seq.json` exists, GET job and list payloads include
+ *   `job.seq` (`state` + normalized `units`); omit when missing.
  * - Phase 2 products: `GET`/`POST /api/products`, `GET`/`PATCH
  *   /api/products/:product` (no DELETE). Slug
  *   `/^[a-z0-9]+(?:-[a-z0-9]+)*$/` max 64; required `name` + `slug`.
@@ -1522,6 +1524,207 @@ describe('serve HTTP jobs API (scan + controls + logs)', () => {
             || stopped.json?.action === 'signaled'
             || stopped.json?.action === 'already-terminal',
           `unexpected stop outcome: state=${afterStop.state} body=${JSON.stringify(stopped.json)}`,
+        );
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('POST /api/jobs/:slug/start starts a planned decompose job via runDetached({ fromSlug })', async () => {
+    /**
+     * After mode:decompose plan-only completion, run.json is terminal `done` /
+     * phase decompose and seq.json is `planned`. Start reuses that slug
+     * (orch --seq --from <slug>) and returns the refreshed enriched job.
+     */
+    const home = makeTmpHome();
+    try {
+      const productDir = seedProduct(home, 'start-app');
+      const slug = 'planned-start-aaaa';
+      const task = 'implement the billing module';
+      seedJob(productDir, slug, {
+        product: 'start-app',
+        task,
+        agent: 'claude',
+        maxRounds: 7,
+        base: 'aaa111',
+        mode: 'decompose',
+        state: 'done',
+        phase: 'decompose',
+        finishedAt: '2026-08-02T01:00:00.000Z',
+        exitCode: 0,
+        pid: null,
+      });
+      const doc = seedSeq(productDir, slug, { state: 'planned', task });
+
+      const detachCalls = [];
+      const runDetached = mock.fn(async (prompt, options = {}) => {
+        detachCalls.push({ prompt, options });
+        if (options.cwd && options.fromSlug) {
+          const existing = readJob(options.cwd, options.fromSlug);
+          if (existing) {
+            writeJob(options.cwd, options.fromSlug, {
+              ...existing,
+              state: 'running',
+              pid: 710001,
+              role: 'coordinator',
+              finishedAt: null,
+              exitCode: null,
+            });
+          }
+        }
+        if (typeof options.exit === 'function') options.exit(0);
+      });
+
+      const handle = await startTestServe(home, { runDetached });
+      try {
+        const { res, json } = await jsonRequest(
+          handle.baseUrl,
+          'POST',
+          `/api/jobs/${slug}/start`,
+        );
+        assert.equal(
+          res.status,
+          200,
+          `planned start must succeed; got ${res.status}: ${JSON.stringify(json)}`,
+        );
+        assert.equal(json?.ok, true);
+        assert.equal(detachCalls.length, 1, 'start must call runDetached once');
+        const { prompt, options } = detachCalls[0];
+        assert.equal(
+          options.fromSlug,
+          slug,
+          'must reuse the job slug via fromSlug (orch --seq --from)',
+        );
+        if (options.jobSlug != null) {
+          assert.equal(
+            options.jobSlug,
+            slug,
+            'if jobSlug is passed it must reuse the same slug, not allocate a new one',
+          );
+        }
+        assert.equal(options.pr, true);
+        assert.equal(options.agent, 'claude');
+        assert.equal(options.maxRounds, 7);
+        assert.equal(options.base, 'aaa111');
+        assert.equal(
+          path.resolve(options.cwd),
+          path.resolve(productDir),
+          'detach cwd must be the product directory',
+        );
+        assert.equal(typeof options.exit, 'function', 'serve must pass a no-op exit');
+        assert.equal(
+          options.decompose,
+          undefined,
+          'start executes planned seq; must not re-run decompose',
+        );
+        assert.ok(
+          prompt === task || prompt === doc.task,
+          `detach prompt should be the job/seq task; got ${JSON.stringify(prompt)}`,
+        );
+
+        const job = json?.job;
+        assert.ok(job && typeof job === 'object', 'response must include refreshed job');
+        assert.equal(job.slug, slug);
+        assert.equal(job.seq?.state, 'planned', 'refreshed job must keep seq enrichment');
+        assertSeqPayload(job.seq, doc);
+        assert.equal(
+          readJob(productDir, slug).state,
+          'running',
+          'runDetached mock should have promoted the reused slug',
+        );
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('POST /api/jobs/:slug/start rejects non-planned seq, live jobs, and missing jobs', async () => {
+    const home = makeTmpHome();
+    try {
+      const productDir = seedProduct(home, 'start-reject');
+      const detachCalls = [];
+      const runDetached = mock.fn(async (prompt, options = {}) => {
+        detachCalls.push({ prompt, options });
+        if (typeof options.exit === 'function') options.exit(0);
+      });
+
+      // Non-planned: done job with seq.state running (execute already in progress on disk).
+      seedJob(productDir, 'seq-running-bbbb', {
+        product: 'start-reject',
+        task: 'already executing',
+        mode: 'decompose',
+        state: 'done',
+        phase: 'decompose',
+        finishedAt: '2026-08-02T01:00:00.000Z',
+        exitCode: 0,
+        pid: null,
+      });
+      seedSeq(productDir, 'seq-running-bbbb', { state: 'running' });
+
+      // Non-planned: done job with no seq.json at all.
+      seedJob(productDir, 'no-seq-cccc', {
+        product: 'start-reject',
+        task: 'plain done job',
+        state: 'done',
+        finishedAt: '2026-08-02T01:00:00.000Z',
+        exitCode: 0,
+        pid: null,
+      });
+
+      // Live: running job even if seq happens to say planned.
+      seedJob(productDir, 'live-planned-dddd', {
+        product: 'start-reject',
+        task: 'still live',
+        mode: 'decompose',
+        state: 'running',
+        phase: 'schedule',
+        pid: process.pid,
+      });
+      seedSeq(productDir, 'live-planned-dddd', { state: 'planned' });
+
+      const handle = await startTestServe(home, { runDetached });
+      try {
+        const nonPlanned = await jsonRequest(
+          handle.baseUrl,
+          'POST',
+          '/api/jobs/seq-running-bbbb/start',
+        );
+        assert.equal(nonPlanned.res.status, 409, 'non-planned seq must be a state conflict');
+        assert.match(String(nonPlanned.json?.error || ''), /planned|seq|state/i);
+
+        const missingSeq = await jsonRequest(
+          handle.baseUrl,
+          'POST',
+          '/api/jobs/no-seq-cccc/start',
+        );
+        assert.equal(missingSeq.res.status, 409, 'missing seq must be rejected');
+        assert.match(String(missingSeq.json?.error || ''), /planned|seq|state/i);
+
+        const live = await jsonRequest(
+          handle.baseUrl,
+          'POST',
+          '/api/jobs/live-planned-dddd/start',
+        );
+        assert.equal(live.res.status, 409, 'live job must be a state conflict');
+        assert.match(String(live.json?.error || ''), /live|running|starting|paused|state/i);
+
+        const missing = await jsonRequest(
+          handle.baseUrl,
+          'POST',
+          '/api/jobs/no-such-start-slug/start',
+        );
+        assert.equal(missing.res.status, 404);
+        assert.match(String(missing.json?.error || ''), /not found/i);
+
+        assert.equal(
+          detachCalls.length,
+          0,
+          'reject paths must not call runDetached',
         );
       } finally {
         await handle.close();
