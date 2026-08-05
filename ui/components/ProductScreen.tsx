@@ -4,7 +4,7 @@ import { FormEvent, useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { v4 as uuidv4 } from 'uuid';
 import { api, ApiError } from '@/lib/api';
-import type { Job, JobMode, Product } from '@/lib/types';
+import type { AskResponse, Job, JobMode, Product } from '@/lib/types';
 
 type Props = {
   productSlug: string;
@@ -20,6 +20,10 @@ export function ProductScreen({ productSlug }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [prompt, setPrompt] = useState('');
+  const [answer, setAnswer] = useState<string | null>(null);
+  const [askSlug, setAskSlug] = useState<string | null>(null);
+  const [askBusy, setAskBusy] = useState(false);
 
   const load = useCallback(async () => {
     setError(null);
@@ -95,6 +99,30 @@ export function ProductScreen({ productSlug }: Props) {
     }
   }
 
+  async function submitAsk(e: FormEvent) {
+    e.preventDefault();
+    const trimmed = prompt.trim();
+    if (!trimmed) return;
+    setAskBusy(true);
+    setError(null);
+    try {
+      const { data } = await api<AskResponse>(
+        `/api/products/${encodeURIComponent(productSlug)}/ask`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ prompt: trimmed }),
+        },
+      );
+      setAnswer(data.answer);
+      setAskSlug(data.slug);
+      setPrompt('');
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'ask failed');
+    } finally {
+      setAskBusy(false);
+    }
+  }
+
   return (
     <div>
       <header className="page-header">
@@ -155,10 +183,31 @@ export function ProductScreen({ productSlug }: Props) {
               </label>
             </div>
           </fieldset>
-          <button type="submit" disabled={busy || !task.trim()}>
+          <button type="submit" disabled={busy || askBusy || !task.trim()}>
             {busy ? 'Starting…' : 'Run'}
           </button>
         </form>
+      </section>
+
+      <section className="section-panel">
+        <h2>Ask</h2>
+        <form className="stack" onSubmit={submitAsk}>
+          <label>
+            Question
+            <textarea
+              value={prompt}
+              onChange={(e) => setPrompt(e.target.value)}
+              required
+              placeholder="Ask about this product…"
+            />
+          </label>
+          <button type="submit" disabled={askBusy || busy || !prompt.trim()}>
+            {askBusy ? 'Asking…' : 'Ask'}
+          </button>
+        </form>
+        {answer != null ? (
+          <pre className="logs mono">{answer}</pre>
+        ) : null}
       </section>
 
       <section className="section-panel">
@@ -167,7 +216,7 @@ export function ProductScreen({ productSlug }: Props) {
           <button
             type="button"
             className="danger"
-            disabled={busy || loading || jobs.length === 0}
+            disabled={busy || askBusy || loading || jobs.length === 0}
             onClick={() => void cleanAllJobs()}
           >
             Clean jobs
