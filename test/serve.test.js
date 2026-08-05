@@ -23,8 +23,8 @@ import { jobPaths, readJob, writeJob } from '../lib/jobs.js';
  *   persist `source: { kind, id, remoteAddr, receivedAt }` on the job record.
  * - HTTP (no auth): `GET /api/healthz`; product routes below; `POST
  *   /api/products/:product/jobs` for an existing product dir (optional exclusive
- *   `mode: 'seq' | 'fan-out'`; omit = normal; persist on job; tick →
- *   `runDetached` with `seq` / `fanOut`); `GET /api/jobs`,
+ *   `mode: 'seq' | 'fan-out' | 'decompose'`; omit = normal; persist on job; tick →
+ *   `runDetached` with `seq` / `fanOut` / `decompose`); `GET /api/jobs`,
  *   `GET /api/jobs/:slug`, `GET /api/jobs/:slug/logs`, `GET /api/jobs/:slug/files`,
  *   `GET /api/products/:product/jobs`, `POST
  *   /api/products/:product/jobs/clean` (product-scoped `cleanJobs`; 409 when
@@ -741,10 +741,10 @@ describe('serve HTTP jobs API', () => {
         assert.equal(first.options.pr, true);
         assert.equal(first.options.base, 'develop');
         assert.equal(typeof first.options.exit, 'function');
-        // Default (no mode): normal pipeline — neither seq nor fan-out.
+        // Default (no mode): normal pipeline — neither seq, fan-out, nor decompose.
         assert.ok(
-          !first.options.seq && !first.options.fanOut,
-          'omitting mode must start a normal pipeline (no seq / fanOut on runDetached)',
+          !first.options.seq && !first.options.fanOut && !first.options.decompose,
+          'omitting mode must start a normal pipeline (no seq / fanOut / decompose on runDetached)',
         );
         // No-op exit: invoking it must not kill the test / serve handle.
         first.options.exit(0);
@@ -977,13 +977,15 @@ describe('serve HTTP jobs API', () => {
     }
   });
 
-  it('POST …/jobs mode seq|fan-out is exclusive, persisted, and forwarded to runDetached', async () => {
+  it('POST …/jobs mode seq|fan-out|decompose is exclusive, persisted, and forwarded to runDetached', async () => {
     /**
-     * Serve UI chooses default / SEQ / Fan out before Run. Contract:
-     * - Optional body.mode: 'seq' | 'fan-out' (omit = normal pipeline).
+     * Serve UI chooses default / SEQ / Fan out / Decompose before Run. Contract:
+     * - Optional body.mode: 'seq' | 'fan-out' | 'decompose' (omit = normal pipeline).
      * - Persist mode on the queued job so tick/startOne can read it.
-     * - startOne → runDetached({ seq: true }) or ({ fanOut: true }); never both.
-     * - Reject invalid mode or both seq+fanOut booleans with 400.
+     * - startOne → runDetached({ seq: true }) or ({ fanOut: true }) or
+     *   ({ decompose: true }); never combine exclusive modes.
+     * - Reject invalid mode, seq+fanOut booleans, or decompose combined with
+     *   seq / fan-out (mode string and/or bools) with 400.
      * - Idempotency by caller id still holds when mode is set.
      */
     const home = makeTmpHome();
@@ -1019,6 +1021,31 @@ describe('serve HTTP jobs API', () => {
           body: { task: 'bad mode', id: 'id-bad', mode: 'pipeline' },
         });
         assert.equal(invalid.res.status, 400, 'unknown mode string must be rejected');
+        assert.match(
+          String(invalid.json?.error ?? ''),
+          /decompose/i,
+          'allowlist error must mention decompose alongside seq / fan-out',
+        );
+
+        const decompPlusSeq = await jsonRequest(handle.baseUrl, 'POST', '/api/products/mode-app/jobs', {
+          body: {
+            task: 'decompose with seq',
+            id: 'id-decomp-seq',
+            mode: 'decompose',
+            seq: true,
+          },
+        });
+        assert.equal(decompPlusSeq.res.status, 400, 'decompose + seq bool must be rejected');
+
+        const decompPlusFan = await jsonRequest(handle.baseUrl, 'POST', '/api/products/mode-app/jobs', {
+          body: {
+            task: 'decompose with fan-out',
+            id: 'id-decomp-fan',
+            mode: 'decompose',
+            fanOut: true,
+          },
+        });
+        assert.equal(decompPlusFan.res.status, 400, 'decompose + fanOut bool must be rejected');
 
         const seqJob = await jsonRequest(handle.baseUrl, 'POST', '/api/products/mode-app/jobs', {
           body: {
@@ -1038,6 +1065,7 @@ describe('serve HTTP jobs API', () => {
         assert.equal(detachCalls[0].prompt, 'ordered billing units');
         assert.equal(detachCalls[0].options.seq, true);
         assert.ok(!detachCalls[0].options.fanOut, 'seq start must not set fanOut');
+        assert.ok(!detachCalls[0].options.decompose, 'seq start must not set decompose');
         assert.equal(detachCalls[0].options.pr, true);
         assert.equal(detachCalls[0].options.jobSlug, seqSlug);
 
@@ -1073,11 +1101,56 @@ describe('serve HTTP jobs API', () => {
         assert.equal(fanCall.prompt, 'parallel billing workers');
         assert.equal(fanCall.options.fanOut, true);
         assert.ok(!fanCall.options.seq, 'fan-out start must not set seq');
+        assert.ok(!fanCall.options.decompose, 'fan-out start must not set decompose');
         assert.equal(fanCall.options.pr, true);
         assert.equal(fanCall.options.jobSlug, fanSlug);
 
         const fanOnDisk = readJob(productDir, fanSlug);
         assert.equal(fanOnDisk.mode, 'fan-out', 'queued job must persist fan-out mode for tick');
+
+        const decompJob = await jsonRequest(handle.baseUrl, 'POST', '/api/products/mode-app/jobs', {
+          body: {
+            task: 'plan-only decompose feature',
+            id: 'id-decomp-550e8400-e29b-41d4-a716-446655440003',
+            mode: 'decompose',
+          },
+        });
+        assert.ok(
+          [200, 201, 202].includes(decompJob.res.status),
+          `decompose status ${decompJob.res.status}`,
+        );
+        const decompSlug = decompJob.json?.slug ?? decompJob.json?.job?.slug;
+        assert.ok(decompSlug);
+        assert.equal(
+          decompJob.json?.job?.mode ?? decompJob.json?.mode,
+          'decompose',
+          'create response must include mode decompose',
+        );
+
+        for (let i = 0; i < 40 && detachCalls.length < 3; i++) {
+          await new Promise((r) => setTimeout(r, 20));
+        }
+        assert.equal(detachCalls.length, 3, 'decompose job must tick into runDetached');
+        const decompCall = detachCalls[2];
+        assert.equal(decompCall.prompt, 'plan-only decompose feature');
+        assert.equal(decompCall.options.decompose, true);
+        assert.ok(!decompCall.options.seq, 'decompose start must not set seq');
+        assert.ok(!decompCall.options.fanOut, 'decompose start must not set fanOut');
+        assert.equal(decompCall.options.pr, true);
+        assert.equal(decompCall.options.jobSlug, decompSlug);
+
+        const decompOnDisk = readJob(productDir, decompSlug);
+        assert.equal(decompOnDisk.mode, 'decompose', 'queued job must persist decompose mode for tick');
+
+        const decompAgain = await jsonRequest(handle.baseUrl, 'POST', '/api/products/mode-app/jobs', {
+          body: {
+            task: 'plan-only decompose feature',
+            id: 'id-decomp-550e8400-e29b-41d4-a716-446655440003',
+            mode: 'decompose',
+          },
+        });
+        assert.equal(decompAgain.json?.slug ?? decompAgain.json?.job?.slug, decompSlug);
+        assert.equal(detachCalls.length, 3, 'idempotent decompose replay must not re-detach');
       } finally {
         await handle.close();
       }
