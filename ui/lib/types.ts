@@ -33,9 +33,25 @@ export type FileEntry = {
   status: string;
 };
 
+/** One turn in a read-only ask session thread. */
+export type AskTurn = {
+  role: 'user' | 'assistant' | string;
+  content: string;
+  at?: string;
+};
+
+/** Persistable ask session returned by serve ask start/continue/GET. */
+export type AskSession = {
+  slug: string;
+  createdAt?: string;
+  updatedAt?: string;
+  agent?: string;
+  turns: AskTurn[];
+};
+
 /** POST /api/products/:product/ask response (read-only ask; no job queue). */
 export type AskResponse = {
   slug: string;
   answer: string;
-  session?: unknown;
+  session?: AskSession;
 };

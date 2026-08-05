@@ -4,7 +4,7 @@ import { FormEvent, useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { v4 as uuidv4 } from 'uuid';
 import { api, ApiError } from '@/lib/api';
-import type { AskResponse, Job, JobMode, Product } from '@/lib/types';
+import type { AskResponse, AskTurn, Job, JobMode, Product } from '@/lib/types';
 
 type Props = {
   productSlug: string;
@@ -23,6 +23,7 @@ export function ProductScreen({ productSlug }: Props) {
   const [prompt, setPrompt] = useState('');
   const [answer, setAnswer] = useState<string | null>(null);
   const [askSlug, setAskSlug] = useState<string | null>(null);
+  const [askTurns, setAskTurns] = useState<AskTurn[]>([]);
   const [askBusy, setAskBusy] = useState(false);
 
   const load = useCallback(async () => {
@@ -106,15 +107,36 @@ export function ProductScreen({ productSlug }: Props) {
     setAskBusy(true);
     setError(null);
     try {
-      const { data } = await api<AskResponse>(
-        `/api/products/${encodeURIComponent(productSlug)}/ask`,
-        {
-          method: 'POST',
-          body: JSON.stringify({ prompt: trimmed }),
-        },
-      );
-      setAnswer(data.answer);
+      const askPath = askSlug
+        ? `/api/products/${encodeURIComponent(productSlug)}/ask/${encodeURIComponent(askSlug)}`
+        : `/api/products/${encodeURIComponent(productSlug)}/ask`;
+      const { data } = await api<AskResponse>(askPath, {
+        method: 'POST',
+        body: JSON.stringify({ prompt: trimmed }),
+      });
       setAskSlug(data.slug);
+      setAnswer(data.answer);
+
+      let turns = data.session?.turns;
+      if (!turns) {
+        try {
+          const { data: got } = await api<AskResponse>(
+            `/api/products/${encodeURIComponent(productSlug)}/ask/${encodeURIComponent(data.slug)}`,
+          );
+          turns = got.session?.turns;
+        } catch {
+          /* keep answer-only fallback below */
+        }
+      }
+      if (turns) {
+        setAskTurns(turns);
+      } else {
+        setAskTurns((prev) => [
+          ...(askSlug ? prev : []),
+          { role: 'user', content: trimmed },
+          { role: 'assistant', content: data.answer },
+        ]);
+      }
       setPrompt('');
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'ask failed');
@@ -205,7 +227,15 @@ export function ProductScreen({ productSlug }: Props) {
             {askBusy ? 'Asking…' : 'Ask'}
           </button>
         </form>
-        {answer != null ? (
+        {askTurns.length > 0 ? (
+          <div className="stack">
+            {askTurns.map((turn, i) => (
+              <pre key={`${turn.role}-${i}`} className="logs mono">
+                {turn.role}: {turn.content}
+              </pre>
+            ))}
+          </div>
+        ) : answer != null ? (
           <pre className="logs mono">{answer}</pre>
         ) : null}
       </section>
