@@ -5,17 +5,20 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 /**
- * Contract for unit 04-product-ask-ui (Product ask chat panel):
+ * Contract for ProductScreen ask panel:
  *
- * - ProductScreen gains a read-only ask section-panel (question input + answer
- *   display) alongside existing Run / Jobs — not a replacement for them.
- * - First turn POSTs `{ prompt }` to `/api/products/<product>/ask` via the
- *   shared `api()` helper (prefer `prompt`; never jobs / clean / write queue).
- * - Success: render returned `answer` as plain CLI `--ask` body text
- *   (`pre` + `mono` / `.logs` style); hold returned `slug` in component state
- *   for later same-session follow-ups (unit 05 wires POST/GET …/ask/:slug).
- * - Do not implement multiturn `/ask/<slug>` POST/GET, agent picker, or
- *   README expansion here.
+ * Unit 04-product-ask-ui:
+ * - Read-only ask section-panel alongside Run / Jobs.
+ * - First turn POSTs `{ prompt }` to `/api/products/<product>/ask`.
+ * - Hold returned `slug` in state; surface ApiError; never jobs / clean / write.
+ *
+ * Unit 05-ui-multiturn:
+ * - When `askSlug` is set, follow-ups POST the same `{ prompt }` body to
+ *   `/api/products/<product>/ask/<askSlug>` (continue), not a new start.
+ * - After success, persist `data.slug` and render the full thread from
+ *   `data.session.turns` (optional GET only if session is missing).
+ * - Still read-only ask — never jobs / Clean / runDetached / write continue.
+ * - No agent picker, New chat, or README expansion here (unit 06 / backlog).
  */
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -27,7 +30,7 @@ function exists(p) {
 }
 
 function read(p) {
-  return fs.readFileSync(p, 'utf8');
+  return fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : '';
 }
 
 function productScreenPath() {
@@ -88,10 +91,8 @@ function askSubmitBody(src) {
     const body = extractFnBody(src, name);
     if (body && /\/ask/.test(body)) return body;
   }
-  // Fallback: window around the start-ask POST path (not …/ask/${slug}).
-  const m = src.match(
-    /\/api\/products\/\$\{[^}]+\}\/ask(?!\/)[\s\S]{0,900}/,
-  );
+  // Fallback: window around any ask POST path (start or continue).
+  const m = src.match(/\/api\/products\/\$\{[^}]+\}\/ask[\s\S]{0,1200}/);
   return m ? m[0] : '';
 }
 
@@ -127,14 +128,15 @@ describe('04-product-ask-ui ProductScreen ask panel', () => {
     );
   });
 
-  it('POSTs trimmed { prompt } to /api/products/:product/ask (start path only)', () => {
+  it('POSTs trimmed { prompt } to /api/products/:product/ask for the first turn', () => {
     const src = read(productScreenPath());
 
-    // Start route: …/ask without a trailing /${slug} segment on the first turn.
+    // Start route must still exist for the first turn (…/ask without slug).
     assert.ok(
       /\/api\/products\/\$\{[^}]+\}\/ask[`'"]/.test(src) ||
-        /\/api\/products\/\$\{encodeURIComponent\([^)]+\)\}\/ask/.test(src),
-      'Ask submit must POST /api/products/${encodeURIComponent(product)}/ask',
+        /\/api\/products\/\$\{encodeURIComponent\([^)]+\)\}\/ask[`'"]/.test(src) ||
+        /\/api\/products\/\$\{[^}]+\}\/ask(?!\/)/.test(src),
+      'Ask submit must POST /api/products/${encodeURIComponent(product)}/ask on start',
     );
 
     // Prefer field name `prompt` in the JSON body (API also accepts question).
@@ -160,30 +162,17 @@ describe('04-product-ask-ui ProductScreen ask panel', () => {
       /\.trim\s*\(/.test(askBody) || /\.trim\s*\(/.test(src),
       'Ask prompt must be trimmed before POST',
     );
-
-    // Unit 04 must not wire continue: POST …/ask/${slug} or GET …/ask/${slug}.
-    assert.doesNotMatch(
-      src,
-      /\/api\/products\/\$\{[^}]+\}\/ask\/\$\{/,
-      'unit 04 must not POST/GET /api/products/.../ask/${slug} (unit 05 owns multiturn)',
-    );
-    assert.doesNotMatch(
-      src,
-      /\/ask\/\$\{(?:askSlug|slug|sessionSlug|askSession)/,
-      'unit 04 must not continue via /ask/${storedSlug} yet',
-    );
   });
 
-  it('stores returned slug and renders answer like CLI --ask (pre + mono)', () => {
+  it('stores returned slug and keeps a pre+mono Ask transcript region', () => {
     const src = read(productScreenPath());
 
-    // Hold slug from the start response for later same-session follow-ups.
+    // Hold slug from the start response for same-session follow-ups.
     assert.ok(
       /(?:data|result|json|res|body)\s*\.\s*slug\b|\.slug\b/.test(src) &&
         /useState/.test(src),
       'ProductScreen must store returned ask slug in component state',
     );
-    // A dedicated ask-slug state (not only Run job slug) — look for ask*Slug or set*Slug near ask.
     assert.ok(
       /askSlug|askSessionSlug|sessionSlug|setAskSlug|setSlug/.test(src) ||
         (/\/ask[`'"]/.test(src) &&
@@ -191,10 +180,12 @@ describe('04-product-ask-ui ProductScreen ask panel', () => {
       'returned data.slug must be assigned into ask session state (e.g. askSlug)',
     );
 
-    // Display stripped answer text (CLI body), not <<<SUMMARY>>> chrome.
+    // Latest-answer fallback is fine; multiturn prefers session.turns (unit 05).
     assert.ok(
-      /(?:data|result|json|res|body)\s*\.\s*answer\b|setAskAnswer|setAnswer/.test(src),
-      'ProductScreen must read/display data.answer from the ask response',
+      /(?:data|result|json|res|body)\s*\.\s*answer\b|setAskAnswer|setAnswer|session\.turns|\.turns\b/.test(
+        src,
+      ),
+      'ProductScreen must display ask response content (answer and/or session.turns)',
     );
     assert.doesNotMatch(
       src,
@@ -205,12 +196,12 @@ describe('04-product-ask-ui ProductScreen ask panel', () => {
     // Plain-text region mirroring JobScreen logs.
     assert.ok(
       /<pre\b/.test(src) && /\bmono\b/.test(src),
-      'answer display must use pre + mono (JobScreen logs pattern)',
+      'Ask transcript must use pre + mono (JobScreen logs pattern)',
     );
     assert.ok(
       /className=\{?['"`][^'"`]*\b(?:logs|mono)\b/.test(src) ||
         /<pre[^>]*className=\{?['"`][^'"`]*mono/.test(src),
-      'answer <pre> should reuse .logs / .mono classes from globals.css',
+      'Ask <pre> should reuse .logs / .mono classes from globals.css',
     );
   });
 
@@ -259,6 +250,180 @@ describe('04-product-ask-ui ProductScreen ask panel', () => {
     assert.ok(
       hasAskType,
       'ui/lib/types.ts should declare a small Ask response type ({ slug, answer, session? })',
+    );
+  });
+});
+
+describe('05-ui-multiturn ProductScreen same-session ask', () => {
+  it('branches submitAsk: continue POST …/ask/${askSlug} when slug is set, else start …/ask', () => {
+    const p = productScreenPath();
+    assert.ok(p, 'expected ProductScreen component');
+    const src = read(p);
+    const askBody = askSubmitBody(src);
+    assert.ok(askBody.length > 0, 'expected ask submit handler in ProductScreen');
+
+    // Continue route must appear in ProductScreen (unit 05 owns this wiring).
+    assert.ok(
+      /\/api\/products\/\$\{[^}]+\}\/ask\/\$\{/.test(src) ||
+        /\/ask\/\$\{(?:askSlug|slug|sessionSlug|askSession)/.test(src),
+      'when askSlug is set, follow-ups must POST /api/products/.../ask/${askSlug}',
+    );
+
+    // Must still keep the start path for first turn.
+    assert.ok(
+      /\/api\/products\/\$\{[^}]+\}\/ask(?!\/)/.test(askBody) ||
+        /\/api\/products\/\$\{[^}]+\}\/ask[`'"]/.test(askBody) ||
+        /\/ask[`'"]/.test(askBody),
+      'first turn must still POST …/ask (no slug)',
+    );
+
+    // Branch on stored ask session slug (ternary, if, or template that embeds askSlug).
+    assert.ok(
+      /askSlug/.test(askBody) || /askSlug/.test(src),
+      'submitAsk must consult askSlug when choosing start vs continue URL',
+    );
+    assert.ok(
+      /\?[\s\S]{0,200}\/ask\/\$\{|\bif\s*\([^)]*askSlug|askSlug\s*\?/.test(askBody) ||
+        (/askSlug/.test(askBody) &&
+          /\/ask\/\$\{/.test(askBody) &&
+          /\/ask(?!\/)/.test(askBody)),
+      'submitAsk must branch: askSlug set → …/ask/${askSlug}, else → …/ask',
+    );
+
+    // Same { prompt } body on both paths.
+    assert.ok(
+      /JSON\.stringify\s*\(\s*\{\s*prompt\s*\}/.test(askBody) ||
+        /JSON\.stringify\s*\(\s*\{[^}]*\bprompt\b/.test(askBody) ||
+        /\{\s*prompt\s*:\s*trimmed\}/.test(askBody) ||
+        /\{\s*prompt\s*\}/.test(askBody),
+      'continue POST must use the same { prompt } body as start',
+    );
+  });
+
+  it('after success, persists data.slug and replaces Ask display with session.turns', () => {
+    const src = read(productScreenPath());
+    const askBody = askSubmitBody(src);
+
+    assert.ok(
+      /setAskSlug\s*\(\s*(?:data|result|json|res|body)\s*\.\s*slug/.test(askBody) ||
+        /setAskSlug\s*\(\s*(?:data|result|json|res|body)\s*\.\s*slug/.test(src) ||
+        (/set[A-Za-z]*Slug\s*\(/.test(askBody) &&
+          /(?:data|result|json|res|body)\s*\.\s*slug/.test(askBody)),
+      'success path must persist data.slug into askSlug state',
+    );
+
+    // Thread state from session.turns (or GET fallback when session missing).
+    assert.ok(
+      /session\s*\.\s*turns|(?:data|result|json|res|body)\s*\.\s*session/.test(askBody) ||
+        /session\s*\.\s*turns|(?:data|result|json|res|body)\s*\.\s*session/.test(src),
+      'success path must read data.session (turns) from the ask response',
+    );
+    assert.ok(
+      /\.turns\b/.test(askBody) || /\.turns\b/.test(src),
+      'Ask display state must be driven by session.turns, not only latest answer',
+    );
+
+    // Dedicated turns / thread state (useState), not answer-only.
+    assert.ok(
+      /useState[\s\S]{0,80}turns|setTurns|askTurns|setAskTurns|thread|setThread|setSession/.test(
+        src,
+      ) ||
+        (/turns/.test(src) && /useState/.test(src)),
+      'ProductScreen must hold Ask thread state (e.g. turns) for the full session',
+    );
+  });
+
+  it('renders the full user/assistant thread in the Ask panel (pre/mono/logs)', () => {
+    const src = read(productScreenPath());
+
+    // Iterate ask turns specifically — not jobs.map alone.
+    assert.ok(
+      /(?:turns|askTurns|thread)\s*\.map\s*\(|\(?(?:turns|askTurns|thread)\)?\.map\s*\(/.test(
+        src,
+      ) ||
+        (/\.turns\b[\s\S]{0,120}\.map\s*\(/.test(src) &&
+          /\.role\b/.test(src) &&
+          /\.content\b/.test(src)),
+      'Ask panel must map session turns for the full thread (not only latest answer)',
+    );
+    assert.ok(
+      /\.role\b/.test(src) && /\.content\b/.test(src),
+      'thread render must use turn.role and turn.content',
+    );
+    // Prefer explicit user/assistant labels or role values in the Ask UI.
+    assert.ok(
+      /user|assistant|turn\.role|\.role\b/.test(src),
+      'thread should distinguish user vs assistant turns',
+    );
+
+    // Stay inside existing visual tokens.
+    assert.ok(
+      /<pre\b/.test(src) && /\b(?:logs|mono)\b/.test(src),
+      'thread display must reuse pre + logs/mono patterns',
+    );
+    assert.ok(
+      /section-panel/.test(src) && (/>\s*Ask\s*</.test(src) || /['"`]Ask['"`]/.test(src)),
+      'thread stays inside the Ask section-panel',
+    );
+  });
+
+  it('keeps askBusy separate from Run busy and never hits jobs/write from ask', () => {
+    const src = read(productScreenPath());
+    const askBody = askSubmitBody(src);
+
+    assert.ok(
+      /askBusy|setAskBusy/.test(src),
+      'Ask must keep askBusy separate from Run busy',
+    );
+    assert.ok(
+      /setAskBusy\s*\(\s*true\s*\)/.test(askBody) || /setAskBusy\s*\(\s*true\s*\)/.test(src),
+      'submitAsk must toggle askBusy while the request is in flight',
+    );
+
+    assert.doesNotMatch(
+      askBody,
+      /\/jobs(?:\/clean)?[`'"]/,
+      'multiturn ask must not POST …/jobs or …/jobs/clean',
+    );
+    assert.doesNotMatch(
+      askBody,
+      /runDetached|orch continue|\/continue/,
+      'multiturn ask must not touch write-pipeline continue paths',
+    );
+    assert.doesNotMatch(
+      askBody,
+      /agent\s*:|agents\s*:|setAgent/,
+      'unit 05 must not add an agent picker on ask POST',
+    );
+  });
+
+  it('types session.turns on AskResponse so the thread is usable without unknown casts', () => {
+    const p = typesPath();
+    assert.ok(p, 'expected ui/lib/types.ts');
+    const typesSrc = read(p);
+
+    assert.ok(
+      /Ask(?:Response|Result|Session)\b/.test(typesSrc),
+      'ui/lib/types.ts must declare AskResponse / AskSession',
+    );
+    assert.ok(
+      /turns\s*[?:]/.test(typesSrc),
+      'Ask session type must expose turns',
+    );
+    assert.ok(
+      /role\s*[?:]/.test(typesSrc) && /content\s*[?:]/.test(typesSrc),
+      'turn type must include role and content',
+    );
+    // session must not remain opaque unknown-only if turns are declared.
+    assert.ok(
+      /session\s*\?\s*:\s*(?:AskSession|\{)/.test(typesSrc) ||
+        (/interface\s+AskSession|type\s+AskSession/.test(typesSrc) &&
+          /session\s*\?/.test(typesSrc)),
+      'AskResponse.session should be typed (AskSession), not only unknown',
+    );
+    assert.ok(
+      /JobMode/.test(typesSrc),
+      'JobMode must remain intact alongside ask types',
     );
   });
 });
