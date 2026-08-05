@@ -5555,6 +5555,7 @@ program
     .option('--github-owner <owner>', 'Default GitHub owner/org for blank product init (private gh repo create)')
     .action(async (options) => {
         const { startServe } = await import('./lib/serve.js');
+        const { runAsk } = await import('./lib/ask-run.js');
         const cwd = process.cwd();
         const agent = resolveAgentOrExit(options.agent, cwd);
         try {
@@ -5568,6 +5569,7 @@ program
                 base: options.base,
                 githubOwner: options.githubOwner,
                 runDetached,
+                runAsk,
                 isBinaryOnPath,
                 execFileSync,
             });
