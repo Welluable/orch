@@ -1160,6 +1160,9 @@ export async function runDetached(prompt, options = {}) {
         cwd = process.cwd(),
         seq = false,
         maxUnits = 8,
+        fanOut = false,
+        maxWorkers = 4,
+        maxConcurrency = null,
         notify,
         pr = false,
         base,
@@ -1168,6 +1171,10 @@ export async function runDetached(prompt, options = {}) {
         spawn: spawnFn = spawn,
         exit = (code) => process.exit(code),
     } = options;
+
+    if (seq && fanOut) {
+        throw new Error('runDetached: seq and fanOut cannot both be set');
+    }
 
     const backend = AGENT_BACKENDS[agent];
     if (!backend) {
@@ -1184,13 +1191,16 @@ export async function runDetached(prompt, options = {}) {
         ensureGhAuthenticated();
     }
 
+    const coordinator = Boolean(seq || fanOut);
     let slug = preallocatedSlug;
     if (slug) {
         const existing = readJob(cwd, slug);
         if (!existing) {
             throw new Error(`runDetached: unknown pre-allocated job ${slug}`);
         }
-        patchJob(cwd, slug, { state: 'starting', task: prompt, agent, maxRounds });
+        const patch = { state: 'starting', task: prompt, agent, maxRounds };
+        if (coordinator) patch.role = 'coordinator';
+        patchJob(cwd, slug, patch);
     } else {
         ({ slug } = allocateJob({
             cwd,
@@ -1199,7 +1209,7 @@ export async function runDetached(prompt, options = {}) {
             maxRounds,
             state: 'starting',
             createRunContext: createRunContextFn,
-            role: seq ? 'coordinator' : null,
+            role: coordinator ? 'coordinator' : null,
         }));
     }
     const { dir, logPath } = jobPaths(cwd, slug);
@@ -1211,6 +1221,12 @@ export async function runDetached(prompt, options = {}) {
     if (verbose) childArgs.push('--verbose');
     if (seq) {
         childArgs.push('--seq', '--max-units', String(maxUnits));
+    }
+    if (fanOut) {
+        childArgs.push('--fan-out', '--max-workers', String(maxWorkers));
+        if (maxConcurrency != null) {
+            childArgs.push('--max-concurrency', String(maxConcurrency));
+        }
     }
     if (pr) childArgs.push('--pr');
     if (base) childArgs.push('--base', base);
@@ -4819,16 +4835,31 @@ Sequential (--seq):
                 return;
             }
 
+            if (options.detach) {
+                await runDetached(prompt, {
+                    ...options,
+                    fanOut: true,
+                    maxWorkers: options.maxWorkers,
+                    maxConcurrency: options.maxConcurrency ?? null,
+                    notify: cliNotifyFromOptions(options),
+                });
+                return;
+            }
+
             const cwd = process.cwd();
-            const { slug } = allocateJob({
-                cwd,
-                prompt,
-                agent: options.agent,
-                maxRounds: options.maxRounds,
-                state: 'running',
-                pid: process.pid,
-                role: 'coordinator',
-            });
+            let slug = process.env.ORCH_JOB_SLUG;
+            if (!slug) {
+                const alloc = allocateJob({
+                    cwd,
+                    prompt,
+                    agent: options.agent,
+                    maxRounds: options.maxRounds,
+                    state: 'running',
+                    pid: process.pid,
+                    role: 'coordinator',
+                });
+                slug = alloc.slug;
+            }
             setJobSlug(slug);
 
             await runFanoutPipeline(prompt, {

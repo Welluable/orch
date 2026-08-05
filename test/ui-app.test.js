@@ -15,7 +15,8 @@ import { fileURLToPath } from 'node:url';
  *   responses; no auth headers or login UI.
  * - Screens: Products (`/` init + clone, navigate to Product on 201),
  *   Product (GET product detail or GET .../jobs — not Run POST alone — +
- *   job→Job links + Run with uuid `id` + danger “Clean jobs” via POST
+ *   job→Job links + Run with uuid `id` + exclusive default/SEQ/Fan-out mode
+ *   before submit (POST mode with task+id) + danger “Clean jobs” via POST
  *   …/jobs/clean with confirm), Job (poll/refresh of GET
  *   /api/jobs/:slug for state/prUrl — not logs-only SSE; also poll/refresh
  *   GET /api/jobs/:slug/files so the Files card updates without manual Reload;
@@ -867,6 +868,58 @@ describe('01-ui-app Product screen', () => {
     // No Continue control labeled for users (forbid Continue button/link text).
     assert.doesNotMatch(src, /<(button|a|Link)[^>]*>\s*[^<]*\bContinue\b/);
     assert.doesNotMatch(src, />\s*Continue\s*</);
+  });
+
+  it('lets the user choose default / SEQ / Fan out before Run and POSTs mode with task+id', () => {
+    const productSrc = exists(path.join(uiRoot, 'components', 'ProductScreen.tsx'))
+      ? read(path.join(uiRoot, 'components', 'ProductScreen.tsx'))
+      : allUiSourceText();
+    const typesSrc = exists(path.join(uiRoot, 'lib', 'types.ts'))
+      ? read(path.join(uiRoot, 'lib', 'types.ts'))
+      : '';
+
+    // Exclusive mode control on the Run form (before submit).
+    assert.ok(
+      /\bSEQ\b/.test(productSrc) && /Fan\s*out|fan-out|Fan-out/i.test(productSrc),
+      'Product Run form must expose SEQ and Fan out choices',
+    );
+    assert.ok(
+      /Default|Normal|Pipeline|standard/i.test(productSrc),
+      'Product Run form must expose a default (neither SEQ nor Fan out) choice',
+    );
+    assert.ok(
+      /type\s*=\s*['"]radio['"]|role\s*=\s*['"]radiogroup['"]|<select\b|mode/.test(productSrc),
+      'mode choice must be an exclusive control (radio, select, or mode state)',
+    );
+
+    // Run POST body must include mode alongside task and id.
+    assert.ok(
+      /\bmode\b/.test(productSrc) &&
+        (
+          /(?:task|id|mode)[\s\S]{0,220}(?:task|id|mode)[\s\S]{0,220}(?:task|id|mode)/.test(
+            productSrc,
+          ) ||
+          /JSON\.stringify\s*\(\s*\{[^}]*(?:\btask\b|\bid\b|\bmode\b)[^}]*(?:\btask\b|\bid\b|\bmode\b)/.test(
+            productSrc,
+          ) ||
+          /\{\s*task[\s\S]{0,80}id[\s\S]{0,80}mode|\{\s*task[\s\S]{0,80}mode[\s\S]{0,80}id/.test(
+            productSrc,
+          )
+        ),
+      'POST .../jobs body must include mode with task and caller uuid id',
+    );
+    assert.ok(
+      /['"]seq['"]/.test(productSrc) && /['"]fan-out['"]/.test(productSrc),
+      'mode values posted must include "seq" and "fan-out"',
+    );
+
+    // Types know about the request mode field (or Job.mode if surfaced).
+    if (typesSrc) {
+      assert.ok(
+        /mode\s*[?:]|'seq'|"seq"|fan-out/.test(typesSrc),
+        'ui/lib/types.ts must type the Run mode field (seq | fan-out)',
+      );
+    }
   });
 
   it('exposes a danger Clean jobs control that POSTs …/jobs/clean after confirm', () => {

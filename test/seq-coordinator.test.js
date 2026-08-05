@@ -49,8 +49,8 @@ import { allocateJob as realAllocateJob } from '../lib/job-lifecycle.js';
  * - Reject `--seq` with `--fan-out` / `--ask` / `--quick` / `--dry-run`.
  * - Reject `--seq` / `--fan-out` if ORCH_SEQ_DEPTH or ORCH_FANOUT_DEPTH set.
  * - `--seq --detach`: spawn detached coordinator with `--seq` (no detach
- *   flag), ORCH_JOB_SLUG, coordinator role — do not inherit fan-out's
- *   pre-detach short-circuit. Positive path pinned via `runDetached({ seq })`.
+ *   flag), ORCH_JOB_SLUG, coordinator role. Positive path pinned via
+ *   `runDetached({ seq })`. Fan-out detach is in fanout-coordinator.test.js.
  *
  * `cascadeStopSeqChildren(cwd, parentSlug, { kill, isPidAlive })` — reads
  * seq.json unit slugs and SIGTERMs live non-terminal children.
@@ -921,10 +921,10 @@ describe('--seq --detach', () => {
   });
 
   it('spawns a detached coordinator child with --seq (no --detach), ORCH_JOB_SLUG, and role coordinator', async () => {
-    // Pins the positive detach path so seq does not inherit fan-out's
-    // pre-detach short-circuit (fan-out currently allocates+runs in-process
-    // before the --detach branch). runDetached({ seq: true }) must forward
+    // Pins the positive detach path. runDetached({ seq: true }) must forward
     // --seq/--max-units and allocate the parent as role:"coordinator".
+    // Fan-out detach (`runDetached({ fanOut })`) is covered in
+    // test/fanout-coordinator.test.js.
     const cwd = makeTmpCwd('orch-seq-detach-spawn-');
     const spawnMock = fakeDetachSpawn(65432);
     const exit = mock.fn();

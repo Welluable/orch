@@ -22,7 +22,9 @@ import { jobPaths, readJob, writeJob } from '../lib/jobs.js';
  *   `base`, and a no-op `exit` so the serve process stays alive. HTTP starts
  *   persist `source: { kind, id, remoteAddr, receivedAt }` on the job record.
  * - HTTP (no auth): `GET /api/healthz`; product routes below; `POST
- *   /api/products/:product/jobs` for an existing product dir; `GET /api/jobs`,
+ *   /api/products/:product/jobs` for an existing product dir (optional exclusive
+ *   `mode: 'seq' | 'fan-out'`; omit = normal; persist on job; tick →
+ *   `runDetached` with `seq` / `fanOut`); `GET /api/jobs`,
  *   `GET /api/jobs/:slug`, `GET /api/jobs/:slug/logs`, `GET /api/jobs/:slug/files`,
  *   `GET /api/products/:product/jobs`, `POST
  *   /api/products/:product/jobs/clean` (product-scoped `cleanJobs`; 409 when
@@ -726,7 +728,6 @@ describe('serve HTTP jobs API', () => {
             id: 'ui-550e8400-e29b-41d4-a716-446655440000',
             agent: 'claude',
             maxRounds: 3,
-            mode: 'pipeline',
           },
         });
         assert.ok([200, 201, 202].includes(created.res.status), `unexpected status ${created.res.status}`);
@@ -740,6 +741,11 @@ describe('serve HTTP jobs API', () => {
         assert.equal(first.options.pr, true);
         assert.equal(first.options.base, 'develop');
         assert.equal(typeof first.options.exit, 'function');
+        // Default (no mode): normal pipeline — neither seq nor fan-out.
+        assert.ok(
+          !first.options.seq && !first.options.fanOut,
+          'omitting mode must start a normal pipeline (no seq / fanOut on runDetached)',
+        );
         // No-op exit: invoking it must not kill the test / serve handle.
         first.options.exit(0);
 
@@ -964,6 +970,115 @@ describe('serve HTTP jobs API', () => {
         assert.equal(started[1].cwd, bDir);
       } finally {
         release();
+        await handle.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('POST …/jobs mode seq|fan-out is exclusive, persisted, and forwarded to runDetached', async () => {
+    /**
+     * Serve UI chooses default / SEQ / Fan out before Run. Contract:
+     * - Optional body.mode: 'seq' | 'fan-out' (omit = normal pipeline).
+     * - Persist mode on the queued job so tick/startOne can read it.
+     * - startOne → runDetached({ seq: true }) or ({ fanOut: true }); never both.
+     * - Reject invalid mode or both seq+fanOut booleans with 400.
+     * - Idempotency by caller id still holds when mode is set.
+     */
+    const home = makeTmpHome();
+    try {
+      const productDir = seedProduct(home, 'mode-app');
+      const detachCalls = [];
+      const runDetached = mock.fn(async (prompt, options = {}) => {
+        detachCalls.push({ prompt, options });
+        if (options.cwd && options.jobSlug) {
+          const existing = readJob(options.cwd, options.jobSlug);
+          if (existing) {
+            writeJob(options.cwd, options.jobSlug, {
+              ...existing,
+              state: 'running',
+              pid: 700000 + detachCalls.length,
+            });
+          }
+        }
+        if (typeof options.exit === 'function') options.exit(0);
+      });
+
+      const handle = await startTestServe(home, {
+        concurrency: 1,
+        runDetached,
+      });
+      try {
+        const both = await jsonRequest(handle.baseUrl, 'POST', '/api/products/mode-app/jobs', {
+          body: { task: 'both modes', id: 'id-both', seq: true, fanOut: true },
+        });
+        assert.equal(both.res.status, 400, 'seq and fanOut together must be rejected');
+
+        const invalid = await jsonRequest(handle.baseUrl, 'POST', '/api/products/mode-app/jobs', {
+          body: { task: 'bad mode', id: 'id-bad', mode: 'pipeline' },
+        });
+        assert.equal(invalid.res.status, 400, 'unknown mode string must be rejected');
+
+        const seqJob = await jsonRequest(handle.baseUrl, 'POST', '/api/products/mode-app/jobs', {
+          body: {
+            task: 'ordered billing units',
+            id: 'id-seq-550e8400-e29b-41d4-a716-446655440001',
+            mode: 'seq',
+          },
+        });
+        assert.ok([200, 201, 202].includes(seqJob.res.status), `seq status ${seqJob.res.status}`);
+        const seqSlug = seqJob.json?.slug ?? seqJob.json?.job?.slug;
+        assert.ok(seqSlug);
+
+        for (let i = 0; i < 30 && detachCalls.length < 1; i++) {
+          await new Promise((r) => setTimeout(r, 20));
+        }
+        assert.equal(detachCalls.length, 1, 'seq job must tick into runDetached');
+        assert.equal(detachCalls[0].prompt, 'ordered billing units');
+        assert.equal(detachCalls[0].options.seq, true);
+        assert.ok(!detachCalls[0].options.fanOut, 'seq start must not set fanOut');
+        assert.equal(detachCalls[0].options.pr, true);
+        assert.equal(detachCalls[0].options.jobSlug, seqSlug);
+
+        const seqOnDisk = readJob(productDir, seqSlug);
+        assert.equal(seqOnDisk.mode, 'seq', 'queued job must persist mode for tick');
+
+        const seqAgain = await jsonRequest(handle.baseUrl, 'POST', '/api/products/mode-app/jobs', {
+          body: {
+            task: 'ordered billing units',
+            id: 'id-seq-550e8400-e29b-41d4-a716-446655440001',
+            mode: 'seq',
+          },
+        });
+        assert.equal(seqAgain.json?.slug ?? seqAgain.json?.job?.slug, seqSlug);
+        assert.equal(detachCalls.length, 1, 'idempotent seq replay must not re-detach');
+
+        const fanJob = await jsonRequest(handle.baseUrl, 'POST', '/api/products/mode-app/jobs', {
+          body: {
+            task: 'parallel billing workers',
+            id: 'id-fan-550e8400-e29b-41d4-a716-446655440002',
+            mode: 'fan-out',
+          },
+        });
+        assert.ok([200, 201, 202].includes(fanJob.res.status), `fan-out status ${fanJob.res.status}`);
+        const fanSlug = fanJob.json?.slug ?? fanJob.json?.job?.slug;
+        assert.ok(fanSlug);
+
+        for (let i = 0; i < 40 && detachCalls.length < 2; i++) {
+          await new Promise((r) => setTimeout(r, 20));
+        }
+        assert.equal(detachCalls.length, 2, 'fan-out job must tick into runDetached');
+        const fanCall = detachCalls[1];
+        assert.equal(fanCall.prompt, 'parallel billing workers');
+        assert.equal(fanCall.options.fanOut, true);
+        assert.ok(!fanCall.options.seq, 'fan-out start must not set seq');
+        assert.equal(fanCall.options.pr, true);
+        assert.equal(fanCall.options.jobSlug, fanSlug);
+
+        const fanOnDisk = readJob(productDir, fanSlug);
+        assert.equal(fanOnDisk.mode, 'fan-out', 'queued job must persist fan-out mode for tick');
+      } finally {
         await handle.close();
       }
     } finally {
