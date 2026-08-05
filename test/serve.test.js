@@ -7,6 +7,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { jobPaths, readJob, writeJob } from '../lib/jobs.js';
+import {
+  askSessionPaths,
+  buildAskFollowUpPrompt,
+  readAskSession,
+  recordAskExchange,
+  writeAskSession,
+} from '../lib/ask-session.js';
 
 /**
  * Contract for `.spec/server.md` phases 1–3 (serve jobs + products + scan/files):
@@ -50,6 +57,18 @@ import { jobPaths, readJob, writeJob } from '../lib/jobs.js';
  *   worktree, the list still surfaces files from commits on the job branch
  *   since `run.json.base` (union of dirty + committed-since-base). Unavailable
  *   job/worktree/git → `{ files: [] }`.
+ * - Unit 03-serve-ask-api (per-product read-only ask, not the write queue):
+ *   `POST /api/products/:product/ask` starts a new ask (allocateJob under the
+ *   product cwd + ask agent + `recordAskExchange` → `.orch/<slug>/ask.json`);
+ *   `POST /api/products/:product/ask/:slug` continues the same session
+ *   (`readAskSession` + `buildAskFollowUpPrompt` + bare follow-up on success,
+ *   mirroring CLI `orch --ask --from`); `GET /api/products/:product/ask/:slug`
+ *   returns transcript (`turns`, `agent`, timestamps) plus `readJob` status
+ *   when `run.json` exists. Body: non-empty `prompt` or `question`; optional
+ *   `agent` (default = serve `options.agent`). Injectable non-exiting
+ *   `runAsk` (and/or `AgentClass`) so failures map to 4xx/5xx without
+ *   `process.exit`. Never `runDetached`, job `tick`, `orch continue`,
+ *   `runContinuePipeline`, or `reopenJob`.
  * - Durable `state: "queued"` jobs are re-enqueued on boot; shutdown does not
  *   kill children.
  *
@@ -462,6 +481,83 @@ async function jsonRequest(baseUrl, method, urlPath, { body, headers } = {}) {
     }
   }
   return { res, text, json };
+}
+
+/**
+ * Injectable `runAsk` stand-in for serve ask routes (unit 03).
+ *
+ * Mirrors the non-exiting ask path the implementer should wire: on success
+ * call `recordAskExchange` with the bare user prompt (never the
+ * `buildAskFollowUpPrompt` blob), return `{ answer, session }`. Throws with
+ * `statusCode` when continue targets a missing/malformed session. Does not
+ * allocate jobs — serve must `allocateJob` for new asks and pass `jobSlug`.
+ */
+function makeMockRunAsk({
+  answerFor = (prompt) => `answer: ${prompt}`,
+  fail = false,
+  failError = null,
+  onCall = null,
+} = {}) {
+  return mock.fn(async (opts = {}) => {
+    if (typeof onCall === 'function') onCall(opts);
+    const {
+      prompt,
+      cwd,
+      agent = 'claude',
+      jobSlug,
+      fromSlug = null,
+    } = opts;
+    assert.ok(typeof prompt === 'string' && prompt.trim(), 'runAsk requires prompt');
+    assert.ok(cwd && jobSlug, 'runAsk requires cwd + jobSlug');
+
+    if (fromSlug) {
+      let session;
+      try {
+        session = readAskSession(cwd, fromSlug);
+      } catch (err) {
+        const e = new Error(`could not read ask session for ${fromSlug}: ${err.message}`);
+        e.statusCode = 400;
+        throw e;
+      }
+      if (!session) {
+        const e = new Error(`no ask session found for ${fromSlug}`);
+        e.statusCode = 404;
+        throw e;
+      }
+      // Real runner folds prior turns into the agent prompt; persist bare follow-up only.
+      void buildAskFollowUpPrompt(session.turns ?? [], prompt);
+    }
+
+    if (fail) {
+      throw failError ?? Object.assign(new Error('ask agent failed'), { statusCode: 502 });
+    }
+
+    const answer = typeof answerFor === 'function' ? answerFor(prompt, opts) : answerFor;
+    const session = recordAskExchange(cwd, jobSlug, { prompt, answer, agent });
+    return { answer, session, slug: jobSlug };
+  });
+}
+
+function seedAskSession(productCwd, slug, overrides = {}) {
+  const now = '2026-08-05T10:00:00.000Z';
+  const session = {
+    slug,
+    createdAt: now,
+    updatedAt: now,
+    agent: 'claude',
+    turns: [
+      { role: 'user', content: 'where is the CLI entrypoint?', at: now },
+      { role: 'assistant', content: 'The entrypoint is main.js.', at: now },
+    ],
+    ...overrides,
+  };
+  writeAskSession(productCwd, slug, session);
+  return session;
+}
+
+function sessionTurns(sessionOrBody) {
+  const session = sessionOrBody?.session ?? sessionOrBody;
+  return (session?.turns ?? []).map((t) => ({ role: t.role, content: t.content }));
 }
 
 describe('orch serve CLI', () => {
@@ -2369,6 +2465,359 @@ describe('serve handle surface', () => {
         assert.equal(typeof handle.close, 'function');
         // Sanity: bound server is an http.Server when exposed.
         if (handle.server) assert.ok(handle.server instanceof http.Server);
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('serve ask API (03-serve-ask-api)', () => {
+  it('POST /api/products/:product/ask starts a new read-only ask and writes ask.json turns', async () => {
+    const home = makeTmpHome();
+    try {
+      const productCwd = seedProduct(home, 'ask-app');
+      const runDetached = mock.fn(async () => {});
+      const runAsk = makeMockRunAsk({
+        answerFor: (prompt) => `About ${prompt}: entry is main.js.`,
+      });
+      const handle = await startTestServe(home, { runDetached, runAsk, agent: 'claude' });
+      try {
+        const prompt = 'where is the CLI entrypoint?';
+        const { res, json } = await jsonRequest(handle.baseUrl, 'POST', '/api/products/ask-app/ask', {
+          body: { prompt },
+        });
+        assert.ok(res.status >= 200 && res.status < 300, `expected success, got ${res.status}: ${JSON.stringify(json)}`);
+        assert.ok(json?.slug, 'start must return a slug');
+        assert.match(String(json.answer ?? json.session?.turns?.at(-1)?.content ?? ''), /main\.js/);
+
+        const session = readAskSession(productCwd, json.slug);
+        assert.ok(session, 'start must create .orch/<slug>/ask.json');
+        assert.equal(session.slug, json.slug);
+        assert.deepEqual(sessionTurns(session), [
+          { role: 'user', content: prompt },
+          { role: 'assistant', content: 'About where is the CLI entrypoint?: entry is main.js.' },
+        ]);
+
+        const job = readJob(productCwd, json.slug);
+        assert.ok(job, 'start must allocateJob under the product cwd (run.json beside ask.json)');
+        assert.equal(job.task, prompt);
+
+        assert.equal(runAsk.mock.calls.length, 1);
+        const askOpts = runAsk.mock.calls[0].arguments[0];
+        assert.equal(askOpts.cwd, productCwd);
+        assert.equal(askOpts.jobSlug, json.slug);
+        assert.equal(askOpts.prompt, prompt);
+        assert.equal(askOpts.fromSlug ?? null, null);
+        assert.equal(askOpts.agent, 'claude');
+        assert.equal(runDetached.mock.calls.length, 0, 'ask must not use the write-job queue / runDetached');
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('POST /api/products/:product/ask accepts question as an alias for prompt; optional agent overrides default', async () => {
+    const home = makeTmpHome();
+    try {
+      seedProduct(home, 'ask-alias');
+      const runAsk = makeMockRunAsk();
+      const handle = await startTestServe(home, { runAsk, agent: 'claude' });
+      try {
+        const missing = await jsonRequest(handle.baseUrl, 'POST', '/api/products/ask-alias/ask', {
+          body: {},
+        });
+        assert.equal(missing.res.status, 400);
+
+        const empty = await jsonRequest(handle.baseUrl, 'POST', '/api/products/ask-alias/ask', {
+          body: { prompt: '   ' },
+        });
+        assert.equal(empty.res.status, 400);
+
+        const { res, json } = await jsonRequest(handle.baseUrl, 'POST', '/api/products/ask-alias/ask', {
+          body: { question: 'what is triage?', agent: 'agn' },
+        });
+        assert.ok(res.status >= 200 && res.status < 300, JSON.stringify(json));
+        assert.equal(runAsk.mock.calls[0].arguments[0].prompt, 'what is triage?');
+        assert.equal(runAsk.mock.calls[0].arguments[0].agent, 'agn');
+        const productCwd = path.join(productsDir(home), 'ask-alias');
+        assert.equal(readAskSession(productCwd, json.slug).agent, 'agn');
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('POST /api/products/:product/ask/:slug continues the same session (CLI --ask --from semantics)', async () => {
+    const home = makeTmpHome();
+    try {
+      const productCwd = seedProduct(home, 'ask-chat');
+      const slug = 'ask-continue-0000';
+      const prior = seedAskSession(productCwd, slug);
+      seedJob(productCwd, slug, {
+        task: prior.turns[0].content,
+        state: 'done',
+        exitCode: 0,
+        finishedAt: prior.updatedAt,
+        product: 'ask-chat',
+      });
+
+      const followUp = 'what about triage?';
+      const answer = 'Triage lives in the triage agent stage.';
+      const runDetached = mock.fn(async () => {});
+      const runAsk = makeMockRunAsk({
+        answerFor: () => answer,
+      });
+      const handle = await startTestServe(home, { runDetached, runAsk });
+      try {
+        const { res, json } = await jsonRequest(
+          handle.baseUrl,
+          'POST',
+          `/api/products/ask-chat/ask/${slug}`,
+          { body: { prompt: followUp } },
+        );
+        assert.ok(res.status >= 200 && res.status < 300, JSON.stringify(json));
+        assert.equal(json.slug, slug, 'continue must reuse the ask-session slug (no sibling allocate)');
+        assert.equal(json.answer ?? sessionTurns(json).at(-1)?.content, answer);
+
+        const session = readAskSession(productCwd, slug);
+        assert.equal(session.turns.length, 4);
+        assert.deepEqual(sessionTurns(session), [
+          { role: 'user', content: 'where is the CLI entrypoint?' },
+          { role: 'assistant', content: 'The entrypoint is main.js.' },
+          { role: 'user', content: followUp },
+          { role: 'assistant', content: answer },
+        ]);
+        // Stored user turn is the bare follow-up — never the context-augmented blob.
+        assert.equal(session.turns[2].content, followUp);
+        assert.doesNotMatch(session.turns[2].content, /The entrypoint is main\.js/);
+        assert.doesNotMatch(session.turns[2].content, /Prior conversation/);
+
+        assert.equal(runAsk.mock.calls.length, 1);
+        const askOpts = runAsk.mock.calls[0].arguments[0];
+        assert.equal(askOpts.fromSlug, slug);
+        assert.equal(askOpts.jobSlug, slug);
+        assert.equal(askOpts.prompt, followUp);
+        assert.equal(askOpts.cwd, productCwd);
+        assert.equal(runDetached.mock.calls.length, 0);
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('GET /api/products/:product/ask/:slug returns transcript plus job status', async () => {
+    const home = makeTmpHome();
+    try {
+      const productCwd = seedProduct(home, 'ask-get');
+      const slug = 'ask-get-0000';
+      const prior = seedAskSession(productCwd, slug, { agent: 'claude' });
+      seedJob(productCwd, slug, {
+        task: prior.turns[0].content,
+        state: 'done',
+        exitCode: 0,
+        finishedAt: prior.updatedAt,
+        phase: 'ask',
+        product: 'ask-get',
+      });
+
+      const handle = await startTestServe(home, { runAsk: makeMockRunAsk() });
+      try {
+        const { res, json } = await jsonRequest(
+          handle.baseUrl,
+          'GET',
+          `/api/products/ask-get/ask/${slug}`,
+        );
+        assert.equal(res.status, 200, JSON.stringify(json));
+
+        const session = json.session ?? json;
+        assert.equal(session.slug ?? json.slug, slug);
+        assert.equal(session.agent, 'claude');
+        assert.ok(session.createdAt);
+        assert.ok(session.updatedAt);
+        assert.deepEqual(sessionTurns(session), [
+          { role: 'user', content: 'where is the CLI entrypoint?' },
+          { role: 'assistant', content: 'The entrypoint is main.js.' },
+        ]);
+
+        const job = json.job ?? json.status ?? null;
+        assert.ok(job, 'GET must include job status from readJob when run.json exists');
+        assert.equal(job.slug, slug);
+        assert.equal(job.state, 'done');
+        assert.equal(job.exitCode, 0);
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('unknown product or missing ask session → 404; malformed ask.json → error without inventing turns', async () => {
+    const home = makeTmpHome();
+    try {
+      const productCwd = seedProduct(home, 'ask-404');
+      const runAsk = makeMockRunAsk();
+      const handle = await startTestServe(home, { runAsk });
+      try {
+        const noProduct = await jsonRequest(handle.baseUrl, 'POST', '/api/products/nope/ask', {
+          body: { prompt: 'hello' },
+        });
+        assert.equal(noProduct.res.status, 404);
+        assert.match(String(noProduct.json?.error ?? ''), /product not found/i);
+
+        const noProductGet = await jsonRequest(
+          handle.baseUrl,
+          'GET',
+          '/api/products/nope/ask/any-slug',
+        );
+        assert.equal(noProductGet.res.status, 404);
+        assert.match(String(noProductGet.json?.error ?? ''), /product not found/i);
+
+        const missingSession = await jsonRequest(
+          handle.baseUrl,
+          'POST',
+          '/api/products/ask-404/ask/missing-slug-zzzz',
+          { body: { prompt: 'follow-up' } },
+        );
+        assert.equal(missingSession.res.status, 404);
+        assert.match(
+          String(missingSession.json?.error ?? ''),
+          /ask|session|not found/i,
+        );
+        assert.equal(readAskSession(productCwd, 'missing-slug-zzzz'), null);
+
+        const missingGet = await jsonRequest(
+          handle.baseUrl,
+          'GET',
+          '/api/products/ask-404/ask/missing-slug-zzzz',
+        );
+        assert.equal(missingGet.res.status, 404);
+        assert.match(String(missingGet.json?.error ?? ''), /ask|session|not found/i);
+
+        const badSlug = 'ask-badjson-0000';
+        const { dir, askJsonPath } = askSessionPaths(productCwd, badSlug);
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(askJsonPath, '{ not valid json');
+        seedJob(productCwd, badSlug, { task: 'x', state: 'done', product: 'ask-404' });
+
+        const badContinue = await jsonRequest(
+          handle.baseUrl,
+          'POST',
+          `/api/products/ask-404/ask/${badSlug}`,
+          { body: { prompt: 'follow-up' } },
+        );
+        assert.ok(
+          badContinue.res.status >= 400 && badContinue.res.status < 600,
+          `malformed ask.json must fail; got ${badContinue.res.status}`,
+        );
+        assert.match(
+          String(badContinue.json?.error ?? badContinue.text ?? ''),
+          /ask|json|session|invalid|parse/i,
+        );
+        assert.equal(fs.readFileSync(askJsonPath, 'utf8'), '{ not valid json');
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('failed ask does not invent turns; runDetached stays unused', async () => {
+    const home = makeTmpHome();
+    try {
+      const productCwd = seedProduct(home, 'ask-fail');
+      const slug = 'ask-fail-0000';
+      const prior = seedAskSession(productCwd, slug);
+      seedJob(productCwd, slug, {
+        task: prior.turns[0].content,
+        state: 'done',
+        exitCode: 0,
+        product: 'ask-fail',
+      });
+      const before = readAskSession(productCwd, slug);
+
+      const runDetached = mock.fn(async () => {});
+      const runAsk = makeMockRunAsk({ fail: true });
+      const handle = await startTestServe(home, { runDetached, runAsk });
+      try {
+        const cont = await jsonRequest(
+          handle.baseUrl,
+          'POST',
+          `/api/products/ask-fail/ask/${slug}`,
+          { body: { prompt: 'and how does planner work?' } },
+        );
+        assert.equal(
+          runAsk.mock.calls.length,
+          1,
+          'continue must invoke runAsk so a failed agent can be observed',
+        );
+        assert.ok(cont.res.status >= 400, `failed ask must be an error status, got ${cont.res.status}`);
+        assert.deepEqual(readAskSession(productCwd, slug), before);
+        assert.equal(runDetached.mock.calls.length, 0);
+      } finally {
+        await handle.close();
+      }
+
+      // Failed start: allocateJob may create a slug dir, but recordAskExchange must not run.
+      const startFail = makeMockRunAsk({ fail: true });
+      const handle2 = await startTestServe(home, { runDetached, runAsk: startFail });
+      try {
+        const started = await jsonRequest(handle2.baseUrl, 'POST', '/api/products/ask-fail/ask', {
+          body: { prompt: 'will fail' },
+        });
+        assert.equal(startFail.mock.calls.length, 1, 'start must invoke runAsk');
+        assert.ok(started.res.status >= 400, `failed start must error, got ${started.res.status}`);
+        const orchDir = path.join(productCwd, '.orch');
+        if (fs.existsSync(orchDir)) {
+          for (const name of fs.readdirSync(orchDir)) {
+            if (name === slug) continue;
+            const sess = readAskSession(productCwd, name);
+            assert.equal(
+              sess,
+              null,
+              `failed start must not create ask.json turns (found session under ${name})`,
+            );
+          }
+        }
+        assert.equal(runDetached.mock.calls.length, 0);
+      } finally {
+        await handle2.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('ask routes never enqueue write jobs (POST …/jobs path stays separate)', async () => {
+    const home = makeTmpHome();
+    try {
+      seedProduct(home, 'ask-vs-jobs');
+      const runDetached = mock.fn(async (_prompt, options = {}) => {
+        if (typeof options.exit === 'function') options.exit(0);
+      });
+      const runAsk = makeMockRunAsk();
+      const handle = await startTestServe(home, {
+        runDetached,
+        runAsk,
+        concurrency: 1,
+      });
+      try {
+        await jsonRequest(handle.baseUrl, 'POST', '/api/products/ask-vs-jobs/ask', {
+          body: { prompt: 'read-only question' },
+        });
+        assert.equal(runDetached.mock.calls.length, 0);
+        assert.equal(runAsk.mock.calls.length, 1);
+        assert.equal(runAsk.mock.calls[0].arguments[0].prompt, 'read-only question');
       } finally {
         await handle.close();
       }
