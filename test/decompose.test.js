@@ -570,10 +570,32 @@ describe('--decompose / --from CLI', () => {
     assert.match(stderr + '', /max-units/i);
   });
 
-  it('rejects --from without --seq', async () => {
+  it('rejects --from without --seq or --ask', async () => {
     const { code, stderr } = await runCli(['--from', 'x', '--agent', 'claude']);
     assert.notEqual(code, 0);
+    // Bare --from still needs --seq (or --ask for ask-session continue).
     assert.match(stderr + '', /--from requires --seq/i);
+  });
+
+  it('--ask --from is not rejected by the bare "--from requires --seq" gate', async () => {
+    const cwd = makeTmpCwd('orch-ask-from-gate-');
+    const { code, stderr } = await runCli(
+      ['what about triage?', '--ask', '--from', 'no-such-ask-0000', '--agent', 'claude'],
+      { cwd },
+    );
+    assert.notEqual(code, 0);
+    assert.doesNotMatch(stderr + '', /--from requires --seq/i);
+    assert.match(stderr + '', /ask\.json|unknown|no ask|session|not found/i);
+  });
+
+  it('--help documents --from for both --seq and --ask', async () => {
+    const { code, stdout } = await runCli(['--help']);
+    assert.equal(code, 0);
+    // Match the --from option row itself (not seq/example prose that merely mentions --from).
+    const fromOpt = stdout.split('\n').find((line) => /^\s*--from\s+</.test(line));
+    assert.ok(fromOpt, 'expected a --from <slug> option line in --help');
+    assert.match(fromOpt, /--seq/);
+    assert.match(fromOpt, /--ask/);
   });
 
   it('unknown --seq --from slug exits 1', async () => {

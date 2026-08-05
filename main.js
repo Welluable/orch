@@ -44,7 +44,11 @@ import {
     reopenJob,
     buildLastOutcome,
 } from './lib/jobs.js';
-import { recordAskExchange } from './lib/ask-session.js';
+import {
+    recordAskExchange,
+    readAskSession,
+    buildAskFollowUpPrompt,
+} from './lib/ask-session.js';
 import {
     validateContinue,
     snapshotPriorOutcome,
@@ -785,6 +789,38 @@ function commitAndMaybePublish({
 export async function runPipeline(prompt, options) {
     const verbose = Boolean(options.verbose);
     const maxRounds = options.maxRounds ?? 5;
+    const invocationCwd = process.cwd();
+
+    const jobSlug = options.jobSlug ?? process.env.ORCH_JOB_SLUG;
+    const jobCwd = options.jobCwd ?? invocationCwd;
+
+    // `--ask --from <slug>`: load the session before backend resolution so we
+    // can fall back to session.agent (when CLI omitted --agent) and fail
+    // missing/malformed sessions before any jobPatch creates `.orch/`.
+    let askPrompt = prompt;
+    const askFromSlug = options.ask ? (options.fromSlug ?? null) : null;
+    if (askFromSlug) {
+        let session;
+        try {
+            session = readAskSession(jobCwd, askFromSlug);
+        } catch (err) {
+            console.error(`Error: could not read ask session for ${askFromSlug}: ${err.message}`);
+            process.exit(1);
+            return;
+        }
+        if (!session) {
+            console.error(`Error: no ask session found for ${askFromSlug} (missing ask.json)`);
+            process.exit(1);
+            return;
+        }
+        // Only when the CLI explicitly omitted --agent (cliAgentExplicit === false).
+        // Direct runPipeline callers leave it undefined and keep options.agent.
+        if (options.cliAgentExplicit === false && session.agent) {
+            options.agent = session.agent;
+        }
+        askPrompt = buildAskFollowUpPrompt(session.turns ?? [], prompt);
+    }
+
     const backend = AGENT_BACKENDS[options.agent];
     if (!backend) {
         throw new Error(`Unknown agent backend: ${options.agent}`);
@@ -803,10 +839,6 @@ export async function runPipeline(prompt, options) {
         findOpenPullRequest: options.findOpenPullRequest,
         createPullRequest: options.createPullRequest,
     }));
-    const invocationCwd = process.cwd();
-
-    const jobSlug = options.jobSlug ?? process.env.ORCH_JOB_SLUG;
-    const jobCwd = options.jobCwd ?? invocationCwd;
     const patchJobFn = options.patchJob ?? patchJob;
     const checkpointPauseFn = options.checkpointPause ?? checkpointPause;
     const pausePollIntervalMs = options.pausePollIntervalMs ?? 500;
@@ -840,7 +872,7 @@ export async function runPipeline(prompt, options) {
 
     if (options.ask) {
         jobPatch({ phase: 'ask' });
-        const ask = askAgentArgs({ prompt, cwd: invocationCwd });
+        const ask = askAgentArgs({ prompt: askPrompt, cwd: invocationCwd });
         const askAgent = new AgentClass(ask.name, ask.instructions, ask.prompt, ask.options);
 
         try {
@@ -857,6 +889,7 @@ export async function runPipeline(prompt, options) {
             printStageSummary('ask', resolveStageSummary('ask', summary, content));
             console.log(content);
             if (jobSlug) {
+                // Persist the follow-up only — never the context-augmented blob.
                 recordAskExchange(jobCwd, jobSlug, {
                     prompt,
                     answer: content,
@@ -5050,7 +5083,7 @@ program
     .option('--fan-out', 'Decompose into parallel workers, then integrate once. Cannot be combined with --ask, --quick, --dry-run, --seq, or --decompose')
     .option('--seq', 'Decompose into ordered units; merge each, then adjust the next. With --from <slug>, run a planned backlog without re-decomposing. Cannot be combined with --fan-out, --ask, --quick, --dry-run, or --decompose')
     .option('--decompose', 'Plan-only sequential decomposition: research, write seq.json (state planned), and exit. Run later with --seq --from <slug>. Cannot be combined with --seq, --fan-out, --ask, --quick, --dry-run, or --from')
-    .option('--from <slug>', 'With --seq only: load .orch/<slug>/seq.json and run the schedule loop (skips triage/research/decompose)')
+    .option('--from <slug>', 'With --seq or --ask: load seq.json schedule or continue ask.json for <slug>')
     .option('--max-workers <n>', 'Max number of parallel fan-out workers (only meaningful with --fan-out)', positiveIntParser('--max-workers'), 4)
     .option('--max-units <n>', 'Max number of sequential units (meaningful with --seq or --decompose; rejected with --from)', positiveIntParser('--max-units'), 8)
     .option('--max-concurrency <n>', 'Optional hard ceiling on in-flight fan-out workers at once (only meaningful with --fan-out; default: coordinator chooses)', positiveIntParser('--max-concurrency'))
@@ -5112,7 +5145,11 @@ Decompose (plan only):
     .action(async (task, options) => {
         const prompt = (Array.isArray(task) ? task : []).join(' ').trim();
 
+        // Capture before resolveAgent fills a config default — needed so
+        // `--ask --from` can fall back to session.agent when --agent is omitted.
+        const cliAgentExplicit = Boolean(options.agent);
         options.agent = resolveAgentOrExit(options.agent);
+        options.cliAgentExplicit = cliAgentExplicit;
         applyNotifyEnabled(options, { dryRun: Boolean(options.dryRun) });
 
         if (options.seqContinue) {
@@ -5141,8 +5178,8 @@ Decompose (plan only):
             return;
         }
 
-        if (options.from && !options.seq) {
-            console.error('Error: --from requires --seq');
+        if (options.from && !options.seq && !options.ask) {
+            console.error('Error: --from requires --seq or --ask');
             process.exit(1);
             return;
         }
@@ -5455,17 +5492,26 @@ Decompose (plan only):
             // Detached (and other) children already carry ORCH_JOB_SLUG from the
             // parent allocation — reuse it so triage/pipeline does not create a
             // second run.json / orch list entry. Mirrors the --seq guard above.
+            // `--ask --from <slug>` reuses the existing ask-session slug (never
+            // allocateJob a sibling).
             let slug = process.env.ORCH_JOB_SLUG;
             if (!slug) {
-                const alloc = allocateJob({
-                    cwd: process.cwd(),
-                    prompt,
-                    agent: options.agent,
-                    maxRounds: options.ask || options.quick ? null : options.maxRounds,
-                    state: 'running',
-                    pid: process.pid,
-                });
-                slug = alloc.slug;
+                if (options.ask && options.from) {
+                    slug = options.from;
+                    options.fromSlug = options.from;
+                } else {
+                    const alloc = allocateJob({
+                        cwd: process.cwd(),
+                        prompt,
+                        agent: options.agent,
+                        maxRounds: options.ask || options.quick ? null : options.maxRounds,
+                        state: 'running',
+                        pid: process.pid,
+                    });
+                    slug = alloc.slug;
+                }
+            } else if (options.ask && options.from) {
+                options.fromSlug = options.from;
             }
             options.jobSlug = slug;
             setJobSlug(slug);

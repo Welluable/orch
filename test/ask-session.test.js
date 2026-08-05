@@ -35,6 +35,11 @@ import {
  * - Schema is intentionally minimal for unit 02 reload: slug metadata +
  *   ordered turns `{ role, content, at? }`. Full transcript stays in
  *   ask.json — never embed turns inside run.json.
+ * - Unit 02 (`--ask --from <slug>`) calls `readAskSession` then
+ *   `recordAskExchange` for the follow-up only; optional helper
+ *   `buildAskFollowUpPrompt(turns, followUp)` may live here to fold a short
+ *   role/content transcript + the new question into the ask agent prompt
+ *   string (agents/ask.js signature stays `{ prompt, cwd }`).
  */
 
 function makeTmpCwd() {
@@ -246,5 +251,31 @@ describe('recordAskExchange', () => {
         { role: 'assistant', content: 'a2' },
       ],
     );
+  });
+});
+
+/**
+ * Optional pure helper for unit 02 prompt folding. Implementers may instead
+ * inline the same transcript shape inside main.js; if this export exists it
+ * must satisfy the contract below.
+ */
+describe('buildAskFollowUpPrompt (optional --ask --from helper)', () => {
+  it('when exported, formats prior turns then the follow-up (roles + contents)', async () => {
+    const mod = await import('../lib/ask-session.js');
+    if (typeof mod.buildAskFollowUpPrompt !== 'function') {
+      // Helper is optional — skip until/unless the implementer adds it.
+      return;
+    }
+    const text = mod.buildAskFollowUpPrompt(
+      [
+        { role: 'user', content: 'where is the CLI entrypoint?' },
+        { role: 'assistant', content: 'The entrypoint is main.js.' },
+      ],
+      'what about triage?',
+    );
+    assert.match(text, /where is the CLI entrypoint/);
+    assert.match(text, /The entrypoint is main\.js/);
+    assert.match(text, /what about triage/);
+    assert.match(text, /user|assistant/i);
   });
 });

@@ -488,6 +488,7 @@ describe('orch continue — CLI eligibility wiring', () => {
   it('rejects --ask and --quick with a clear error', async () => {
     const cwd = makeTmpCwd();
     const { slug } = seedEligibleJob(cwd);
+    // Ask multiturn is `orch --ask --from <slug>`, not write-pipeline continue.
     const askResult = await runCli(['continue', slug, 'keep going', '--ask'], { cwd });
     assert.notEqual(askResult.code, 0);
     assert.match(askResult.stderr, /--ask/);
