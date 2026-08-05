@@ -7,6 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runPipeline, formatStatus, runDetached } from '../main.js';
 import { jobPaths, readJob, writeJob, patchJob as realPatchJob } from '../lib/jobs.js';
+import { askSessionPaths, readAskSession } from '../lib/ask-session.js';
 import * as agentLib from '../lib/agent.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1545,6 +1546,172 @@ describe('runPipeline --ask (read-only Q&A)', () => {
       assert.equal(record.state, 'done');
       assert.equal(record.exitCode, 0);
       assert.ok(record.finishedAt);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('on successful --ask with an active job, writes .orch/<slug>/ask.json with slug metadata + user/assistant turns (stripped content, not raw <<<SUMMARY>>>)', async () => {
+    const tmpCwd = makeTmpCwd('orch-ask-session-ok-');
+    try {
+      const slug = 'ask-session-ok-0000';
+      const prompt = 'where is the CLI entrypoint?';
+      const answer = 'The entrypoint is main.js.';
+      const answerSummary = 'Named the CLI entrypoint after reading main.js.';
+      seedForegroundJob(tmpCwd, slug, prompt);
+      const MockAgentClass = createMockAgentClass({
+        ask: { ok: true, result: withSummary(answer, answerSummary) },
+      });
+
+      const logSpy = mock.method(console, 'log', () => {});
+      const errorSpy = mock.method(console, 'error', () => {});
+      const exitSpy = mock.method(process, 'exit', () => {});
+      try {
+        await runPipeline(prompt, {
+          agent: 'claude',
+          ask: true,
+          AgentClass: MockAgentClass,
+          createRunContext: mock.fn(() => fakeRunContext(tmpCwd)),
+          createWorktree: mock.fn(() => fakeWorktree(tmpCwd)),
+          commitWorktree: mock.fn(() => fakeCommitResult('orch/stub')),
+          jobSlug: slug,
+          jobCwd: tmpCwd,
+          patchJob: realDiskPatchJobSpy([]),
+        });
+      } finally {
+        logSpy.mock.restore();
+        errorSpy.mock.restore();
+        exitSpy.mock.restore();
+      }
+
+      const session = readAskSession(tmpCwd, slug);
+      assert.ok(session, 'expected ask.json beside run.json for a successful ask');
+      assert.equal(session.slug, slug);
+      assert.ok(session.createdAt);
+      assert.ok(session.updatedAt);
+      assert.equal(session.agent, 'claude');
+      assert.equal(session.turns.length, 2);
+      assert.equal(session.turns[0].role, 'user');
+      assert.equal(session.turns[0].content, prompt);
+      assert.equal(session.turns[1].role, 'assistant');
+      assert.equal(session.turns[1].content, answer);
+      assert.doesNotMatch(session.turns[1].content, /<<<SUMMARY>>>/);
+      assert.doesNotMatch(session.turns[1].content, /Named the CLI entrypoint/);
+
+      // Transcript stays in ask.json — run.json keeps lifecycle only.
+      const record = readJob(tmpCwd, slug);
+      assert.equal(record.phase, 'ask');
+      assert.equal(record.state, 'done');
+      assert.equal(record.turns, undefined);
+      assert.equal('turns' in record, false);
+
+      assert.equal(
+        fs.existsSync(askSessionPaths(tmpCwd, slug).askJsonPath),
+        true,
+      );
+      assert.equal(
+        fs.existsSync(path.join(jobPaths(tmpCwd, slug).dir, 'ask.json')),
+        true,
+        'ask.json must live under the same slug dir as run.json',
+      );
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('failed --ask does not invent a successful assistant turn in ask.json (absent or unchanged, no fake answer)', async () => {
+    const tmpCwd = makeTmpCwd('orch-ask-session-fail-');
+    try {
+      const slug = 'ask-session-fail-0000';
+      seedForegroundJob(tmpCwd, slug, 'explain the slugger');
+      const MockAgentClass = createMockAgentClass({
+        ask: { ok: false, result: 'agent crashed' },
+      });
+
+      const logSpy = mock.method(console, 'log', () => {});
+      const errorSpy = mock.method(console, 'error', () => {});
+      const exitSpy = mock.method(process, 'exit', () => {});
+      try {
+        await runPipeline('explain the slugger', {
+          agent: 'claude',
+          ask: true,
+          AgentClass: MockAgentClass,
+          createRunContext: mock.fn(() => fakeRunContext(tmpCwd)),
+          createWorktree: mock.fn(() => fakeWorktree(tmpCwd)),
+          commitWorktree: mock.fn(() => fakeCommitResult('orch/stub')),
+          jobSlug: slug,
+          jobCwd: tmpCwd,
+          patchJob: realDiskPatchJobSpy([]),
+        });
+      } finally {
+        logSpy.mock.restore();
+        errorSpy.mock.restore();
+        exitSpy.mock.restore();
+      }
+
+      const session = readAskSession(tmpCwd, slug);
+      // Prefer leaving ask.json absent on a failed first ask. If a later
+      // implementation records only the user turn, it must still not invent
+      // a successful assistant answer from the failure payload.
+      if (session == null) {
+        assert.equal(fs.existsSync(askSessionPaths(tmpCwd, slug).askJsonPath), false);
+      } else {
+        const assistantTurns = session.turns.filter((t) => t.role === 'assistant');
+        assert.equal(
+          assistantTurns.length,
+          0,
+          'failed ask must not invent an assistant turn',
+        );
+      }
+
+      const record = readJob(tmpCwd, slug);
+      assert.equal(record.state, 'failed');
+      assert.equal(record.exitCode, 1);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('successful --ask with no active job (jobSlug unset) does not write ask.json', async () => {
+    const tmpCwd = makeTmpCwd('orch-ask-session-nojobj-');
+    try {
+      const MockAgentClass = createMockAgentClass({
+        ask: { ok: true, result: 'answer' },
+      });
+      const prevJobSlug = process.env.ORCH_JOB_SLUG;
+      delete process.env.ORCH_JOB_SLUG;
+
+      const logSpy = mock.method(console, 'log', () => {});
+      const errorSpy = mock.method(console, 'error', () => {});
+      const exitSpy = mock.method(process, 'exit', () => {});
+      try {
+        await runPipeline('where is the CLI entrypoint?', {
+          agent: 'claude',
+          ask: true,
+          AgentClass: MockAgentClass,
+          createRunContext: mock.fn(() => fakeRunContext(tmpCwd)),
+          createWorktree: mock.fn(() => fakeWorktree(tmpCwd)),
+          commitWorktree: mock.fn(() => fakeCommitResult('orch/stub')),
+          patchJob: mock.fn(),
+        });
+      } finally {
+        logSpy.mock.restore();
+        errorSpy.mock.restore();
+        exitSpy.mock.restore();
+        if (prevJobSlug === undefined) delete process.env.ORCH_JOB_SLUG;
+        else process.env.ORCH_JOB_SLUG = prevJobSlug;
+      }
+
+      const orchDir = path.join(tmpCwd, '.orch');
+      if (fs.existsSync(orchDir)) {
+        for (const slug of fs.readdirSync(orchDir)) {
+          assert.equal(
+            readAskSession(tmpCwd, slug),
+            null,
+            `no-job ask must not create ask.json under ${slug}`,
+          );
+        }
+      }
     } finally {
       fs.rmSync(tmpCwd, { recursive: true, force: true });
     }
