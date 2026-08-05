@@ -182,6 +182,8 @@ agent CLI does all the actual reading and writing of files.
 | `--dry-run` | Checks the selected agent CLI is on `PATH` and exits without running the pipeline. | You want to sanity-check your setup before a real run. |
 | `--detach` | Runs the pipeline in a background process and returns immediately, printing the run slug. Manage it with `orch list/status/pause/resume/stop/logs`. | You want to kick off a run and keep using your shell, or run several tasks concurrently. |
 | `--pr` | Always create a worktree, commit, push `orch/<slug>`, and open a PR with `gh` — including when triage routes to quick-fix (research/planner skipped on that path). | You want a PR instead of a local merge hint (required later for served jobs). |
+| `--decompose` | Plan-only sequential split: research → seq-decomposer → write `seq.json` (`state: planned`) and exit. No worktrees or unit spawns. | You want a reviewable backlog before spending N worktrees. |
+| `--seq --from <slug>` | Load a planned `seq.json` and run today's seq schedule loop (skips triage/research/decompose). | You approved a `--decompose` plan and want to implement it. |
 
 For `--ask`, Cursor uses `--mode ask`, Claude uses `--permission-mode plan`,
 `agn` is prompt-only best-effort (it has no dedicated read-only flag), and
@@ -248,15 +250,24 @@ Usage: orch [options] [command] <task...>
   implementer loop; defaults to `5`, ignored with `--ask` and `--quick`.
 - `--fan-out` — decomposes the task into parallel workers coordinated by this
   process instead of running the single-worktree pipeline (see
-  [Fan-out](#fan-out)); rejects `--ask`/`--quick`/`--dry-run`/`--seq`.
+  [Fan-out](#fan-out)); rejects `--ask`/`--quick`/`--dry-run`/`--seq`/`--decompose`.
 - `--seq` — decomposes into ordered units, merges each into `orch/<slug>`,
   then adjusts the near-term backlog (see
   [Sequential multi-unit (`--seq`)](#sequential-multi-unit---seq)); rejects
-  `--fan-out`/`--ask`/`--quick`/`--dry-run`.
+  `--fan-out`/`--ask`/`--quick`/`--dry-run`/`--decompose`. With `--from <slug>`,
+  loads a planned backlog and skips triage/research/decompose.
+- `--decompose` — plan-only sequential decomposition: research, write
+  `seq.json` with `state: planned`, print `next: orch --seq --from <slug>`, and
+  exit (see [Decompose (`--decompose`)](#decompose---decompose)); rejects
+  `--seq`/`--fan-out`/`--ask`/`--quick`/`--dry-run`/`--from`. `--detach` is
+  allowed. No worktree is created at plan time.
+- `--from <slug>` — with `--seq` only: run `.orch/<slug>/seq.json` without
+  re-decomposing; task comes from the file (no task prompt). Rejects
+  `--max-units` (frozen at plan time) and nesting depths.
 - `--max-workers <n>` — max number of parallel fan-out workers; defaults to
   `4`; only meaningful with `--fan-out`.
-- `--max-units <n>` — max number of sequential units; defaults to `8`; only
-  meaningful with `--seq`.
+- `--max-units <n>` — max number of sequential units; defaults to `8`;
+  meaningful with `--seq` or `--decompose`; rejected with `--seq --from`.
 - `--max-concurrency <n>` — optional hard ceiling on in-flight fan-out workers
   at once; omit to let the coordinator choose (typically the current layer's
   size); only meaningful with `--fan-out`.
@@ -580,6 +591,54 @@ The flow, in order:
 Unit children set `ORCH_SEQ_DEPTH=1` and `ORCH_FANOUT_DEPTH=1` so they cannot
 nest `--seq` or `--fan-out`. Deliverable stays on `orch/<parent-slug>` until
 you merge it yourself.
+
+To plan first and implement later, use [`--decompose`](#decompose---decompose)
+then `orch --seq --from <slug>`.
+
+## Decompose (`--decompose`)
+
+Plan-only peer to `--ask` / `--quick` for sequential work: research once, split
+into an ordered backlog of **N ≥ 1** units, write `seq.json`, and exit. No
+triage, no worktrees, no unit spawns, no merge/adjust. A later
+`--seq --from <slug>` loads that backlog and runs the seq schedule loop.
+
+```bash
+orch "implement the billing module" --decompose
+orch "fix the typo in README" --decompose --max-units 6
+orch "…" --decompose --agent claude --detach
+```
+
+```text
+research: mapped billing routes, models, and existing payment helpers
+decomposer: 5 units
+
+  01-types     Add billing types and shared enums
+  02-api       Invoice create/list endpoints
+  03-charges   Charge capture + webhook handlers
+  04-ui        Billing settings page
+  05-tests     End-to-end coverage for the happy path
+
+wrote: .orch/wise-pine-e904/seq.json
+next:  orch --seq --from wise-pine-e904
+```
+
+If there is no useful split, the decomposer returns **one** unit covering the
+whole task (a normal backlog of length 1). Empty `units[]` is invalid; after
+up to two repair rounds orch fails the job rather than inventing a unit.
+
+`--max-units` (default `8`) caps the backlog. `--detach` is allowed. Job
+`role` stays unset until `--seq --from` promotes the same slug to
+`coordinator`. The coordinator worktree/`orch/<slug>` branch is created at
+**execute** time (`--from`), not during plan — tip may drift between plan and
+run; v1 advances tip to current `HEAD` when starting from `planned`.
+
+```bash
+orch --seq --from wise-pine-e904
+```
+
+Do not pass a task prompt or `--max-units` with `--from` (task and cap are
+frozen in `seq.json`). `--seq-continue` remains recovery-only and is not the
+decompose handoff.
 
 ## Project structure
 

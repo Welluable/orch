@@ -14,6 +14,7 @@ import {
   buildUnitEnvelope,
   validateAdjustResult,
   applyAdjustResult,
+  SEQ_DOC_STATES,
 } from '../lib/seq.js';
 
 /**
@@ -35,11 +36,14 @@ import {
  *   Same null-seq error as patchUnit.
  * - appendAdjustment(cwd, parentSlug, entry) -> locks and pushes onto
  *   `adjustments[]` (creating the array if absent). Same null-seq error.
- * - validateSeqDecomposition(decomposition, { maxUnits }) -> violation
- *   strings (empty = valid). Rules: ≥2 units; ≤ maxUnits; unique non-empty
- *   slug-safe `id` (`/^[a-z0-9]+(?:-[a-z0-9]+)*$/`); non-empty `title` /
- *   `subtask`; **reject** fan-out fields `dependsOn`, `owns`, `scaffold`,
- *   `area` when present on any unit.
+ * - validateSeqDecomposition(decomposition, { maxUnits, minUnits = 2 }) ->
+ *   violation strings (empty = valid). Rules: ≥ minUnits (default 2 for
+ *   `--seq`; pass `minUnits: 1` for `--decompose`); ≤ maxUnits; unique
+ *   non-empty slug-safe `id` (`/^[a-z0-9]+(?:-[a-z0-9]+)*$/`); non-empty
+ *   `title` / `subtask`; **reject** fan-out fields `dependsOn`, `owns`,
+ *   `scaffold`, `area` when present on any unit. Empty `units[]` is always
+ *   invalid. Document `state` may be `planned` | `running` | `done` | `failed`
+ *   (`SEQ_DOC_STATES`).
  * - buildUnitEnvelope({ id, title, subtask, originalTask }) -> thin prompt
  *   string from .spec/seq.md (unit id/title, original task fence, subtask,
  *   "work only on this unit"; no full backlog, no boundaries.md, no owns).
@@ -316,6 +320,29 @@ describe('validateSeqDecomposition', () => {
       { maxUnits: 8 },
     );
     assert.ok(violations.length > 0);
+    assert.ok(violations.includes('fewer than two units; not decomposable'));
+  });
+
+  it('minUnits:1 accepts a single well-formed unit (decompose plan mode)', () => {
+    assert.deepEqual(
+      validateSeqDecomposition(
+        {
+          units: [{ id: '01-types', title: 'billing types', subtask: 'Add types.' }],
+        },
+        { maxUnits: 8, minUnits: 1 },
+      ),
+      [],
+    );
+  });
+
+  it('empty units[] stays invalid under minUnits:1', () => {
+    const violations = validateSeqDecomposition({ units: [] }, { minUnits: 1 });
+    assert.ok(violations.length > 0);
+    assert.ok(!violations.includes('fewer than two units; not decomposable'));
+  });
+
+  it('SEQ_DOC_STATES includes planned', () => {
+    assert.ok(SEQ_DOC_STATES.includes('planned'));
   });
 
   it('rejects more units than maxUnits', () => {

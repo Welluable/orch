@@ -186,8 +186,9 @@ describe('adjustAgentArgs', () => {
 });
 
 describe('agents/index.js seq exports', () => {
-  it('re-exports seqDecomposerAgentArgs and adjustAgentArgs', () => {
+  it('re-exports seqDecomposerAgentArgs, decomposeAgentArgs, and adjustAgentArgs', () => {
     assert.equal(typeof agentsIndex.seqDecomposerAgentArgs, 'function');
+    assert.equal(typeof agentsIndex.decomposeAgentArgs, 'function');
     assert.equal(typeof agentsIndex.adjustAgentArgs, 'function');
   });
 });

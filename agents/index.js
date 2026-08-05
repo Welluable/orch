@@ -10,7 +10,7 @@ export { testRunnerAgentArgs } from './test-runner.js';
 export { integratorAgentArgs } from './integrator.js';
 export { boundariesAgentArgs } from './boundaries.js';
 export { decomposerAgentArgs } from './decomposer.js';
-export { seqDecomposerAgentArgs } from './seq-decomposer.js';
+export { seqDecomposerAgentArgs, decomposeAgentArgs } from './seq-decomposer.js';
 export { adjustAgentArgs } from './adjust.js';
 export {
     researchConsumerHardRule,
