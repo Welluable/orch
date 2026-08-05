@@ -8,7 +8,7 @@ export type Product = {
 };
 
 /** Serve Run modes: omit / default = normal pipeline. */
-export type JobMode = 'seq' | 'fan-out';
+export type JobMode = 'seq' | 'fan-out' | 'decompose';
 
 export type Job = {
   slug: string;
