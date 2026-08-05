@@ -14,6 +14,7 @@ import {
   recordAskExchange,
   writeAskSession,
 } from '../lib/ask-session.js';
+import { writeSeq } from '../lib/seq.js';
 
 /**
  * Contract for `.spec/server.md` phases 1–3 (serve jobs + products + scan/files):
@@ -30,13 +31,17 @@ import {
  *   persist `source: { kind, id, remoteAddr, receivedAt }` on the job record.
  * - HTTP (no auth): `GET /api/healthz`; product routes below; `POST
  *   /api/products/:product/jobs` for an existing product dir (optional exclusive
- *   `mode: 'seq' | 'fan-out'`; omit = normal; persist on job; tick →
- *   `runDetached` with `seq` / `fanOut`); `GET /api/jobs`,
+ *   `mode: 'seq' | 'fan-out' | 'decompose'`; omit = normal; persist on job; tick →
+ *   `runDetached` with `seq` / `fanOut` / `decompose`); `GET /api/jobs`,
  *   `GET /api/jobs/:slug`, `GET /api/jobs/:slug/logs`, `GET /api/jobs/:slug/files`,
  *   `GET /api/products/:product/jobs`, `POST
  *   /api/products/:product/jobs/clean` (product-scoped `cleanJobs`; 409 when
  *   live jobs block; distinct from create-job POST …/jobs), `POST
- *   .../pause|resume|stop`.
+ *   .../pause|resume|stop|start`. Start is for plan-only decompose jobs with
+ *   `job.seq.state === 'planned'`: reuses the slug via `runDetached({ fromSlug })`
+ *   (same as `orch --seq --from <slug>`); rejects live / non-planned with 409.
+ *   When `.orch/<slug>/seq.json` exists, GET job and list payloads include
+ *   `job.seq` (`state` + normalized `units`); omit when missing.
  * - Phase 2 products: `GET`/`POST /api/products`, `GET`/`PATCH
  *   /api/products/:product` (no DELETE). Slug
  *   `/^[a-z0-9]+(?:-[a-z0-9]+)*$/` max 64; required `name` + `slug`.
@@ -136,6 +141,79 @@ function seedJob(productCwd, slug, fields = {}) {
     fs.writeFileSync(jobPaths(productCwd, slug).logPath, fields.logText);
   }
   return record;
+}
+
+/** Minimal planned seq.json for serve GET enrichment contract tests. */
+function seedSeq(productCwd, parentSlug, overrides = {}) {
+  const doc = {
+    version: 1,
+    parentSlug,
+    task: 'implement the billing module',
+    base: 'aaa111',
+    tip: 'aaa111',
+    maxUnits: 8,
+    units: [
+      {
+        id: '01-types',
+        title: 'billing types',
+        subtask: 'Add shared billing types and stubs.',
+        state: 'done',
+        slug: 'rapid-fox-x7q2',
+        sha: 'bbb1111',
+        changedFiles: ['src/billing/types.ts'],
+      },
+      {
+        id: '02-api',
+        title: 'invoice API',
+        subtask: 'Implement create/list invoice endpoints on current tip.',
+        state: 'pending',
+        slug: null,
+        sha: null,
+        changedFiles: null,
+      },
+    ],
+    adjustments: [],
+    state: 'planned',
+    startedAt: new Date(0).toISOString(),
+    finishedAt: null,
+    ...overrides,
+  };
+  writeSeq(productCwd, parentSlug, doc);
+  return doc;
+}
+
+/**
+ * Assert `job.seq` is the normalized enrichment shape for UI backlog rendering.
+ * Child job slug may be exposed as `slug` and/or `childSlug` (on-disk field is `slug`).
+ */
+function assertSeqPayload(seq, expected) {
+  assert.ok(seq && typeof seq === 'object', 'expected job.seq enrichment object');
+  assert.equal(seq.state, expected.state);
+  assert.ok(Array.isArray(seq.units), 'job.seq.units must be an array');
+  assert.equal(seq.units.length, expected.units.length);
+  for (let i = 0; i < expected.units.length; i += 1) {
+    const unit = seq.units[i];
+    const want = expected.units[i];
+    assert.equal(unit.id, want.id);
+    assert.equal(unit.title, want.title);
+    assert.equal(unit.subtask, want.subtask);
+    assert.equal(unit.state, want.state);
+    const childSlug = unit.childSlug !== undefined ? unit.childSlug : unit.slug;
+    assert.equal(
+      childSlug,
+      want.slug,
+      `unit ${want.id}: child slug must be exposed as slug and/or childSlug`,
+    );
+  }
+}
+
+function assertNoSeqEnrichment(job) {
+  assert.ok(job && typeof job === 'object');
+  assert.equal(
+    job.seq,
+    undefined,
+    'jobs without seq.json must omit job.seq (not null/empty object)',
+  );
 }
 
 function runCli(args, { cwd = path.join(__dirname, '..'), env = process.env } = {}) {
@@ -837,10 +915,10 @@ describe('serve HTTP jobs API', () => {
         assert.equal(first.options.pr, true);
         assert.equal(first.options.base, 'develop');
         assert.equal(typeof first.options.exit, 'function');
-        // Default (no mode): normal pipeline — neither seq nor fan-out.
+        // Default (no mode): normal pipeline — neither seq, fan-out, nor decompose.
         assert.ok(
-          !first.options.seq && !first.options.fanOut,
-          'omitting mode must start a normal pipeline (no seq / fanOut on runDetached)',
+          !first.options.seq && !first.options.fanOut && !first.options.decompose,
+          'omitting mode must start a normal pipeline (no seq / fanOut / decompose on runDetached)',
         );
         // No-op exit: invoking it must not kill the test / serve handle.
         first.options.exit(0);
@@ -1073,13 +1151,15 @@ describe('serve HTTP jobs API', () => {
     }
   });
 
-  it('POST …/jobs mode seq|fan-out is exclusive, persisted, and forwarded to runDetached', async () => {
+  it('POST …/jobs mode seq|fan-out|decompose is exclusive, persisted, and forwarded to runDetached', async () => {
     /**
-     * Serve UI chooses default / SEQ / Fan out before Run. Contract:
-     * - Optional body.mode: 'seq' | 'fan-out' (omit = normal pipeline).
+     * Serve UI chooses default / SEQ / Fan out / Decompose before Run. Contract:
+     * - Optional body.mode: 'seq' | 'fan-out' | 'decompose' (omit = normal pipeline).
      * - Persist mode on the queued job so tick/startOne can read it.
-     * - startOne → runDetached({ seq: true }) or ({ fanOut: true }); never both.
-     * - Reject invalid mode or both seq+fanOut booleans with 400.
+     * - startOne → runDetached({ seq: true }) or ({ fanOut: true }) or
+     *   ({ decompose: true }); never combine exclusive modes.
+     * - Reject invalid mode, seq+fanOut booleans, or decompose combined with
+     *   seq / fan-out (mode string and/or bools) with 400.
      * - Idempotency by caller id still holds when mode is set.
      */
     const home = makeTmpHome();
@@ -1115,6 +1195,31 @@ describe('serve HTTP jobs API', () => {
           body: { task: 'bad mode', id: 'id-bad', mode: 'pipeline' },
         });
         assert.equal(invalid.res.status, 400, 'unknown mode string must be rejected');
+        assert.match(
+          String(invalid.json?.error ?? ''),
+          /decompose/i,
+          'allowlist error must mention decompose alongside seq / fan-out',
+        );
+
+        const decompPlusSeq = await jsonRequest(handle.baseUrl, 'POST', '/api/products/mode-app/jobs', {
+          body: {
+            task: 'decompose with seq',
+            id: 'id-decomp-seq',
+            mode: 'decompose',
+            seq: true,
+          },
+        });
+        assert.equal(decompPlusSeq.res.status, 400, 'decompose + seq bool must be rejected');
+
+        const decompPlusFan = await jsonRequest(handle.baseUrl, 'POST', '/api/products/mode-app/jobs', {
+          body: {
+            task: 'decompose with fan-out',
+            id: 'id-decomp-fan',
+            mode: 'decompose',
+            fanOut: true,
+          },
+        });
+        assert.equal(decompPlusFan.res.status, 400, 'decompose + fanOut bool must be rejected');
 
         const seqJob = await jsonRequest(handle.baseUrl, 'POST', '/api/products/mode-app/jobs', {
           body: {
@@ -1134,6 +1239,7 @@ describe('serve HTTP jobs API', () => {
         assert.equal(detachCalls[0].prompt, 'ordered billing units');
         assert.equal(detachCalls[0].options.seq, true);
         assert.ok(!detachCalls[0].options.fanOut, 'seq start must not set fanOut');
+        assert.ok(!detachCalls[0].options.decompose, 'seq start must not set decompose');
         assert.equal(detachCalls[0].options.pr, true);
         assert.equal(detachCalls[0].options.jobSlug, seqSlug);
 
@@ -1169,11 +1275,56 @@ describe('serve HTTP jobs API', () => {
         assert.equal(fanCall.prompt, 'parallel billing workers');
         assert.equal(fanCall.options.fanOut, true);
         assert.ok(!fanCall.options.seq, 'fan-out start must not set seq');
+        assert.ok(!fanCall.options.decompose, 'fan-out start must not set decompose');
         assert.equal(fanCall.options.pr, true);
         assert.equal(fanCall.options.jobSlug, fanSlug);
 
         const fanOnDisk = readJob(productDir, fanSlug);
         assert.equal(fanOnDisk.mode, 'fan-out', 'queued job must persist fan-out mode for tick');
+
+        const decompJob = await jsonRequest(handle.baseUrl, 'POST', '/api/products/mode-app/jobs', {
+          body: {
+            task: 'plan-only decompose feature',
+            id: 'id-decomp-550e8400-e29b-41d4-a716-446655440003',
+            mode: 'decompose',
+          },
+        });
+        assert.ok(
+          [200, 201, 202].includes(decompJob.res.status),
+          `decompose status ${decompJob.res.status}`,
+        );
+        const decompSlug = decompJob.json?.slug ?? decompJob.json?.job?.slug;
+        assert.ok(decompSlug);
+        assert.equal(
+          decompJob.json?.job?.mode ?? decompJob.json?.mode,
+          'decompose',
+          'create response must include mode decompose',
+        );
+
+        for (let i = 0; i < 40 && detachCalls.length < 3; i++) {
+          await new Promise((r) => setTimeout(r, 20));
+        }
+        assert.equal(detachCalls.length, 3, 'decompose job must tick into runDetached');
+        const decompCall = detachCalls[2];
+        assert.equal(decompCall.prompt, 'plan-only decompose feature');
+        assert.equal(decompCall.options.decompose, true);
+        assert.ok(!decompCall.options.seq, 'decompose start must not set seq');
+        assert.ok(!decompCall.options.fanOut, 'decompose start must not set fanOut');
+        assert.equal(decompCall.options.pr, true);
+        assert.equal(decompCall.options.jobSlug, decompSlug);
+
+        const decompOnDisk = readJob(productDir, decompSlug);
+        assert.equal(decompOnDisk.mode, 'decompose', 'queued job must persist decompose mode for tick');
+
+        const decompAgain = await jsonRequest(handle.baseUrl, 'POST', '/api/products/mode-app/jobs', {
+          body: {
+            task: 'plan-only decompose feature',
+            id: 'id-decomp-550e8400-e29b-41d4-a716-446655440003',
+            mode: 'decompose',
+          },
+        });
+        assert.equal(decompAgain.json?.slug ?? decompAgain.json?.job?.slug, decompSlug);
+        assert.equal(detachCalls.length, 3, 'idempotent decompose replay must not re-detach');
       } finally {
         await handle.close();
       }
@@ -1232,6 +1383,154 @@ describe('serve HTTP jobs API (scan + controls + logs)', () => {
 
         const missing = await jsonRequest(handle.baseUrl, 'GET', '/api/jobs/no-such-slug');
         assert.equal(missing.res.status, 404);
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('GET /api/jobs/:slug includes job.seq state + units when seq.json exists', async () => {
+    const home = makeTmpHome();
+    try {
+      const productDir = seedProduct(home, 'seq-app');
+      const slug = 'decomp-plan-aaaa';
+      seedJob(productDir, slug, {
+        product: 'seq-app',
+        task: 'implement the billing module',
+        state: 'done',
+        phase: 'decompose',
+        finishedAt: '2026-08-02T01:00:00.000Z',
+        exitCode: 0,
+      });
+      const doc = seedSeq(productDir, slug);
+
+      const handle = await startTestServe(home);
+      try {
+        const { res, json } = await jsonRequest(handle.baseUrl, 'GET', `/api/jobs/${slug}`);
+        assert.equal(res.status, 200, `expected 200; got ${res.status}: ${JSON.stringify(json)}`);
+        const job = json?.job ?? json;
+        assert.equal(job.slug, slug);
+        assertSeqPayload(job.seq, doc);
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('GET /api/jobs/:slug omits job.seq when seq.json is missing', async () => {
+    const home = makeTmpHome();
+    try {
+      const productDir = seedProduct(home, 'plain-app');
+      seedJob(productDir, 'plain-job-bbbb', {
+        product: 'plain-app',
+        task: 'no decompose',
+        state: 'done',
+        finishedAt: '2026-08-02T01:00:00.000Z',
+        exitCode: 0,
+      });
+
+      const handle = await startTestServe(home);
+      try {
+        const { res, json } = await jsonRequest(handle.baseUrl, 'GET', '/api/jobs/plain-job-bbbb');
+        assert.equal(res.status, 200);
+        const job = json?.job ?? json;
+        assert.equal(job.slug, 'plain-job-bbbb');
+        assertNoSeqEnrichment(job);
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('GET /api/jobs and GET /api/products/:product/jobs attach job.seq when present', async () => {
+    const home = makeTmpHome();
+    try {
+      const withSeqDir = seedProduct(home, 'with-seq');
+      const noSeqDir = seedProduct(home, 'no-seq');
+      const plannedSlug = 'parent-seq-cccc';
+      seedJob(withSeqDir, plannedSlug, {
+        product: 'with-seq',
+        task: 'planned backlog',
+        state: 'done',
+        phase: 'decompose',
+        startedAt: '2026-08-03T00:00:00.000Z',
+        finishedAt: '2026-08-03T01:00:00.000Z',
+        exitCode: 0,
+      });
+      const doc = seedSeq(withSeqDir, plannedSlug, { state: 'planned' });
+      seedJob(noSeqDir, 'lonely-dddd', {
+        product: 'no-seq',
+        task: 'no seq artifact',
+        state: 'running',
+        startedAt: '2026-08-04T00:00:00.000Z',
+        pid: process.pid,
+      });
+
+      const handle = await startTestServe(home);
+      try {
+        const all = await jsonRequest(handle.baseUrl, 'GET', '/api/jobs');
+        assert.equal(all.res.status, 200);
+        const jobs = all.json?.jobs ?? all.json;
+        assert.ok(Array.isArray(jobs));
+        const withSeq = jobs.find((j) => j.slug === plannedSlug);
+        const without = jobs.find((j) => j.slug === 'lonely-dddd');
+        assert.ok(withSeq, 'list must include the decomposed parent');
+        assert.ok(without, 'list must include the plain job');
+        assertSeqPayload(withSeq.seq, doc);
+        assertNoSeqEnrichment(without);
+
+        const productList = await jsonRequest(
+          handle.baseUrl,
+          'GET',
+          '/api/products/with-seq/jobs',
+        );
+        assert.equal(productList.res.status, 200);
+        const productJobs = productList.json?.jobs;
+        assert.ok(Array.isArray(productJobs));
+        const only = productJobs.find((j) => j.slug === plannedSlug);
+        assert.ok(only);
+        assertSeqPayload(only.seq, doc);
+        assert.ok(
+          !productJobs.some((j) => j.slug === 'lonely-dddd'),
+          'product list must stay product-scoped',
+        );
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('GET /api/jobs/:slug returns 500 when seq.json is corrupt (readSeq throws)', async () => {
+    // readSeq uses JSON.parse and throws on invalid JSON; serve's request
+    // catch maps that to 500 — document that behavior (do not silently omit).
+    const home = makeTmpHome();
+    try {
+      const productDir = seedProduct(home, 'bad-seq');
+      const slug = 'corrupt-seq-eeee';
+      seedJob(productDir, slug, {
+        product: 'bad-seq',
+        task: 'has bad seq',
+        state: 'done',
+        finishedAt: '2026-08-02T01:00:00.000Z',
+        exitCode: 0,
+      });
+      const seqDir = path.join(productDir, '.orch', slug);
+      fs.mkdirSync(seqDir, { recursive: true });
+      fs.writeFileSync(path.join(seqDir, 'seq.json'), '{not-json');
+
+      const handle = await startTestServe(home);
+      try {
+        const { res, json } = await jsonRequest(handle.baseUrl, 'GET', `/api/jobs/${slug}`);
+        assert.equal(res.status, 500);
+        assert.ok(json?.error, 'corrupt seq.json should surface as a 500 error body');
       } finally {
         await handle.close();
       }
@@ -1321,6 +1620,207 @@ describe('serve HTTP jobs API (scan + controls + logs)', () => {
             || stopped.json?.action === 'signaled'
             || stopped.json?.action === 'already-terminal',
           `unexpected stop outcome: state=${afterStop.state} body=${JSON.stringify(stopped.json)}`,
+        );
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('POST /api/jobs/:slug/start starts a planned decompose job via runDetached({ fromSlug })', async () => {
+    /**
+     * After mode:decompose plan-only completion, run.json is terminal `done` /
+     * phase decompose and seq.json is `planned`. Start reuses that slug
+     * (orch --seq --from <slug>) and returns the refreshed enriched job.
+     */
+    const home = makeTmpHome();
+    try {
+      const productDir = seedProduct(home, 'start-app');
+      const slug = 'planned-start-aaaa';
+      const task = 'implement the billing module';
+      seedJob(productDir, slug, {
+        product: 'start-app',
+        task,
+        agent: 'claude',
+        maxRounds: 7,
+        base: 'aaa111',
+        mode: 'decompose',
+        state: 'done',
+        phase: 'decompose',
+        finishedAt: '2026-08-02T01:00:00.000Z',
+        exitCode: 0,
+        pid: null,
+      });
+      const doc = seedSeq(productDir, slug, { state: 'planned', task });
+
+      const detachCalls = [];
+      const runDetached = mock.fn(async (prompt, options = {}) => {
+        detachCalls.push({ prompt, options });
+        if (options.cwd && options.fromSlug) {
+          const existing = readJob(options.cwd, options.fromSlug);
+          if (existing) {
+            writeJob(options.cwd, options.fromSlug, {
+              ...existing,
+              state: 'running',
+              pid: 710001,
+              role: 'coordinator',
+              finishedAt: null,
+              exitCode: null,
+            });
+          }
+        }
+        if (typeof options.exit === 'function') options.exit(0);
+      });
+
+      const handle = await startTestServe(home, { runDetached });
+      try {
+        const { res, json } = await jsonRequest(
+          handle.baseUrl,
+          'POST',
+          `/api/jobs/${slug}/start`,
+        );
+        assert.equal(
+          res.status,
+          200,
+          `planned start must succeed; got ${res.status}: ${JSON.stringify(json)}`,
+        );
+        assert.equal(json?.ok, true);
+        assert.equal(detachCalls.length, 1, 'start must call runDetached once');
+        const { prompt, options } = detachCalls[0];
+        assert.equal(
+          options.fromSlug,
+          slug,
+          'must reuse the job slug via fromSlug (orch --seq --from)',
+        );
+        if (options.jobSlug != null) {
+          assert.equal(
+            options.jobSlug,
+            slug,
+            'if jobSlug is passed it must reuse the same slug, not allocate a new one',
+          );
+        }
+        assert.equal(options.pr, true);
+        assert.equal(options.agent, 'claude');
+        assert.equal(options.maxRounds, 7);
+        assert.equal(options.base, 'aaa111');
+        assert.equal(
+          path.resolve(options.cwd),
+          path.resolve(productDir),
+          'detach cwd must be the product directory',
+        );
+        assert.equal(typeof options.exit, 'function', 'serve must pass a no-op exit');
+        assert.equal(
+          options.decompose,
+          undefined,
+          'start executes planned seq; must not re-run decompose',
+        );
+        assert.ok(
+          prompt === task || prompt === doc.task,
+          `detach prompt should be the job/seq task; got ${JSON.stringify(prompt)}`,
+        );
+
+        const job = json?.job;
+        assert.ok(job && typeof job === 'object', 'response must include refreshed job');
+        assert.equal(job.slug, slug);
+        assert.equal(job.seq?.state, 'planned', 'refreshed job must keep seq enrichment');
+        assertSeqPayload(job.seq, doc);
+        assert.equal(
+          readJob(productDir, slug).state,
+          'running',
+          'runDetached mock should have promoted the reused slug',
+        );
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('POST /api/jobs/:slug/start rejects non-planned seq, live jobs, and missing jobs', async () => {
+    const home = makeTmpHome();
+    try {
+      const productDir = seedProduct(home, 'start-reject');
+      const detachCalls = [];
+      const runDetached = mock.fn(async (prompt, options = {}) => {
+        detachCalls.push({ prompt, options });
+        if (typeof options.exit === 'function') options.exit(0);
+      });
+
+      // Non-planned: done job with seq.state running (execute already in progress on disk).
+      seedJob(productDir, 'seq-running-bbbb', {
+        product: 'start-reject',
+        task: 'already executing',
+        mode: 'decompose',
+        state: 'done',
+        phase: 'decompose',
+        finishedAt: '2026-08-02T01:00:00.000Z',
+        exitCode: 0,
+        pid: null,
+      });
+      seedSeq(productDir, 'seq-running-bbbb', { state: 'running' });
+
+      // Non-planned: done job with no seq.json at all.
+      seedJob(productDir, 'no-seq-cccc', {
+        product: 'start-reject',
+        task: 'plain done job',
+        state: 'done',
+        finishedAt: '2026-08-02T01:00:00.000Z',
+        exitCode: 0,
+        pid: null,
+      });
+
+      // Live: running job even if seq happens to say planned.
+      seedJob(productDir, 'live-planned-dddd', {
+        product: 'start-reject',
+        task: 'still live',
+        mode: 'decompose',
+        state: 'running',
+        phase: 'schedule',
+        pid: process.pid,
+      });
+      seedSeq(productDir, 'live-planned-dddd', { state: 'planned' });
+
+      const handle = await startTestServe(home, { runDetached });
+      try {
+        const nonPlanned = await jsonRequest(
+          handle.baseUrl,
+          'POST',
+          '/api/jobs/seq-running-bbbb/start',
+        );
+        assert.equal(nonPlanned.res.status, 409, 'non-planned seq must be a state conflict');
+        assert.match(String(nonPlanned.json?.error || ''), /planned|seq|state/i);
+
+        const missingSeq = await jsonRequest(
+          handle.baseUrl,
+          'POST',
+          '/api/jobs/no-seq-cccc/start',
+        );
+        assert.equal(missingSeq.res.status, 409, 'missing seq must be rejected');
+        assert.match(String(missingSeq.json?.error || ''), /planned|seq|state/i);
+
+        const live = await jsonRequest(
+          handle.baseUrl,
+          'POST',
+          '/api/jobs/live-planned-dddd/start',
+        );
+        assert.equal(live.res.status, 409, 'live job must be a state conflict');
+        assert.match(String(live.json?.error || ''), /live|running|starting|paused|state/i);
+
+        const missing = await jsonRequest(
+          handle.baseUrl,
+          'POST',
+          '/api/jobs/no-such-start-slug/start',
+        );
+        assert.equal(missing.res.status, 404);
+        assert.match(String(missing.json?.error || ''), /not found/i);
+
+        assert.equal(
+          detachCalls.length,
+          0,
+          'reject paths must not call runDetached',
         );
       } finally {
         await handle.close();

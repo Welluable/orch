@@ -8,7 +8,23 @@ export type Product = {
 };
 
 /** Serve Run modes: omit / default = normal pipeline. */
-export type JobMode = 'seq' | 'fan-out';
+export type JobMode = 'seq' | 'fan-out' | 'decompose';
+
+/** Unit from serve `job.seq` enrichment (`seqEnrichment`). */
+export type JobSeqUnit = {
+  id: string;
+  title?: string;
+  subtask?: string;
+  state?: string;
+  slug?: string | null;
+  childSlug?: string | null;
+};
+
+/** Plan/execute backlog attached when seq.json exists for the job. */
+export type JobSeq = {
+  state?: string;
+  units: JobSeqUnit[];
+};
 
 export type Job = {
   slug: string;
@@ -17,6 +33,7 @@ export type Job = {
   product?: string;
   prompt?: string;
   mode?: JobMode;
+  seq?: JobSeq;
   [key: string]: unknown;
 };
 

@@ -69,7 +69,7 @@ export function JobScreen({ jobSlug }: Props) {
     el.scrollTop = el.scrollHeight;
   }, [logs]);
 
-  async function control(action: 'pause' | 'resume' | 'stop') {
+  async function control(action: 'pause' | 'resume' | 'stop' | 'start') {
     setControlBusy(true);
     setError(null);
     try {
@@ -78,7 +78,9 @@ export function JobScreen({ jobSlug }: Props) {
           ? `/api/jobs/${encodeURIComponent(jobSlug)}/pause`
           : action === 'resume'
             ? `/api/jobs/${encodeURIComponent(jobSlug)}/resume`
-            : `/api/jobs/${encodeURIComponent(jobSlug)}/stop`;
+            : action === 'stop'
+              ? `/api/jobs/${encodeURIComponent(jobSlug)}/stop`
+              : `/api/jobs/${encodeURIComponent(jobSlug)}/start`;
       const { data } = await api<{ job: Job }>(path, { method: 'POST' });
       if (data.job) setJob(data.job);
       else await loadJob();
@@ -154,6 +156,59 @@ export function JobScreen({ jobSlug }: Props) {
             </button>
           </div>
         </section>
+
+        {job?.seq ? (
+          <section className="section-panel">
+            <div className="row row-between">
+              <h3 className="section-heading">Seq</h3>
+              <div className="row">
+                <span className="badge">{job.seq.state || '…'}</span>
+                {job.seq.state === 'planned' ? (
+                  <>
+                    <span className="muted">ready</span>
+                    <button
+                      type="button"
+                      className="secondary"
+                      disabled={controlBusy}
+                      onClick={() => control('start')}
+                    >
+                      Start
+                    </button>
+                  </>
+                ) : null}
+              </div>
+            </div>
+            {job.seq.units.length === 0 ? (
+              <p className="muted mt-2">No units.</p>
+            ) : (
+              <ul className="mt-2">
+                {job.seq.units.map((unit) => {
+                  const childId = unit.slug || unit.childSlug;
+                  return (
+                    <li key={unit.id} className="list-row">
+                      <div>
+                        <span className="mono">{unit.id}</span>
+                        {unit.title ? (
+                          <>
+                            {' '}
+                            <span>{unit.title}</span>
+                          </>
+                        ) : null}
+                        {unit.subtask ? (
+                          <p className="muted">{unit.subtask}</p>
+                        ) : null}
+                        {childId ? (
+                          <p className="muted mono">{childId}</p>
+                        ) : null}
+                      </div>
+                      <span className="badge">{unit.state || '…'}</span>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </section>
+        ) : null}
 
         <section className="section-panel">
           <div className="row row-between">
