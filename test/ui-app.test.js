@@ -26,7 +26,10 @@ import { fileURLToPath } from 'node:url';
  *   ordered `units[]` with id/title/subtask/state/slug|childSlug), JobScreen
  *   must render that backlog in a sidebar section-panel peer to Controls/Files
  *   so plan-only decompose results stay visible. Omit the section when
- *   `job.seq` is absent. Display only — no Start / POST …/start (out of scope).
+ *   `job.seq` is absent. When `job.seq.state === 'planned'`, show a
+ *   planned/ready affordance and a Start control that POSTs
+ *   `/api/jobs/:slug/start` via `api()` (peer to pause/resume/stop) then
+ *   `setJob` from the refreshed job.
  * - Mobile-responsive layout cues; root `package.json` `files` includes the
  *   built UI (`ui/out/**`) and `lib/serve.js` serves non-/api static export
  *   (unit 02 packaging + static middleware).
@@ -175,17 +178,17 @@ function eachTimerFirstArg(src, visit) {
 
 /**
  * True when `s` references GET /api/jobs/:slug (job record for state/prUrl),
- * not /logs, /files, or pause|resume|stop control paths.
+ * not /logs, /files, or pause|resume|stop|start control paths.
  */
 function mentionsJobStatusApi(s) {
   // Template / concat forms: `/api/jobs/${slug}` or '/api/jobs/' + id
   if (
-    /\/api\/jobs\/\$\{[^}]+\}(?!\/(?:logs|files|pause|resume|stop))/.test(s) ||
-    /\/api\/jobs\/['"`]\s*\+\s*[^;]+(?![\s\S]{0,40}\/(?:logs|files|pause|resume|stop))/.test(s)
+    /\/api\/jobs\/\$\{[^}]+\}(?!\/(?:logs|files|pause|resume|stop|start))/.test(s) ||
+    /\/api\/jobs\/['"`]\s*\+\s*[^;]+(?![\s\S]{0,40}\/(?:logs|files|pause|resume|stop|start))/.test(s)
   ) {
     // Reject if the only /api/jobs/ hits in this slice are clearly sub-resources.
     const withoutSubs = s.replace(
-      /\/api\/jobs\/(?:\$\{[^}]+\}|[^/'"`\s]+)\/(?:logs|files|pause|resume|stop)/g,
+      /\/api\/jobs\/(?:\$\{[^}]+\}|[^/'"`\s]+)\/(?:logs|files|pause|resume|stop|start)/g,
       '',
     );
     return /\/api\/jobs\//.test(withoutSubs);
@@ -193,7 +196,7 @@ function mentionsJobStatusApi(s) {
   // Literal or generic `/api/jobs/` then slug token, not a known subpath.
   if (!/\/api\/jobs\//.test(s)) return false;
   const withoutSubs = s.replace(
-    /\/api\/jobs\/(?:\$\{[^}]+\}|[^/'"`\s]+)\/(?:logs|files|pause|resume|stop)/g,
+    /\/api\/jobs\/(?:\$\{[^}]+\}|[^/'"`\s]+)\/(?:logs|files|pause|resume|stop|start)/g,
     '',
   );
   return /\/api\/jobs\/(?:\$\{[^}]+\}|[A-Za-z0-9_$'"`+][^/'"`\s]*)/.test(withoutSubs);
@@ -430,7 +433,7 @@ function hasJobStatusPollOrRefresh(src) {
   // Manual Refresh: label alone is insufficient — handler must hit status API.
   const hasRefreshLabel = />\s*Refresh\s*</.test(src) || /['"`]Refresh['"`]/.test(src);
   if (hasRefreshLabel) {
-    if (/onClick=\{[^}]*\/api\/jobs\/(?![^}]*\/(?:logs|files|pause|resume|stop))/.test(src)) {
+    if (/onClick=\{[^}]*\/api\/jobs\/(?![^}]*\/(?:logs|files|pause|resume|stop|start))/.test(src)) {
       return true;
     }
     for (const m of src.matchAll(/>\s*Refresh\s*<|['"`]Refresh['"`]/g)) {
@@ -450,7 +453,7 @@ function hasJobStatusPollOrRefresh(src) {
 
   // onClick that directly fetches job status (without requiring "Refresh" text).
   if (
-    /onClick=\{[^}]*\/api\/jobs\/(?![^}]*\/(?:logs|files|pause|resume|stop))/.test(src)
+    /onClick=\{[^}]*\/api\/jobs\/(?![^}]*\/(?:logs|files|pause|resume|stop|start))/.test(src)
   ) {
     return true;
   }
@@ -1087,12 +1090,13 @@ describe('01-ui-app Job screen', () => {
     assert.doesNotMatch(src, />\s*Continue\s*</);
   });
 
-  it('renders job.seq state + ordered units backlog when enrichment is present', () => {
+  it('renders job.seq backlog and Start when seq.state is planned', () => {
     /**
-     * Unit 05-ui-task-units: plan-only decompose leaves seq.json `state:planned`
-     * with units; serve already attaches `job.seq` on GET /api/jobs/:slug.
-     * JobScreen must surface that payload so the backlog stays visible on the
-     * task detail screen. Display only — Start / POST …/start is out of scope.
+     * Units 05–06: plan-only decompose leaves seq.json `state:planned` with
+     * units; serve attaches `job.seq` on GET /api/jobs/:slug. JobScreen must
+     * surface that backlog and, when `job.seq.state === 'planned'`, offer a
+     * planned/ready affordance plus Start → POST /api/jobs/:slug/start via
+     * api()/control (peer to pause/resume/stop), then setJob from the response.
      */
     const jobPath = path.join(uiRoot, 'components', 'JobScreen.tsx');
     assert.ok(exists(jobPath), 'expected ui/components/JobScreen.tsx');
@@ -1157,16 +1161,40 @@ describe('01-ui-app Job screen', () => {
       'seq section must render only when job.seq is present (omit when enrichment absent)',
     );
 
-    // Out of scope: do not wire Start / POST …/start on JobScreen.
-    assert.doesNotMatch(
-      jobSrc,
-      /\/api\/jobs\/[^'"`\n]*\/start|\/start['"`]/,
-      'JobScreen must not call POST /api/jobs/:slug/start in this unit',
+    // Unit 06: Start peers pause/resume/stop — POST …/start via api()/control, then setJob.
+    assert.ok(
+      /['"]start['"]\s*\|/.test(jobSrc) ||
+        /\|\s*['"]start['"]/.test(jobSrc) ||
+        /control\s*\(\s*['"]start['"]\s*\)/.test(jobSrc) ||
+        /action\s*===\s*['"]start['"]/.test(jobSrc),
+      "control() must accept 'start' as a peer of pause|resume|stop (or call control('start'))",
     );
-    assert.doesNotMatch(
-      jobSrc,
-      />\s*Start\s*(?:seq|backlog|job)?\s*</i,
-      'JobScreen must not expose a Start control for the seq backlog in this unit',
+    assert.ok(
+      /\/api\/jobs\/[^'"`\n]*\/start|\/start['"`]/.test(jobSrc),
+      'JobScreen must POST /api/jobs/:slug/start (path built like pause/resume/stop)',
+    );
+    assert.ok(
+      /\bapi\s*[<(]/.test(jobSrc) &&
+        /method\s*:\s*['"]POST['"]/.test(jobSrc) &&
+        /setJob\s*\(/.test(jobSrc),
+      'Start must go through api(..., { method: POST }) and setJob from the refreshed job',
+    );
+    assert.ok(
+      />\s*Start\s*</.test(jobSrc) || /['"`]Start['"`]/.test(jobSrc),
+      'JobScreen must expose a user-facing Start control label',
+    );
+
+    // Gate Start + planned/ready affordance on seq.state === 'planned' (not only job.state).
+    const plannedGate =
+      /(?:seq\.state|job\.seq\.state|\.seq\.state)\s*===?\s*['"]planned['"]/.test(jobSrc) ||
+      /['"]planned['"]\s*===?\s*(?:seq\.state|job\.seq\.state|\.seq\.state)/.test(jobSrc);
+    assert.ok(
+      plannedGate,
+      "Start (and planned/ready affordance) must gate on job.seq.state === 'planned'",
+    );
+    assert.ok(
+      /\bplanned\b/i.test(jobSrc) && (/\bready\b/i.test(jobSrc) || /\bbadge\b/.test(jobSrc)),
+      'when seq is planned, JobScreen must show a planned/ready affordance (label or badge)',
     );
 
     // Optional typed Job.seq shape — pin when types declare it.
