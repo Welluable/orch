@@ -22,6 +22,11 @@ import { fileURLToPath } from 'node:url';
  *   GET /api/jobs/:slug/files so the Files card updates without manual Reload;
  *   logs, files file.path+file.status, Pause/Resume/Stop). No per-job delete /
  *   continue; no HTTP DELETE (bulk clean is POST).
+ * - When GET /api/jobs/:slug returns `job.seq` (serve enrichment: doc `state` +
+ *   ordered `units[]` with id/title/subtask/state/slug|childSlug), JobScreen
+ *   must render that backlog in a sidebar section-panel peer to Controls/Files
+ *   so plan-only decompose results stay visible. Omit the section when
+ *   `job.seq` is absent. Display only — no Start / POST …/start (out of scope).
  * - Mobile-responsive layout cues; root `package.json` `files` includes the
  *   built UI (`ui/out/**`) and `lib/serve.js` serves non-/api static export
  *   (unit 02 packaging + static middleware).
@@ -1080,6 +1085,106 @@ describe('01-ui-app Job screen', () => {
 
     assert.doesNotMatch(src, /<(button|a|Link)[^>]*>\s*[^<]*\bContinue\b/);
     assert.doesNotMatch(src, />\s*Continue\s*</);
+  });
+
+  it('renders job.seq state + ordered units backlog when enrichment is present', () => {
+    /**
+     * Unit 05-ui-task-units: plan-only decompose leaves seq.json `state:planned`
+     * with units; serve already attaches `job.seq` on GET /api/jobs/:slug.
+     * JobScreen must surface that payload so the backlog stays visible on the
+     * task detail screen. Display only — Start / POST …/start is out of scope.
+     */
+    const jobPath = path.join(uiRoot, 'components', 'JobScreen.tsx');
+    assert.ok(exists(jobPath), 'expected ui/components/JobScreen.tsx');
+    const jobSrc = read(jobPath);
+    const typesSrc = exists(path.join(uiRoot, 'lib', 'types.ts'))
+      ? read(path.join(uiRoot, 'lib', 'types.ts'))
+      : '';
+
+    // Gate on job.seq from the existing loadJob / GET payload (not a separate fetch).
+    assert.ok(
+      /job\?\.seq\b|job\.seq\b/.test(jobSrc),
+      'JobScreen must read job.seq from the GET /api/jobs/:slug payload (loadJob state)',
+    );
+
+    // Document-level seq.state (badge or muted label).
+    assert.ok(
+      /seq\.state\b|job\.seq\.state\b|\.seq\.state\b/.test(jobSrc),
+      'JobScreen must render job.seq.state (document-level planned|running|done|failed)',
+    );
+
+    // Ordered units list: map over seq.units (or job.seq.units).
+    assert.ok(
+      /(?:seq|job\.seq)\.units\b/.test(jobSrc) &&
+        /\.map\s*\(/.test(jobSrc) &&
+        /(?:seq|job\.seq)\.units[\s\S]{0,200}\.map\s*\(|\.units\.map\s*\(/.test(jobSrc),
+      'JobScreen must map over job.seq.units in order for the backlog list',
+    );
+
+    // Per-unit enrichment fields from serve: id, title, subtask, state, slug|childSlug.
+    assert.ok(
+      /\.id\b/.test(jobSrc) && /\.title\b/.test(jobSrc),
+      'seq unit rows must surface unit.id and unit.title',
+    );
+    assert.ok(
+      /\.subtask\b/.test(jobSrc),
+      'seq unit rows must surface unit.subtask',
+    );
+    assert.ok(
+      /(?:unit|u|entry|row|item)\s*\.\s*state\b|units[\s\S]{0,400}\.state\b/.test(jobSrc),
+      'seq unit rows must surface each unit.state (distinct from job.state / seq.state)',
+    );
+    assert.ok(
+      /\.slug\b|\.childSlug\b/.test(jobSrc),
+      'seq unit rows must surface child job id via unit.slug and/or unit.childSlug',
+    );
+
+    // Sidebar section-panel peer to Controls/Files (reuse chrome classes).
+    assert.ok(
+      /section-panel/.test(jobSrc),
+      'seq backlog must live in a section-panel (peer to Controls/Files)',
+    );
+    assert.ok(
+      /list-row|\bbadge\b|\bmono\b|\bmuted\b/.test(jobSrc),
+      'seq backlog should reuse list-row / badge / mono / muted chrome classes',
+    );
+
+    // Omit the section when job.seq is absent (conditional render, no empty placeholder required).
+    assert.ok(
+      /job\?\.seq\b|job\.seq\s*&&|\{[^}]*job\.seq[^}]*&&|if\s*\(\s*job\?\.seq|if\s*\(\s*job\.seq/.test(
+        jobSrc,
+      ),
+      'seq section must render only when job.seq is present (omit when enrichment absent)',
+    );
+
+    // Out of scope: do not wire Start / POST …/start on JobScreen.
+    assert.doesNotMatch(
+      jobSrc,
+      /\/api\/jobs\/[^'"`\n]*\/start|\/start['"`]/,
+      'JobScreen must not call POST /api/jobs/:slug/start in this unit',
+    );
+    assert.doesNotMatch(
+      jobSrc,
+      />\s*Start\s*(?:seq|backlog|job)?\s*</i,
+      'JobScreen must not expose a Start control for the seq backlog in this unit',
+    );
+
+    // Optional typed Job.seq shape — pin when types declare it.
+    if (
+      /JobSeq|seq\??\s*:\s*|interface\s+\w*Seq|type\s+\w*Seq/.test(typesSrc) ||
+      /units\s*:\s*/.test(typesSrc) && /childSlug|subtask/.test(typesSrc)
+    ) {
+      assert.ok(
+        /state/.test(typesSrc) &&
+          /units/.test(typesSrc) &&
+          /id/.test(typesSrc) &&
+          /title/.test(typesSrc) &&
+          /subtask/.test(typesSrc) &&
+          (/slug/.test(typesSrc) || /childSlug/.test(typesSrc)),
+        'ui/lib/types.ts Job.seq / JobSeq must include state + units[] ' +
+          '(id, title, subtask, state, slug|childSlug)',
+      );
+    }
   });
 });
 

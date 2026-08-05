@@ -155,6 +155,44 @@ export function JobScreen({ jobSlug }: Props) {
           </div>
         </section>
 
+        {job?.seq ? (
+          <section className="section-panel">
+            <div className="row row-between">
+              <h3 className="section-heading">Seq</h3>
+              <span className="badge">{job.seq.state || '…'}</span>
+            </div>
+            {job.seq.units.length === 0 ? (
+              <p className="muted mt-2">No units.</p>
+            ) : (
+              <ul className="mt-2">
+                {job.seq.units.map((unit) => {
+                  const childId = unit.slug || unit.childSlug;
+                  return (
+                    <li key={unit.id} className="list-row">
+                      <div>
+                        <span className="mono">{unit.id}</span>
+                        {unit.title ? (
+                          <>
+                            {' '}
+                            <span>{unit.title}</span>
+                          </>
+                        ) : null}
+                        {unit.subtask ? (
+                          <p className="muted">{unit.subtask}</p>
+                        ) : null}
+                        {childId ? (
+                          <p className="muted mono">{childId}</p>
+                        ) : null}
+                      </div>
+                      <span className="badge">{unit.state || '…'}</span>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </section>
+        ) : null}
+
         <section className="section-panel">
           <div className="row row-between">
             <h3 className="section-heading">Files</h3>
