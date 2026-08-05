@@ -5074,7 +5074,7 @@ program
     .argument('[task...]', 'Task description to use as the prompt (mention a file path and the agent will read it)')
     .option('-v, --verbose', 'Stream agent thinking/output deltas to stderr as the pipeline runs')
     .option('--dry-run', 'Check that the selected agent CLI is on PATH and exit; do not run the pipeline')
-    .option('--ask', 'Ask a read-only question about the codebase; print the reply and exit (skips triage and all write pipelines)')
+    .option('--ask', 'Ask a read-only question about the codebase; print the reply and exit (skips triage and all write pipelines). Pair with --from <slug> for a same-session follow-up via ask.json')
     .option('--quick', 'Skip triage, run quick-fix directly in the current working tree; create no artifacts, worktrees, or commits')
     .option('--detach', 'Run the pipeline in the background and return immediately; manage it with orch list/status/pause/resume/stop/logs. Cannot be combined with --ask, --quick, or --dry-run')
     .option('--pr', 'Always create a worktree, commit, push orch/<slug>, and open a pull request with gh (including triage → quick-fix; skips research/planner on that path). Requires gh on PATH and authenticated. Cannot be combined with --ask, --quick, or --dry-run')
@@ -5083,7 +5083,7 @@ program
     .option('--fan-out', 'Decompose into parallel workers, then integrate once. Cannot be combined with --ask, --quick, --dry-run, --seq, or --decompose')
     .option('--seq', 'Decompose into ordered units; merge each, then adjust the next. With --from <slug>, run a planned backlog without re-decomposing. Cannot be combined with --fan-out, --ask, --quick, --dry-run, or --decompose')
     .option('--decompose', 'Plan-only sequential decomposition: research, write seq.json (state planned), and exit. Run later with --seq --from <slug>. Cannot be combined with --seq, --fan-out, --ask, --quick, --dry-run, or --from')
-    .option('--from <slug>', 'With --seq or --ask: load seq.json schedule or continue ask.json for <slug>')
+    .option('--from <slug>', 'With --seq or --ask: load seq.json schedule or continue ask.json for <slug>. With --ask, requires a follow-up prompt and reuses the ask slug')
     .option('--max-workers <n>', 'Max number of parallel fan-out workers (only meaningful with --fan-out)', positiveIntParser('--max-workers'), 4)
     .option('--max-units <n>', 'Max number of sequential units (meaningful with --seq or --decompose; rejected with --from)', positiveIntParser('--max-units'), 8)
     .option('--max-concurrency <n>', 'Optional hard ceiling on in-flight fan-out workers at once (only meaningful with --fan-out; default: coordinator chooses)', positiveIntParser('--max-concurrency'))
@@ -5106,6 +5106,7 @@ Examples:
   $ orch "implement the local spec" --agent agn -v
   $ orch "fix the typo in the README" --agent opencode
   $ orch --ask "where is the CLI entrypoint?" --agent claude
+  $ orch --ask --from <slug> "and how is triage wired?" --agent claude
   $ orch --quick "fix the typo in the README" --agent claude
   $ orch "noop" --dry-run --agent cursor
   $ orch "noop" --dry-run --agent opencode
@@ -5122,8 +5123,10 @@ Headless runs:
   $ orch status [slug]                                 # show full status (defaults to most recent)
   $ orch pause <slug>                                  # request a pause at the next stage boundary
   $ orch resume <slug>                                 # unpause live pause, or recover failed/stopped/crashed
+  $ orch resume <slug> --detach                        # recover a failed/stopped/crashed job in the background
   $ orch continue <slug> "new task"                    # new work on a done run's worktree
                                                        # (workers: same command; then re-integrate the parent)
+  $ orch continue <slug> "new task" --detach           # same, backgrounded under the same slug
   $ orch stop <slug>                                   # send SIGTERM to a running job
   $ orch logs <slug> [-f]                              # print (or follow) a run's log file
 

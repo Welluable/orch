@@ -316,11 +316,13 @@ Job-control subcommands (see [Headless runs](#headless-runs)):
   checkpoint.
 - `orch resume <slug>` — unpauses a paused/pausing run, or recovers a
   failed/stopped/crashed complex job at its unfinished stage (thin recover +
-  reentry; see failure resume). Not the same as continue.
+  reentry; see failure resume). Not the same as continue. `--detach`
+  backgrounds failure resume under the same slug.
 - `orch continue <slug> "new task"` — starts a new complex pipeline on a
   **done** run's existing worktree/branch (same slug). Carries prior outcome
   into research/plan. For crash recovery use `orch resume` instead. For fan-out
   workers that finished, continue the worker slug, then `orch --integrate <parent>`.
+  `--detach` backgrounds the continue under the same slug.
 - `orch stop <slug>` — sends `SIGTERM` to a running job (or reconciles a dead
   one to `crashed`).
 - `orch logs <slug> [-f]` — prints a run's `orch.log`; `-f` follows it until
@@ -379,7 +381,9 @@ orch list                     # SLUG  ROLE  STATE  PHASE  AGENT  STARTED  DURATI
 orch status swift-lagoon-49ea # full record: state, phase, branch, worktree, exit code, ...
 orch pause swift-lagoon-49ea  # request a pause at the next stage-boundary checkpoint
 orch resume swift-lagoon-49ea # unpause, or recover failed/stopped/crashed
+orch resume swift-lagoon-49ea --detach  # recover in the background under the same slug
 orch continue swift-lagoon-49ea "follow-up polish"  # new work on a done run
+orch continue swift-lagoon-49ea "follow-up polish" --detach  # same, backgrounded
 orch logs swift-lagoon-49ea -f # follow orch.log until the run finishes
 orch stop swift-lagoon-49ea   # SIGTERM the run
 orch jobs clean                # delete every tracked run under .orch/ (asks to confirm; refuses if live)
@@ -423,10 +427,19 @@ under `$HOME/.orch/products/<slug>/` with a `product.json` and a GitHub
 - **Clone:** `git clone <url>` into `$HOME/.orch/products/<slug>/`.
 
 **Jobs.** Every served job runs detached in that product's cwd and **always**
-enables `--pr` (publish). The UI shows status, PR URL, logs, files changed,
-and Pause / Resume / Stop, plus Clean jobs on the product page (wipes that
-product’s tracked runs; refuses while live). Continue-from-UI (write
-pipeline) is not available — use `orch continue` on the CLI.
+enables `--pr` (publish). Create via UI or `POST /api/products/<product>/jobs`
+with optional exclusive `mode`: `seq`, `fan-out`, or `decompose` (omit =
+normal pipeline) — matching the product page radios Default / SEQ / Fan out /
+Decompose. Plan-only `decompose` writes `seq.json` (`state: planned`) and
+leaves the job `done`; GET job/list payloads include `job.seq` (state +
+units) when that file exists. The UI shows status, PR URL, logs, files
+changed, and Pause / Resume / Stop, plus Clean jobs on the product page
+(wipes that product’s tracked runs; refuses while live). When
+`job.seq.state === 'planned'`, the job page also shows the units backlog and a
+**Start** control that `POST /api/jobs/<slug>/start` — same as
+`orch --seq --from <slug>` (rejects live or non-planned with 409).
+Continue-from-UI (write pipeline) is not available — use `orch continue` on
+the CLI.
 
 **Ask chat.** Per-product read-only Q&A (same family as CLI `--ask`), with
 same-session multiturn via `ask.json`. Never enters the write jobs queue.
