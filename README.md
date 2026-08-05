@@ -184,10 +184,20 @@ agent CLI does all the actual reading and writing of files.
 | `--pr` | Always create a worktree, commit, push `orch/<slug>`, and open a PR with `gh` — including when triage routes to quick-fix (research/planner skipped on that path). | You want a PR instead of a local merge hint (required later for served jobs). |
 | `--decompose` | Plan-only sequential split: research → seq-decomposer → write `seq.json` (`state: planned`) and exit. No worktrees or unit spawns. | You want a reviewable backlog before spending N worktrees. |
 | `--seq --from <slug>` | Load a planned `seq.json` and run today's seq schedule loop (skips triage/research/decompose). | You approved a `--decompose` plan and want to implement it. |
+| `--ask --from <slug>` | Same-session **read-only** follow-up against `.orch/<slug>/ask.json` (reuses the ask slug; required follow-up prompt). | Continue an earlier `--ask` thread without starting a new slug. |
 
 For `--ask`, Cursor uses `--mode ask`, Claude uses `--permission-mode plan`,
 `agn` is prompt-only best-effort (it has no dedicated read-only flag), and
 OpenCode uses `--agent plan` with `edit`/`bash` denied via `OPENCODE_PERMISSION`.
+`--ask --from` uses the same read-only agent path.
+
+Three distinct “from / continue” mechanisms (do not conflate them):
+
+| Mechanism | Purpose | Artifact |
+| --- | --- | --- |
+| `orch continue <slug> "new task"` | New **write** pipeline on a **done** worktree (same slug) | Prior run worktree / `run.json` |
+| `orch --seq --from <slug>` | Run a planned seq backlog (no task prompt; from file) | `seq.json` |
+| `orch --ask --from <slug> "…"` | Same-session **read-only** ask follow-up | `ask.json` |
 
 `--detach` only controls backgrounding, not whether a job record exists —
 every non-`--dry-run` invocation gets one. Combining `--detach` with
@@ -234,7 +244,11 @@ Usage: orch [options] [command] <task...>
 - `--dry-run` — checks that the selected agent CLI is on `PATH` and exits
   without running the pipeline.
 - `--ask` — asks a read-only question about the codebase; prints the reply
-  and exits (skips triage and all write pipelines).
+  and exits (skips triage and all write pipelines). Pair with `--from <slug>`
+  for a same-session follow-up via `ask.json`:
+  `orch --ask --from <slug> "<follow-up>"`. Same incompatible flags as plain
+  `--ask` apply to `--ask --from` (`--detach`, `--seq`, `--fan-out`);
+  `--seq --from` still rejects `--ask`.
 - `--quick` — skips triage, runs `quick-fix` directly in the current working
   tree; creates no artifacts, worktrees, or commits.
 - `--detach` — runs the pipeline in the background and returns immediately,
@@ -261,9 +275,12 @@ Usage: orch [options] [command] <task...>
   exit (see [Decompose (`--decompose`)](#decompose---decompose)); rejects
   `--seq`/`--fan-out`/`--ask`/`--quick`/`--dry-run`/`--from`. `--detach` is
   allowed. No worktree is created at plan time.
-- `--from <slug>` — with `--seq` only: run `.orch/<slug>/seq.json` without
-  re-decomposing; task comes from the file (no task prompt). Rejects
-  `--max-units` (frozen at plan time) and nesting depths.
+- `--from <slug>` — with `--seq` or `--ask`: load `seq.json` schedule or
+  continue `ask.json` for `<slug>`. With `--seq`: run without re-decomposing;
+  task comes from the file (no task prompt); rejects `--max-units` (frozen at
+  plan time) and nesting depths. With `--ask`: same-session read-only
+  follow-up (required prompt); reuses the ask slug. `--seq --from` still
+  rejects `--ask`.
 - `--max-workers <n>` — max number of parallel fan-out workers; defaults to
   `4`; only meaningful with `--fan-out`.
 - `--max-units <n>` — max number of sequential units; defaults to `8`;
@@ -327,6 +344,7 @@ orch "fix the bug described in task.md" --agent cursor -v
 orch "implement the local spec" --agent agn -v
 orch "fix the typo in the README" --agent opencode
 orch --ask "where is the CLI entrypoint?" --agent claude
+orch --ask --from <slug> "and how is triage wired?" --agent claude
 orch --ask "where is package.json?" --agent opencode
 orch --quick "fix the typo in the README" --agent claude
 orch "implement the flag" --pr --agent claude
@@ -407,8 +425,20 @@ under `$HOME/.orch/products/<slug>/` with a `product.json` and a GitHub
 **Jobs.** Every served job runs detached in that product's cwd and **always**
 enables `--pr` (publish). The UI shows status, PR URL, logs, files changed,
 and Pause / Resume / Stop, plus Clean jobs on the product page (wipes that
-product’s tracked runs; refuses while live). Continue-from-UI is not available —
-use `orch continue` on the CLI.
+product’s tracked runs; refuses while live). Continue-from-UI (write
+pipeline) is not available — use `orch continue` on the CLI.
+
+**Ask chat.** Per-product read-only Q&A (same family as CLI `--ask`), with
+same-session multiturn via `ask.json`. Never enters the write jobs queue.
+
+- `POST /api/products/<product>/ask` — start; body `{ "prompt": "…" }`
+  (alias `question`); optional `agent` → `{ slug, answer, session }`
+- `POST /api/products/<product>/ask/<slug>` — follow-up (same semantics as
+  CLI `--ask --from`)
+- `GET /api/products/<product>/ask/<slug>` — `{ slug, session, job }`
+
+The UI Ask panel on each product page uses these routes for same-session
+multiturn chat.
 
 **Security.** There is **no authentication** in v1. The default bind is
 `0.0.0.0` so phones on the same network can reach the UI. Startup prints a
