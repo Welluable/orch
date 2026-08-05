@@ -15,9 +15,9 @@ import { fileURLToPath } from 'node:url';
  *   responses; no auth headers or login UI.
  * - Screens: Products (`/` init + clone, navigate to Product on 201),
  *   Product (GET product detail or GET .../jobs — not Run POST alone — +
- *   job→Job links + Run with uuid `id` + exclusive default/SEQ/Fan-out mode
- *   before submit (POST mode with task+id) + danger “Clean jobs” via POST
- *   …/jobs/clean with confirm), Job (poll/refresh of GET
+ *   job→Job links + Run with uuid `id` + exclusive default/SEQ/Fan-out/
+ *   Decompose mode before submit (POST mode with task+id) + danger “Clean
+ *   jobs” via POST …/jobs/clean with confirm), Job (poll/refresh of GET
  *   /api/jobs/:slug for state/prUrl — not logs-only SSE; also poll/refresh
  *   GET /api/jobs/:slug/files so the Files card updates without manual Reload;
  *   logs, files file.path+file.status, Pause/Resume/Stop). No per-job delete /
@@ -870,7 +870,7 @@ describe('01-ui-app Product screen', () => {
     assert.doesNotMatch(src, />\s*Continue\s*</);
   });
 
-  it('lets the user choose default / SEQ / Fan out before Run and POSTs mode with task+id', () => {
+  it('lets the user choose default / SEQ / Fan out / Decompose before Run and POSTs mode with task+id', () => {
     const productSrc = exists(path.join(uiRoot, 'components', 'ProductScreen.tsx'))
       ? read(path.join(uiRoot, 'components', 'ProductScreen.tsx'))
       : allUiSourceText();
@@ -884,12 +884,24 @@ describe('01-ui-app Product screen', () => {
       'Product Run form must expose SEQ and Fan out choices',
     );
     assert.ok(
+      /\bDecompose\b/.test(productSrc),
+      'Product Run form must expose a Decompose choice beside Default / SEQ / Fan out',
+    );
+    assert.ok(
       /Default|Normal|Pipeline|standard/i.test(productSrc),
-      'Product Run form must expose a default (neither SEQ nor Fan out) choice',
+      'Product Run form must expose a default (neither SEQ, Fan out, nor Decompose) choice',
     );
     assert.ok(
       /type\s*=\s*['"]radio['"]|role\s*=\s*['"]radiogroup['"]|<select\b|mode/.test(productSrc),
       'mode choice must be an exclusive control (radio, select, or mode state)',
+    );
+    // Decompose must be a radio in the same exclusive group (value="decompose").
+    assert.ok(
+      /value\s*=\s*['"]decompose['"]/.test(productSrc) &&
+        /type\s*=\s*['"]radio['"][\s\S]{0,200}value\s*=\s*['"]decompose['"]|value\s*=\s*['"]decompose['"][\s\S]{0,200}type\s*=\s*['"]radio['"]/.test(
+          productSrc,
+        ),
+      'Decompose must be a radio with value="decompose" in the Run mode group',
     );
 
     // Run POST body must include mode alongside task and id.
@@ -909,15 +921,28 @@ describe('01-ui-app Product screen', () => {
       'POST .../jobs body must include mode with task and caller uuid id',
     );
     assert.ok(
-      /['"]seq['"]/.test(productSrc) && /['"]fan-out['"]/.test(productSrc),
-      'mode values posted must include "seq" and "fan-out"',
+      /['"]seq['"]/.test(productSrc) &&
+        /['"]fan-out['"]/.test(productSrc) &&
+        /['"]decompose['"]/.test(productSrc),
+      'mode values posted must include "seq", "fan-out", and "decompose"',
+    );
+    // runJob gate must POST mode when decompose is selected (same as seq/fan-out).
+    assert.ok(
+      /mode\s*===\s*['"]decompose['"]|mode\s*===\s*['"]seq['"][\s\S]{0,120}decompose|decompose[\s\S]{0,120}mode\s*===\s*['"]seq['"]/.test(
+        productSrc,
+      ),
+      'runJob must set body.mode = "decompose" when the Decompose radio is selected',
     );
 
     // Types know about the request mode field (or Job.mode if surfaced).
     if (typesSrc) {
       assert.ok(
-        /mode\s*[?:]|'seq'|"seq"|fan-out/.test(typesSrc),
-        'ui/lib/types.ts must type the Run mode field (seq | fan-out)',
+        /JobMode\s*=\s*['"]seq['"]\s*\|\s*['"]fan-out['"]\s*\|\s*['"]decompose['"]|'decompose'|"decompose"/.test(
+          typesSrc,
+        ) &&
+          /'seq'|"seq"/.test(typesSrc) &&
+          /fan-out/.test(typesSrc),
+        "ui/lib/types.ts JobMode must include 'seq' | 'fan-out' | 'decompose'",
       );
     }
   });

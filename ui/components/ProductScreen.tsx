@@ -52,7 +52,7 @@ export function ProductScreen({ productSlug }: Props) {
         task: trimmed,
         id,
       };
-      if (mode === 'seq' || mode === 'fan-out') {
+      if (mode === 'seq' || mode === 'fan-out' || mode === 'decompose') {
         body.mode = mode;
       }
       await api<{ slug: string; job: Job }>(
@@ -152,6 +152,16 @@ export function ProductScreen({ productSlug }: Props) {
                   onChange={() => setMode('fan-out')}
                 />
                 Fan out
+              </label>
+              <label className="mode-option">
+                <input
+                  type="radio"
+                  name="mode"
+                  value="decompose"
+                  checked={mode === 'decompose'}
+                  onChange={() => setMode('decompose')}
+                />
+                Decompose
               </label>
             </div>
           </fieldset>
