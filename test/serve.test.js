@@ -7,6 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { jobPaths, readJob, writeJob } from '../lib/jobs.js';
+import { writeSeq } from '../lib/seq.js';
 
 /**
  * Contract for `.spec/server.md` phases 1–3 (serve jobs + products + scan/files):
@@ -29,7 +30,9 @@ import { jobPaths, readJob, writeJob } from '../lib/jobs.js';
  *   `GET /api/products/:product/jobs`, `POST
  *   /api/products/:product/jobs/clean` (product-scoped `cleanJobs`; 409 when
  *   live jobs block; distinct from create-job POST …/jobs), `POST
- *   .../pause|resume|stop`.
+ *   .../pause|resume|stop`. When `.orch/<slug>/seq.json` exists, GET job and
+ *   list payloads include `job.seq` (`state` + normalized `units`); omit when
+ *   missing.
  * - Phase 2 products: `GET`/`POST /api/products`, `GET`/`PATCH
  *   /api/products/:product` (no DELETE). Slug
  *   `/^[a-z0-9]+(?:-[a-z0-9]+)*$/` max 64; required `name` + `slug`.
@@ -117,6 +120,79 @@ function seedJob(productCwd, slug, fields = {}) {
     fs.writeFileSync(jobPaths(productCwd, slug).logPath, fields.logText);
   }
   return record;
+}
+
+/** Minimal planned seq.json for serve GET enrichment contract tests. */
+function seedSeq(productCwd, parentSlug, overrides = {}) {
+  const doc = {
+    version: 1,
+    parentSlug,
+    task: 'implement the billing module',
+    base: 'aaa111',
+    tip: 'aaa111',
+    maxUnits: 8,
+    units: [
+      {
+        id: '01-types',
+        title: 'billing types',
+        subtask: 'Add shared billing types and stubs.',
+        state: 'done',
+        slug: 'rapid-fox-x7q2',
+        sha: 'bbb1111',
+        changedFiles: ['src/billing/types.ts'],
+      },
+      {
+        id: '02-api',
+        title: 'invoice API',
+        subtask: 'Implement create/list invoice endpoints on current tip.',
+        state: 'pending',
+        slug: null,
+        sha: null,
+        changedFiles: null,
+      },
+    ],
+    adjustments: [],
+    state: 'planned',
+    startedAt: new Date(0).toISOString(),
+    finishedAt: null,
+    ...overrides,
+  };
+  writeSeq(productCwd, parentSlug, doc);
+  return doc;
+}
+
+/**
+ * Assert `job.seq` is the normalized enrichment shape for UI backlog rendering.
+ * Child job slug may be exposed as `slug` and/or `childSlug` (on-disk field is `slug`).
+ */
+function assertSeqPayload(seq, expected) {
+  assert.ok(seq && typeof seq === 'object', 'expected job.seq enrichment object');
+  assert.equal(seq.state, expected.state);
+  assert.ok(Array.isArray(seq.units), 'job.seq.units must be an array');
+  assert.equal(seq.units.length, expected.units.length);
+  for (let i = 0; i < expected.units.length; i += 1) {
+    const unit = seq.units[i];
+    const want = expected.units[i];
+    assert.equal(unit.id, want.id);
+    assert.equal(unit.title, want.title);
+    assert.equal(unit.subtask, want.subtask);
+    assert.equal(unit.state, want.state);
+    const childSlug = unit.childSlug !== undefined ? unit.childSlug : unit.slug;
+    assert.equal(
+      childSlug,
+      want.slug,
+      `unit ${want.id}: child slug must be exposed as slug and/or childSlug`,
+    );
+  }
+}
+
+function assertNoSeqEnrichment(job) {
+  assert.ok(job && typeof job === 'object');
+  assert.equal(
+    job.seq,
+    undefined,
+    'jobs without seq.json must omit job.seq (not null/empty object)',
+  );
 }
 
 function runCli(args, { cwd = path.join(__dirname, '..'), env = process.env } = {}) {
@@ -1209,6 +1285,154 @@ describe('serve HTTP jobs API (scan + controls + logs)', () => {
 
         const missing = await jsonRequest(handle.baseUrl, 'GET', '/api/jobs/no-such-slug');
         assert.equal(missing.res.status, 404);
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('GET /api/jobs/:slug includes job.seq state + units when seq.json exists', async () => {
+    const home = makeTmpHome();
+    try {
+      const productDir = seedProduct(home, 'seq-app');
+      const slug = 'decomp-plan-aaaa';
+      seedJob(productDir, slug, {
+        product: 'seq-app',
+        task: 'implement the billing module',
+        state: 'done',
+        phase: 'decompose',
+        finishedAt: '2026-08-02T01:00:00.000Z',
+        exitCode: 0,
+      });
+      const doc = seedSeq(productDir, slug);
+
+      const handle = await startTestServe(home);
+      try {
+        const { res, json } = await jsonRequest(handle.baseUrl, 'GET', `/api/jobs/${slug}`);
+        assert.equal(res.status, 200, `expected 200; got ${res.status}: ${JSON.stringify(json)}`);
+        const job = json?.job ?? json;
+        assert.equal(job.slug, slug);
+        assertSeqPayload(job.seq, doc);
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('GET /api/jobs/:slug omits job.seq when seq.json is missing', async () => {
+    const home = makeTmpHome();
+    try {
+      const productDir = seedProduct(home, 'plain-app');
+      seedJob(productDir, 'plain-job-bbbb', {
+        product: 'plain-app',
+        task: 'no decompose',
+        state: 'done',
+        finishedAt: '2026-08-02T01:00:00.000Z',
+        exitCode: 0,
+      });
+
+      const handle = await startTestServe(home);
+      try {
+        const { res, json } = await jsonRequest(handle.baseUrl, 'GET', '/api/jobs/plain-job-bbbb');
+        assert.equal(res.status, 200);
+        const job = json?.job ?? json;
+        assert.equal(job.slug, 'plain-job-bbbb');
+        assertNoSeqEnrichment(job);
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('GET /api/jobs and GET /api/products/:product/jobs attach job.seq when present', async () => {
+    const home = makeTmpHome();
+    try {
+      const withSeqDir = seedProduct(home, 'with-seq');
+      const noSeqDir = seedProduct(home, 'no-seq');
+      const plannedSlug = 'parent-seq-cccc';
+      seedJob(withSeqDir, plannedSlug, {
+        product: 'with-seq',
+        task: 'planned backlog',
+        state: 'done',
+        phase: 'decompose',
+        startedAt: '2026-08-03T00:00:00.000Z',
+        finishedAt: '2026-08-03T01:00:00.000Z',
+        exitCode: 0,
+      });
+      const doc = seedSeq(withSeqDir, plannedSlug, { state: 'planned' });
+      seedJob(noSeqDir, 'lonely-dddd', {
+        product: 'no-seq',
+        task: 'no seq artifact',
+        state: 'running',
+        startedAt: '2026-08-04T00:00:00.000Z',
+        pid: process.pid,
+      });
+
+      const handle = await startTestServe(home);
+      try {
+        const all = await jsonRequest(handle.baseUrl, 'GET', '/api/jobs');
+        assert.equal(all.res.status, 200);
+        const jobs = all.json?.jobs ?? all.json;
+        assert.ok(Array.isArray(jobs));
+        const withSeq = jobs.find((j) => j.slug === plannedSlug);
+        const without = jobs.find((j) => j.slug === 'lonely-dddd');
+        assert.ok(withSeq, 'list must include the decomposed parent');
+        assert.ok(without, 'list must include the plain job');
+        assertSeqPayload(withSeq.seq, doc);
+        assertNoSeqEnrichment(without);
+
+        const productList = await jsonRequest(
+          handle.baseUrl,
+          'GET',
+          '/api/products/with-seq/jobs',
+        );
+        assert.equal(productList.res.status, 200);
+        const productJobs = productList.json?.jobs;
+        assert.ok(Array.isArray(productJobs));
+        const only = productJobs.find((j) => j.slug === plannedSlug);
+        assert.ok(only);
+        assertSeqPayload(only.seq, doc);
+        assert.ok(
+          !productJobs.some((j) => j.slug === 'lonely-dddd'),
+          'product list must stay product-scoped',
+        );
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('GET /api/jobs/:slug returns 500 when seq.json is corrupt (readSeq throws)', async () => {
+    // readSeq uses JSON.parse and throws on invalid JSON; serve's request
+    // catch maps that to 500 — document that behavior (do not silently omit).
+    const home = makeTmpHome();
+    try {
+      const productDir = seedProduct(home, 'bad-seq');
+      const slug = 'corrupt-seq-eeee';
+      seedJob(productDir, slug, {
+        product: 'bad-seq',
+        task: 'has bad seq',
+        state: 'done',
+        finishedAt: '2026-08-02T01:00:00.000Z',
+        exitCode: 0,
+      });
+      const seqDir = path.join(productDir, '.orch', slug);
+      fs.mkdirSync(seqDir, { recursive: true });
+      fs.writeFileSync(path.join(seqDir, 'seq.json'), '{not-json');
+
+      const handle = await startTestServe(home);
+      try {
+        const { res, json } = await jsonRequest(handle.baseUrl, 'GET', `/api/jobs/${slug}`);
+        assert.equal(res.status, 500);
+        assert.ok(json?.error, 'corrupt seq.json should surface as a 500 error body');
       } finally {
         await handle.close();
       }
