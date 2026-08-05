@@ -349,6 +349,34 @@ label {
   color: var(--muted);
 }
 
+.mode-fieldset {
+  margin: 0;
+  padding: 0;
+  border: none;
+}
+
+.mode-fieldset legend {
+  padding: 0;
+  margin-bottom: var(--space-1);
+  font-size: var(--font-body-size);
+  color: var(--muted);
+}
+
+.mode-option {
+  flex-direction: row;
+  align-items: center;
+  gap: var(--space-1);
+  width: auto;
+  cursor: pointer;
+  color: var(--text);
+}
+
+.mode-option input[type='radio'] {
+  width: auto;
+  margin: 0;
+  accent-color: var(--primary);
+}
+
 input,
 textarea {
   width: 100%;

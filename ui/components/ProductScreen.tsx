@@ -4,16 +4,19 @@ import { FormEvent, useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { v4 as uuidv4 } from 'uuid';
 import { api, ApiError } from '@/lib/api';
-import type { Job, Product } from '@/lib/types';
+import type { Job, JobMode, Product } from '@/lib/types';
 
 type Props = {
   productSlug: string;
 };
 
+type RunMode = 'default' | JobMode;
+
 export function ProductScreen({ productSlug }: Props) {
   const [product, setProduct] = useState<Product | null>(null);
   const [jobs, setJobs] = useState<Job[]>([]);
   const [task, setTask] = useState('');
+  const [mode, setMode] = useState<RunMode>('default');
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -45,14 +48,22 @@ export function ProductScreen({ productSlug }: Props) {
     setError(null);
     try {
       const id = uuidv4();
+      const body: { task: string; id: string; mode?: JobMode } = {
+        task: trimmed,
+        id,
+      };
+      if (mode === 'seq' || mode === 'fan-out') {
+        body.mode = mode;
+      }
       await api<{ slug: string; job: Job }>(
         `/api/products/${encodeURIComponent(productSlug)}/jobs`,
         {
           method: 'POST',
-          body: JSON.stringify({ task: trimmed, id }),
+          body: JSON.stringify(body),
         },
       );
       setTask('');
+      setMode('default');
       await load();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'run failed');
@@ -109,6 +120,41 @@ export function ProductScreen({ productSlug }: Props) {
               placeholder="Describe the work…"
             />
           </label>
+          <fieldset className="mode-fieldset">
+            <legend>Mode</legend>
+            <div className="row mode-options" role="radiogroup" aria-label="Run mode">
+              <label className="mode-option">
+                <input
+                  type="radio"
+                  name="mode"
+                  value="default"
+                  checked={mode === 'default'}
+                  onChange={() => setMode('default')}
+                />
+                Default
+              </label>
+              <label className="mode-option">
+                <input
+                  type="radio"
+                  name="mode"
+                  value="seq"
+                  checked={mode === 'seq'}
+                  onChange={() => setMode('seq')}
+                />
+                SEQ
+              </label>
+              <label className="mode-option">
+                <input
+                  type="radio"
+                  name="mode"
+                  value="fan-out"
+                  checked={mode === 'fan-out'}
+                  onChange={() => setMode('fan-out')}
+                />
+                Fan out
+              </label>
+            </div>
+          </fieldset>
           <button type="submit" disabled={busy || !task.trim()}>
             {busy ? 'Starting…' : 'Run'}
           </button>

@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { runFanoutPipeline, cascadeStopFanoutChildren } from '../main.js';
+import { runFanoutPipeline, cascadeStopFanoutChildren, runDetached } from '../main.js';
 import { readFanout, writeFanout, patchWorker, patchIntegration } from '../lib/fanout.js';
 import { jobPaths, readJob, writeJob, patchJob } from '../lib/jobs.js';
 import { allocateJob as realAllocateJob } from '../lib/job-lifecycle.js';
@@ -132,6 +132,12 @@ import { exitCodeForSignal } from '../lib/agent.js';
  * `lib/jobs.js`'s `stopJob` uses. It never touches worktrees. This composes
  * with (does not replace) `lib/agent.js`'s existing `shutdown()` — the
  * coordinator's own SIGINT/SIGHUP/SIGTERM handling calls both.
+ *
+ * `--fan-out --detach` / `runDetached({ fanOut })`: Serve’s tick path starts
+ * jobs via detach. Fan-out must spawn a detached coordinator with `--fan-out`
+ * (optional `--max-workers` / `--max-concurrency`), no `--detach` on the
+ * child, ORCH_JOB_SLUG, role coordinator — not the former in-process
+ * allocate+run short-circuit before the detach branch.
  */
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1217,6 +1223,63 @@ describe('--fan-out CLI flags and guards', () => {
       const { code, stderr } = await runCli(['a trivial task', '--fan-out', flag, '0']);
       assert.notEqual(code, 0);
       assert.match(stderr, /must be a positive integer/);
+    }
+  });
+});
+
+describe('--fan-out --detach', () => {
+  function fakeDetachSpawn(pid) {
+    return mock.fn(() => ({ pid, unref: () => {} }));
+  }
+
+  it('spawns a detached coordinator child with --fan-out (no --detach), ORCH_JOB_SLUG, and role coordinator', async () => {
+    // Serve starts jobs via runDetached; fan-out must not short-circuit to
+    // in-process allocate+run before the detach branch. runDetached({ fanOut })
+    // must forward --fan-out (and optional max-workers / max-concurrency) and
+    // allocate the parent as role:"coordinator" — mirroring --seq --detach.
+    // CLI `--fan-out --detach` must call this same path (not runFanoutPipeline
+    // in-process); pinned here via the injectable spawn seam.
+    const cwd = makeTmpCwd('orch-fanout-detach-spawn-');
+    const spawnMock = fakeDetachSpawn(65433);
+    const exit = mock.fn();
+    const logSpy = mock.method(console, 'log', () => {});
+    try {
+      await runDetached('implement the billing module', {
+        agent: 'claude',
+        maxRounds: 5,
+        fanOut: true,
+        maxWorkers: 6,
+        maxConcurrency: 3,
+        cwd,
+        spawn: spawnMock,
+        exit,
+      });
+
+      assert.equal(spawnMock.mock.calls.length, 1, 'must spawn exactly one detached coordinator child');
+      const [command, args, spawnOptions] = spawnMock.mock.calls[0].arguments;
+      assert.equal(command, process.execPath);
+      assert.ok(args.includes('implement the billing module'));
+      assert.ok(args.includes('--fan-out'), 'child must receive --fan-out so it enters runFanoutPipeline');
+      assert.ok(args.includes('--max-workers'));
+      assert.ok(args.includes('6'));
+      assert.ok(args.includes('--max-concurrency'));
+      assert.ok(args.includes('3'));
+      assert.ok(!args.includes('--detach'), 'child must not receive --detach (would spawn a grandchild)');
+      assert.ok(!args.includes('--seq'));
+
+      assert.equal(spawnOptions.detached, true);
+      assert.equal(spawnOptions.env.ORCH_DETACHED, '1');
+      assert.match(spawnOptions.env.ORCH_JOB_SLUG, /^[a-z]+-[a-z]+-[0-9a-f]{4}$/);
+
+      const slug = spawnOptions.env.ORCH_JOB_SLUG;
+      const record = readJob(cwd, slug);
+      assert.equal(record.role, 'coordinator');
+      assert.equal(record.pid, 65433);
+      assert.equal(record.state, 'running');
+      assert.equal(exit.mock.calls[0].arguments[0], 0);
+    } finally {
+      logSpy.mock.restore();
+      fs.rmSync(cwd, { recursive: true, force: true });
     }
   });
 });
