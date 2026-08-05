@@ -7,6 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runPipeline, runDetached } from '../main.js';
 import { readJob, writeJob, listJobs, patchJob as realPatchJob, checkpointPause as realCheckpointPause } from '../lib/jobs.js';
+import { readAskSession } from '../lib/ask-session.js';
 
 /**
  * Contract this file pins down for the headless-run additions to main.js
@@ -46,6 +47,8 @@ import { readJob, writeJob, listJobs, patchJob as realPatchJob, checkpointPause 
  *   pre-injecting `jobSlug`/`jobCwd` into direct `runPipeline(...)` calls
  *   (as the rest of this file and test/main.test.js do) cannot catch, since
  *   that seam is a no-op if the CLI action never calls the allocator at all.
+ *   For `--ask`, the same slug dir also gets `ask.json` (turns + slug
+ *   metadata) after a successful answer — see unit 01-ask-session.
  */
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -371,6 +374,19 @@ describe('Commander action wiring: job records are universal, not just --detach 
       assert.equal(record.state, 'done');
       assert.equal(record.exitCode, 0);
       assert.ok(record.finishedAt);
+
+      const session = readAskSession(tmpCwd, slug);
+      assert.ok(session, 'successful --ask must persist ask.json under the same slug');
+      assert.equal(session.slug, slug);
+      assert.ok(session.createdAt);
+      assert.ok(session.updatedAt);
+      assert.equal(session.turns.length, 2);
+      assert.equal(session.turns[0].role, 'user');
+      assert.equal(session.turns[0].content, 'where is the CLI entrypoint?');
+      assert.equal(session.turns[1].role, 'assistant');
+      assert.match(session.turns[1].content, /the entrypoint is main\.js/i);
+      assert.doesNotMatch(session.turns[1].content, /<<<SUMMARY>>>/);
+      assert.equal(record.turns, undefined, 'transcript must not be embedded in run.json');
     } finally {
       fs.rmSync(tmpCwd, { recursive: true, force: true });
       fs.rmSync(binDir, { recursive: true, force: true });

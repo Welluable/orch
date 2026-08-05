@@ -44,6 +44,7 @@ import {
     reopenJob,
     buildLastOutcome,
 } from './lib/jobs.js';
+import { recordAskExchange } from './lib/ask-session.js';
 import {
     validateContinue,
     snapshotPriorOutcome,
@@ -845,6 +846,8 @@ export async function runPipeline(prompt, options) {
         try {
             const askResult = await askAgent.run({ verbose });
             if (!askResult.ok) {
+                // Failed asks do not invent assistant turns — leave ask.json
+                // absent/unchanged (only persist after a successful answer).
                 console.error(`Error: ask agent failed`);
                 jobPatch({ state: 'failed', exitCode: 1, finishedAt: new Date().toISOString() });
                 process.exit(1);
@@ -853,6 +856,13 @@ export async function runPipeline(prompt, options) {
             const { content, summary } = splitStageSummary(askResult.result);
             printStageSummary('ask', resolveStageSummary('ask', summary, content));
             console.log(content);
+            if (jobSlug) {
+                recordAskExchange(jobCwd, jobSlug, {
+                    prompt,
+                    answer: content,
+                    agent: options.agent,
+                });
+            }
             jobPatch({ state: 'done', exitCode: 0, finishedAt: new Date().toISOString() });
         } catch (err) {
             console.error(`Error: ${err.message}`);
