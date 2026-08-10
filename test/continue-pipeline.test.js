@@ -4,7 +4,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { runContinuePipeline } from '../main.js';
-import { readJob, writeJob } from '../lib/jobs.js';
+import { readJob, writeJob, reopenJob } from '../lib/jobs.js';
+import { validateContinue, snapshotPriorOutcome } from '../lib/continue.js';
 
 /**
  * Contract this file pins down for `runContinuePipeline` — the net-new
@@ -794,5 +795,107 @@ describe('runContinuePipeline — fan-out worker bookkeeping', () => {
     }
 
     assert.equal(patchWorkerMock.mock.calls.length, 0);
+  });
+});
+
+/**
+ * Issue #11 acceptance bullet: "at least one failure→continue pipeline
+ * smoke" — exercised end-to-end through the real eligibility gate
+ * (`validateContinue`) and the real reopen mechanics (`reopenJob`), not just
+ * `runContinuePipeline` in isolation (every other describe block in this
+ * file already calls `runContinuePipeline` directly with a hand-built
+ * `failed`-shaped `priorOutcome`, which pins the pipeline's own contract but
+ * not the gate that used to refuse this state before issue #11).
+ */
+describe('failed → continue: gate accepts, reopen bumps continuation, pipeline reaches done', () => {
+  it('validateContinue no longer refuses a "failed" complex run; reopenJob + runContinuePipeline carry it to done', async () => {
+    const cwd = makeTmpCwd();
+    const slug = 'quirky-oasis-906b';
+    const branch = `orch/${slug}`;
+    const worktreePath = path.join(path.dirname(cwd), `${path.basename(cwd)}-${slug}`);
+    fs.mkdirSync(worktreePath, { recursive: true });
+
+    writeJob(cwd, slug, {
+      slug,
+      task: 'implement the billing endpoint',
+      agent: 'claude',
+      maxRounds: 5,
+      cwd,
+      pauseRequested: false,
+      branch,
+      worktree: worktreePath,
+      startedAt: '2026-07-27T09:00:00.000Z',
+      finishedAt: '2026-07-27T10:00:00.000Z',
+      exitCode: 1,
+      pid: process.pid,
+      state: 'failed',
+      phase: 'code-loop',
+      stage: 'test-runner',
+      round: 3,
+      role: null,
+      parent: null,
+      workerId: null,
+      lastOutcome: FAILED_PRIOR_OUTCOME,
+    });
+
+    // 1. The gate itself: this used to throw "use: orch resume" pre-#11.
+    const validated = validateContinue(cwd, slug, { task: 'fix the failure and finish' });
+    assert.equal(validated.state, 'failed');
+
+    // 2. Reopen in place: same slug/worktree/branch, continuation bumped,
+    //    prior outcome carried forward.
+    const prior = snapshotPriorOutcome(cwd, slug, validated);
+    const reopened = reopenJob(cwd, slug, {
+      task: 'fix the failure and finish',
+      agent: validated.agent,
+      maxRounds: validated.maxRounds,
+      pid: process.pid,
+      prior,
+    });
+    assert.equal(reopened.continuation, 2);
+    assert.equal(reopened.state, 'running');
+    assert.equal(reopened.phase, 'research');
+    assert.equal(reopened.round, null);
+    // No new job directory / worktree allocated for the reopen.
+    assert.deepEqual(fs.readdirSync(path.join(cwd, '.orch')), [slug]);
+
+    const runContext = fakeRunContext(cwd, slug);
+    seedPriorStatusMd(runContext, slug, branch, worktreePath);
+    const MockAgentClass = createMockAgentClass(continuePassBehaviors());
+
+    const logSpy = mock.method(console, 'log', () => {});
+    try {
+      await runContinuePipeline('fix the failure and finish', {
+        agent: 'claude',
+        AgentClass: MockAgentClass,
+        cwd,
+        slug,
+        worktreePath,
+        branch,
+        continuation: reopened.continuation,
+        priorOutcome: prior,
+        createRunContext: mock.fn(() => runContext),
+        commitWorktree: mock.fn(() => fakeCommitResult(branch)),
+        jobSlug: slug,
+        jobCwd: cwd,
+      });
+    } finally {
+      logSpy.mock.restore();
+    }
+
+    // 3. Loops from round 1 with a fresh max-rounds budget, restarted from
+    //    research, and lands on done — the prior failure carried context but
+    //    did not block or truncate this attempt.
+    const finalRecord = readJob(cwd, slug);
+    assert.equal(finalRecord.state, 'done');
+    assert.equal(finalRecord.exitCode, 0);
+    assert.equal(finalRecord.continuation, 2);
+    assert.ok(finalRecord.lastOutcome);
+    assert.equal(finalRecord.lastOutcome.state, 'done');
+
+    const research = MockAgentClass.instances.find((i) => agentRole(i.name) === 'research');
+    assert.match(research.prompt, /\[Prior run outcome\]/);
+    assert.match(research.prompt, /Prior state: failed/);
+    assert.match(research.prompt, /Error: test-runner failed; stopping before commit/);
   });
 });

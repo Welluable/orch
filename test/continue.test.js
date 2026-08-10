@@ -19,11 +19,9 @@ const mainPath = path.join(__dirname, '..', 'main.js');
 /**
  * Contract this file pins down for `orch continue` per `.spec/continue.md`
  * (decisions 1–18, "Eligibility and validation", "Job record", and
- * "Prior-outcome injection") and `.orch/sunny-oasis-a761/task.md` sections
- * 2, 4, 5, 8. None of `lib/continue.js`, the `orch continue` Commander
- * subcommand, or `formatStatus`'s `lastOutcome` block exist yet as of this
- * test-writing round — this describes the contract the next implementation
- * round must satisfy.
+ * "Prior-outcome injection"), `.orch/sunny-oasis-a761/task.md` sections
+ * 2, 4, 5, 8, and issue #11 ("allow orch continue on failed/stopped/crashed
+ * jobs for exhausted-loop recovery").
  *
  * ## lib/continue.js
  *
@@ -40,14 +38,18 @@ const mainPath = path.join(__dirname, '..', 'main.js');
  *     2. `--ask` passed          -> mentions `--ask`
  *     3. `--quick` passed        -> mentions `--quick`
  *     4. empty/whitespace task   -> `task cannot be empty`
- *     5. non-terminal state      -> `cannot continue <slug> while state is
- *                                    <state>; use orch resume / orch stop`
- *     6. role: coordinator       -> `cannot continue coordinator <slug>;
+ *     5. role: coordinator       -> `cannot continue coordinator <slug>;
  *                                    continue each failed worker slug, then
- *                                    orch --integrate <slug>`
- *     7. role: integration       -> `cannot continue integration <slug>;
+ *                                    orch --integrate <slug>` (regardless of
+ *                                    terminal state — coordinators are
+ *                                    always refused)
+ *     6. role: integration       -> `cannot continue integration <slug>;
  *                                    use orch --integrate <parent-slug>`
- *                                    (parent-slug = record.parent)
+ *                                    (parent-slug = record.parent; also
+ *                                    regardless of terminal state)
+ *     7. non-terminal/live state
+ *        (running/paused/pausing) -> `cannot continue <slug> while state is
+ *                                    <state>; use orch resume / orch stop`
  *     8. missing worktree/branch -> `<slug> has no worktree; continue only
  *                                    applies to complex runs` (this is also
  *                                    what a skipped/never-started worker
@@ -56,6 +58,14 @@ const mainPath = path.join(__dirname, '..', 'main.js');
  *                                    cannot continue <slug>`
  *   `role` missing/null and `role: "worker"` are otherwise treated the same
  *   as an ordinary complex slug.
+ *
+ *   Per issue #11, `done`, `failed`, `stopped`, and `crashed` are ALL
+ *   eligible terminal states (same worktree/branch constraints apply
+ *   uniformly to all four) — continue is no longer done-only. `orch resume`
+ *   remains the way to re-enter the exact failed stage in place; continue on
+ *   a failure terminal instead restarts the pipeline from research with a
+ *   fresh round-1 budget, on the same slug/worktree/branch, carrying the
+ *   prior outcome (including its `error`) into the research/planner prompt.
  *
  * - `snapshotPriorOutcome(cwd, slug, record)` — returns `record.lastOutcome`
  *   verbatim when present; otherwise synthesizes a fallback object with
@@ -233,7 +243,7 @@ describe('validateContinue — eligibility gate', () => {
     });
   }
 
-  for (const state of ['done']) {
+  for (const state of ['done', 'failed', 'stopped', 'crashed']) {
     it(`accepts terminal state "${state}" with a worktree present on disk`, () => {
       const cwd = makeTmpCwd();
       const { slug, record } = seedEligibleJob(cwd, { state });
@@ -245,48 +255,27 @@ describe('validateContinue — eligibility gate', () => {
     });
   }
 
-  for (const state of ['failed', 'stopped', 'crashed']) {
-    it(`refuses terminal failure "${state}" with a resume hint`, () => {
+  for (const state of ['done', 'failed', 'stopped', 'crashed']) {
+    it(`refuses "${state}" when record.worktree/record.branch are unset (e.g. --ask or triage->quick-fix runs)`, () => {
       const cwd = makeTmpCwd();
-      const { slug, record } = seedEligibleJob(cwd, { state });
+      const { slug } = seedEligibleJob(cwd, { state, worktree: null, branch: null });
       assert.throws(
         () => validateContinue(cwd, slug, { task: 'keep going' }),
-        new RegExp(`${slug} is ${state} at ${record.phase}/${record.stage}`),
+        new RegExp(`${slug} has no worktree; continue only applies to complex runs`),
       );
-      assert.match(
-        (() => {
-          try {
-            validateContinue(cwd, slug, { task: 'keep going' });
-            return '';
-          } catch (err) {
-            return err.message;
-          }
-        })(),
-        new RegExp(`use: orch resume ${slug}`),
+    });
+
+    it(`refuses "${state}" when the worktree directory no longer exists on disk, without recreating it`, () => {
+      const cwd = makeTmpCwd();
+      const missingPath = path.join(os.tmpdir(), `orch-continue-missing-worktree-${state}-does-not-exist`);
+      const { slug } = seedEligibleJob(cwd, { state, worktree: missingPath });
+      assert.throws(
+        () => validateContinue(cwd, slug, { task: 'keep going' }),
+        new RegExp(`worktree missing at ${missingPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}; cannot continue ${slug}`),
       );
-      assert.deepEqual(readJob(cwd, slug), record);
+      assert.equal(fs.existsSync(missingPath), false);
     });
   }
-
-  it('refuses when record.worktree/record.branch are unset (e.g. --ask or triage->quick-fix runs)', () => {
-    const cwd = makeTmpCwd();
-    const { slug } = seedEligibleJob(cwd, { state: 'done', worktree: null, branch: null });
-    assert.throws(
-      () => validateContinue(cwd, slug, { task: 'keep going' }),
-      new RegExp(`${slug} has no worktree; continue only applies to complex runs`),
-    );
-  });
-
-  it('refuses when the worktree directory no longer exists on disk, without recreating it', () => {
-    const cwd = makeTmpCwd();
-    const missingPath = path.join(os.tmpdir(), 'orch-continue-missing-worktree-does-not-exist');
-    const { slug } = seedEligibleJob(cwd, { state: 'done', worktree: missingPath });
-    assert.throws(
-      () => validateContinue(cwd, slug, { task: 'keep going' }),
-      new RegExp(`worktree missing at ${missingPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}; cannot continue ${slug}`),
-    );
-    assert.equal(fs.existsSync(missingPath), false);
-  });
 
   it('refuses role:"coordinator" pointing at worker-continue + --integrate', () => {
     const cwd = makeTmpCwd();
@@ -297,9 +286,27 @@ describe('validateContinue — eligibility gate', () => {
     );
   });
 
+  it('refuses role:"coordinator" even when the coordinator itself is a failure terminal', () => {
+    const cwd = makeTmpCwd();
+    const { slug } = seedEligibleJob(cwd, { state: 'failed', role: 'coordinator' });
+    assert.throws(
+      () => validateContinue(cwd, slug, { task: 'keep going' }),
+      new RegExp(`cannot continue coordinator ${slug}; continue each failed worker slug, then orch --integrate ${slug}`),
+    );
+  });
+
   it('refuses role:"integration" pointing at --integrate <parent>', () => {
     const cwd = makeTmpCwd();
     const { slug } = seedEligibleJob(cwd, { state: 'done', role: 'integration', parent: 'wise-pine-e904' });
+    assert.throws(
+      () => validateContinue(cwd, slug, { task: 'keep going' }),
+      /cannot continue integration .*; use orch --integrate wise-pine-e904/,
+    );
+  });
+
+  it('refuses role:"integration" even when the integration job itself is a failure terminal', () => {
+    const cwd = makeTmpCwd();
+    const { slug } = seedEligibleJob(cwd, { state: 'crashed', role: 'integration', parent: 'wise-pine-e904' });
     assert.throws(
       () => validateContinue(cwd, slug, { task: 'keep going' }),
       /cannot continue integration .*; use orch --integrate wise-pine-e904/,
@@ -329,7 +336,7 @@ describe('validateContinue — eligibility gate', () => {
     );
   });
 
-  it('reconciles a dead-pid "running" record to crashed first, then refuses with resume hint', async () => {
+  it('reconciles a dead-pid "running" record to crashed first, then accepts it (crashed is continue-eligible)', async () => {
     const cwd = makeTmpCwd();
     const { spawn: nodeSpawn } = await import('node:child_process');
     const child = nodeSpawn(process.execPath, ['-e', 'process.exit(0)']);
@@ -337,10 +344,10 @@ describe('validateContinue — eligibility gate', () => {
     await new Promise((resolve) => child.on('close', resolve));
 
     const { slug } = seedEligibleJob(cwd, { state: 'running', pid: deadPid, finishedAt: null, exitCode: null, lastOutcome: null });
-    assert.throws(
-      () => validateContinue(cwd, slug, { task: 'keep going' }),
-      /use: orch resume/,
-    );
+    const result = validateContinue(cwd, slug, { task: 'keep going' });
+    assert.equal(result.state, 'crashed');
+    // reconcileJob's dead-pid rewrite is the only mutation continue causes
+    // via validation — the gate itself stays read-only beyond that.
     assert.equal(readJob(cwd, slug).state, 'crashed');
   });
 });
@@ -374,6 +381,38 @@ describe('snapshotPriorOutcome', () => {
     // No status.md written for this slug at all.
     const prior = snapshotPriorOutcome(cwd, slug, record);
     assert.equal(prior.summary, '');
+  });
+
+  it('surfaces a failure terminal\'s error field end-to-end into the [Prior run outcome] block', () => {
+    const cwd = makeTmpCwd();
+    const { slug, record } = seedEligibleJob(cwd, {
+      state: 'failed',
+      exitCode: 1,
+      lastOutcome: {
+        state: 'failed',
+        phase: 'code-loop',
+        stage: 'test-runner',
+        round: 3,
+        exitCode: 1,
+        finishedAt: new Date().toISOString(),
+        task: 'do the thing',
+        summary: 'tests failed on round 3',
+        error: 'test-runner failed; stopping before commit',
+      },
+    });
+    const prior = snapshotPriorOutcome(cwd, slug, record);
+    assert.equal(prior.error, 'test-runner failed; stopping before commit');
+
+    const text = buildPriorOutcomeText(prior, {
+      slug,
+      continuation: 2,
+      worktreePath: record.worktree,
+      branch: record.branch,
+    });
+    assert.match(text, /- Error: test-runner failed; stopping before commit/);
+    assert.match(text, /Prior phase: code-loop/);
+    assert.match(text, /Prior stage: test-runner/);
+    assert.match(text, /Prior round: 3/);
   });
 
   it('still emits a usable snapshot when the prior terminal state was "done" (not failure-only)', () => {
@@ -505,6 +544,16 @@ describe('orch continue — CLI eligibility wiring', () => {
     assert.equal(code, 0);
     assert.deepEqual(readJob(cwd, slug), before);
   });
+
+  for (const state of ['failed', 'stopped', 'crashed']) {
+    it(`--dry-run on a "${state}" complex run exits 0 (no longer refused; issue #11) and leaves run.json unchanged`, async () => {
+      const cwd = makeTmpCwd();
+      const { slug, record: before } = seedEligibleJob(cwd, { state });
+      const { code, stderr } = await runCli(['continue', slug, 'keep going', '--dry-run', '--agent', 'claude'], { cwd });
+      assert.equal(code, 0, stderr);
+      assert.deepEqual(readJob(cwd, slug), before);
+    });
+  }
 
   it('refuses role:"coordinator" and role:"integration" via the CLI with role-specific hints', async () => {
     const cwd = makeTmpCwd();

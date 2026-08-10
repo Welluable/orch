@@ -267,14 +267,14 @@ function lastNonEmptyLine(content) {
     return lines[lines.length - 1];
 }
 
-/** Status / list `next:` hint per `.spec/resume.md` decision 28. */
+/** Status / list `next:` hint. */
 function nextHintForRecord(record) {
     if (!record) return null;
     if (record.state === 'paused' || record.state === 'pausing') {
         return `orch resume ${record.slug}`;
     }
     if (record.state === 'failed' || record.state === 'stopped' || record.state === 'crashed') {
-        return `orch resume ${record.slug}`;
+        return `orch resume ${record.slug}  (or: orch continue ${record.slug} "<follow-up>" for a fresh attempt)`;
     }
     if (record.state === 'done') {
         return `orch continue ${record.slug} "<follow-up>"`;
@@ -1640,7 +1640,8 @@ export async function runContinueDetached(slug, prompt, options = {}) {
 
 /**
  * Failure-resume pipeline: recover → re-enter unfinished stage → remaining phases.
- * Distinct from `runContinuePipeline` (new-task continue). See `.spec/resume.md`.
+ * Distinct from `runContinuePipeline`, which starts a fresh attempt with a new
+ * task prompt from research (also available for failed/stopped/crashed runs).
  */
 export async function runResumePipeline(options = {}) {
     const verbose = Boolean(options.verbose);
@@ -5124,7 +5125,7 @@ Headless runs:
   $ orch pause <slug>                                  # request a pause at the next stage boundary
   $ orch resume <slug>                                 # unpause live pause, or recover failed/stopped/crashed
   $ orch resume <slug> --detach                        # recover a failed/stopped/crashed job in the background
-  $ orch continue <slug> "new task"                    # new work on a done run's worktree
+  $ orch continue <slug> "new task"                    # new work on a done, failed, stopped, or crashed run's worktree
                                                        # (workers: same command; then re-integrate the parent)
   $ orch continue <slug> "new task" --detach           # same, backgrounded under the same slug
   $ orch stop <slug>                                   # send SIGTERM to a running job
@@ -5595,7 +5596,7 @@ program
 program
     .command('continue')
     .description(
-        'Start new complex work on a done run\'s existing worktree (not crash recovery — use orch resume for failed/stopped/crashed). Workers: continue the worker slug, then re-integrate the parent',
+        'Start a fresh attempt with a new task prompt on a complex run\'s existing worktree — accepts done, failed, stopped, or crashed (exhausted-loop recovery; use orch resume instead to re-enter the exact failed stage in place). Workers: continue the worker slug, then re-integrate the parent',
     )
     .argument('<slug>', 'Existing run slug under .orch/')
     .argument('<task...>', 'New task prompt for this continue iteration')

@@ -195,7 +195,7 @@ Three distinct “from / continue” mechanisms (do not conflate them):
 
 | Mechanism | Purpose | Artifact |
 | --- | --- | --- |
-| `orch continue <slug> "new task"` | New **write** pipeline on a **done** worktree (same slug) | Prior run worktree / `run.json` |
+| `orch continue <slug> "new task"` | New **write** pipeline on a **done**, **failed**, **stopped**, or **crashed** worktree (same slug) | Prior run worktree / `run.json` |
 | `orch --seq --from <slug>` | Run a planned seq backlog (no task prompt; from file) | `seq.json` |
 | `orch --ask --from <slug> "…"` | Same-session **read-only** ask follow-up | `ask.json` |
 
@@ -319,10 +319,15 @@ Job-control subcommands (see [Headless runs](#headless-runs)):
   reentry; see failure resume). Not the same as continue. `--detach`
   backgrounds failure resume under the same slug.
 - `orch continue <slug> "new task"` — starts a new complex pipeline on a
-  **done** run's existing worktree/branch (same slug). Carries prior outcome
-  into research/plan. For crash recovery use `orch resume` instead. For fan-out
-  workers that finished, continue the worker slug, then `orch --integrate <parent>`.
-  `--detach` backgrounds the continue under the same slug.
+  **done**, **failed**, **stopped**, or **crashed** run's existing
+  worktree/branch (same slug; no new worktree). Carries prior outcome
+  (including failure phase/stage/round/error for failure terminals) into
+  research/plan. Resume and continue serve different recovery needs on a
+  failed/stopped/crashed run: `orch resume` re-enters the exact failed stage
+  in place, while `orch continue` starts a fresh attempt from research with a
+  new task prompt on the same worktree. For fan-out workers that finished,
+  continue the worker slug, then `orch --integrate <parent>`. `--detach`
+  backgrounds the continue under the same slug.
 - `orch stop <slug>` — sends `SIGTERM` to a running job (or reconciles a dead
   one to `crashed`).
 - `orch logs <slug> [-f]` — prints a run's `orch.log`; `-f` follows it until

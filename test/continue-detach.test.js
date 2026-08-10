@@ -194,6 +194,46 @@ describe('runContinueDetached — reopen + spawn wiring', () => {
     assert.equal(record.pid, 54321);
   });
 
+  it('reopens a "failed" job the same way (issue #11: --detach continue is no longer done-only)', async () => {
+    const cwd = makeTmpCwd();
+    const { slug } = seedEligibleContinueJob(cwd, {
+      state: 'failed',
+      exitCode: 1,
+      lastOutcome: {
+        state: 'failed',
+        phase: 'code-loop',
+        stage: 'test-runner',
+        round: 3,
+        exitCode: 1,
+        finishedAt: new Date().toISOString(),
+        task: 'do the thing',
+        summary: 'tests failed on round 3',
+        error: 'test-runner failed; stopping before commit',
+      },
+    });
+    const spawnMock = fakeSpawn(54325);
+    const exitMock = mock.fn();
+    const logSpy = mock.method(console, 'log', () => {});
+    try {
+      await runContinueDetached(slug, 'fix the failure and finish', {
+        agent: 'claude',
+        maxRounds: 5,
+        cwd,
+        spawn: spawnMock,
+        exit: exitMock,
+      });
+    } finally {
+      logSpy.mock.restore();
+    }
+
+    assert.equal(spawnMock.mock.calls.length, 1);
+    const record = readJob(cwd, slug);
+    assert.equal(record.state, 'running');
+    assert.equal(record.continuation, 2);
+    assert.equal(record.pid, 54325);
+    assert.equal(exitMock.mock.calls.some((c) => c.arguments[0] === 1), false);
+  });
+
   it('spawns a re-invocation of `continue <slug> <task>` with --detach stripped and ORCH_JOB_SLUG/ORCH_DETACHED set', async () => {
     const cwd = makeTmpCwd();
     const { slug } = seedEligibleContinueJob(cwd);

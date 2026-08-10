@@ -320,6 +320,16 @@ describe('formatStatus — next hints', () => {
     assert.match(out, new RegExp(`next:\\s+orch resume ${slug}`));
   });
 
+  for (const state of ['failed', 'stopped', 'crashed']) {
+    it(`terminal failure (${state}) → next hint still leads with "orch resume <slug>" but also mentions "orch continue <slug>" as the exhausted-loop-recovery alternative (issue #11)`, () => {
+      const cwd = makeTmpCwd();
+      const { slug, record } = seedStoppedJob(cwd, { state });
+      const out = formatStatus(cwd, record);
+      assert.match(out, new RegExp(`next:\\s+orch resume ${slug}`));
+      assert.match(out, new RegExp(`orch continue ${slug}`));
+    });
+  }
+
   it('done → next: orch continue', () => {
     const cwd = makeTmpCwd();
     const { slug, record } = seedStoppedJob(cwd, { state: 'done', exitCode: 0 });
@@ -474,12 +484,12 @@ describe('runResumePipeline — reentry without research', () => {
 });
 
 describe('orch resume CLI', () => {
-  it('continue on stopped refuses with resume hint', async () => {
+  it('continue on stopped is accepted (issue #11: no longer refused with a resume-only hint)', async () => {
     const cwd = makeTmpCwd();
-    const { slug } = seedStoppedJob(cwd);
-    const { code, stderr } = await runCli(['continue', slug, 'same task again'], { cwd });
-    assert.notEqual(code, 0);
-    assert.match(stderr, /use: orch resume/);
+    const { slug, record: before } = seedStoppedJob(cwd);
+    const { code, stderr } = await runCli(['continue', slug, 'same task again', '--dry-run', '--agent', 'claude'], { cwd });
+    assert.equal(code, 0, stderr);
+    assert.deepEqual(readJob(cwd, slug), before);
   });
 
   it('resume --dry-run on stopped exits 0 without reopen', async () => {

@@ -279,6 +279,24 @@ describe('worker continue — CLI role gate + acceptance', () => {
     assert.deepEqual(readJob(cwd, workerSlug), before);
   });
 
+  it('accepts a terminal, worktree-backed role:"worker" slug that is "failed" (issue #11: worker continue is no longer done-only)', async () => {
+    const cwd = makeTmpCwd();
+    const doc = baseFanout();
+    writeFanout(cwd, doc.parentSlug, doc);
+    const workerSlug = 'merry-elk-r4b1';
+    // seedWorkerJob defaults to state: 'failed' with a real worktree on disk.
+    seedWorkerJob(cwd, workerSlug);
+    const before = readJob(cwd, workerSlug);
+
+    const { code, stderr } = await runCli(
+      ['continue', workerSlug, 'fix the failing invoice tests and finish', '--dry-run', '--agent', 'claude'],
+      { cwd },
+    );
+
+    assert.equal(code, 0, stderr);
+    assert.deepEqual(readJob(cwd, workerSlug), before);
+  });
+
   it('refuses a skipped worker (no worktree ever allocated) with the no-worktree error when state is done, and does not create one', async () => {
     const cwd = makeTmpCwd();
     const doc = baseFanout();
