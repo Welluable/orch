@@ -67,8 +67,12 @@ import { writeConfig, localConfigPath } from '../lib/config.js';
  *   commit (`git commit`, no `-m`, accepting the staged merge message)).
  * - Never invokes triage, research, planner, test-writer, or test-critic.
  * - Worktree: reused when `<cwd>-<parentSlug>` already exists on disk and is
- *   checked out on `orch/<parentSlug>` (no `reset`/`clean`); otherwise
- *   created via `createWorktree({ cwd, slug: parentSlug, base: fanout.base })`.
+ *   checked out on the stored parent/integrate `run.json.branch` or
+ *   `fanout.integration.branch`, else
+ *   `${resolveBranchPrefix({ cwd })}/<parentSlug>` when that name is still
+ *   unset (never a hardcoded `orch/<parentSlug>`; no `reset`/`clean`);
+ *   otherwise created via
+ *   `createWorktree({ cwd, slug: parentSlug, base: fanout.base })`.
  * - Merges `fanout.integration.candidates` in the given order (no
  *   reordering), skipping branches already in `fanout.integration.merged`,
  *   via `mergeBranches`. On a clean merge, appends the branch to
@@ -84,7 +88,7 @@ import { writeConfig, localConfigPath } from '../lib/config.js';
  *   `code-writer` only on failure, alternating up to `--max-rounds`; never
  *   `test-writer`/`test-critic`.
  * - On verify success: `commitWorktree({ worktreePath, branch:
- *   'orch/<parentSlug>', message: 'orch: <parentSlug> <first line of
+ *   worktree.branch, message: 'orch: <parentSlug> <first line of
  *   fanout.task>' })`, then `patchIntegration(cwd, parentSlug, {
  *   state:'done', sha, merged, skipped })`.
  * - On verify exhaustion: `patchIntegration(..., { state:'failed', merged,
@@ -631,7 +635,10 @@ describe('runIntegratePipeline (--integrate driver)', () => {
     const doc = baseFanout();
     writeFanout(cwd, doc.parentSlug, doc);
     const integrationSlug = 'tidy-heron-m2p9';
-    const worktree = fakeWorktree(cwd, doc.parentSlug);
+    const worktree = {
+      ...fakeWorktree(cwd, doc.parentSlug),
+      branch: `${prefix}/${doc.parentSlug}`,
+    };
 
     const { execFile, calls } = makeFakeExecFile([
       { match: (args) => args.includes('merge') && !args.includes('--abort'), stdout: 'Merge made by the ort strategy.' },
@@ -639,6 +646,7 @@ describe('runIntegratePipeline (--integrate driver)', () => {
 
     const MockAgentClass = createMockAgentClass({ 'test-runner': PASS_RUNNER });
     const createWorktreeMock = mock.fn(() => worktree);
+    const commitWorktreeMock = mock.fn(() => fakeCommitResult(worktree.branch));
 
     const logSpy = mock.method(console, 'log', () => {});
     try {
@@ -651,7 +659,7 @@ describe('runIntegratePipeline (--integrate driver)', () => {
         jobCwd: cwd,
         execFile,
         createWorktree: createWorktreeMock,
-        commitWorktree: mock.fn(() => fakeCommitResult(`orch/${doc.parentSlug}`)),
+        commitWorktree: commitWorktreeMock,
       });
     } finally {
       logSpy.mock.restore();
@@ -665,6 +673,12 @@ describe('runIntegratePipeline (--integrate driver)', () => {
     assert.equal(createWorktreeMock.mock.calls[0].arguments[0].slug, doc.parentSlug);
     assert.equal(createWorktreeMock.mock.calls[0].arguments[0].base, doc.base);
     assert.equal(createWorktreeMock.mock.calls[0].arguments[0].branchPrefix, prefix);
+    assert.equal(commitWorktreeMock.mock.calls.length, 1);
+    assert.equal(
+      commitWorktreeMock.mock.calls[0].arguments[0].branch,
+      worktree.branch,
+      'commitWorktree must use worktree.branch, not a hardcoded orch/<parentSlug>',
+    );
 
     const integrationMdPath = path.join(cwd, '.orch', integrationSlug, 'integration.md');
     assert.ok(fs.existsSync(integrationMdPath), 'expected integration.md to be written');
@@ -807,6 +821,99 @@ describe('runIntegratePipeline (--integrate driver)', () => {
     );
     assert.ok(mergeCalls.some((c) => c.args.includes('orch/merry-elk-r4b1')));
     assert.ok(mergeCalls.some((c) => c.args.includes('orch/wise-owl-k1a8')));
+  });
+
+  it('reuses an existing worktree when HEAD matches the derived prefix/parentSlug — not a hardcoded orch/<parentSlug>', async () => {
+    const cwd = makeTmpCwd('orch-integrate-reuse-derived-');
+    const prefix = pinLocalBranchPrefix(cwd);
+    const doc = baseFanout({
+      integration: {
+        slug: null, pid: null, branch: null, worktree: `${cwd}-wise-pine-e904`,
+        candidates: ['orch/rapid-fox-x7q2', 'orch/merry-elk-r4b1'],
+        merged: [], skipped: [], overlappingFiles: [], state: 'merging', sha: null,
+      },
+    });
+    writeFanout(cwd, doc.parentSlug, doc);
+    fs.mkdirSync(`${cwd}-${doc.parentSlug}`, { recursive: true });
+
+    const { execFile } = makeFakeExecFile([
+      { match: (args) => args.includes('rev-parse') && args.includes('--abbrev-ref'), stdout: `${prefix}/${doc.parentSlug}\n` },
+      { match: (args) => args.includes('merge') && !args.includes('--abort'), stdout: 'Merge made by the ort strategy.' },
+    ]);
+
+    const createWorktreeMock = mock.fn(() => ({
+      worktreePath: path.join(cwd, 'created'),
+      branch: `${prefix}/${doc.parentSlug}`,
+    }));
+    const commitWorktreeMock = mock.fn((opts) => fakeCommitResult(opts.branch));
+    const MockAgentClass = createMockAgentClass({ 'test-runner': PASS_RUNNER });
+
+    const logSpy = mock.method(console, 'log', () => {});
+    try {
+      await runIntegratePipeline({
+        agent: 'claude',
+        AgentClass: MockAgentClass,
+        cwd,
+        parentSlug: doc.parentSlug,
+        jobSlug: 'tidy-heron-m2p9',
+        jobCwd: cwd,
+        execFile,
+        createWorktree: createWorktreeMock,
+        commitWorktree: commitWorktreeMock,
+      });
+    } finally {
+      logSpy.mock.restore();
+    }
+
+    assert.equal(createWorktreeMock.mock.calls.length, 0, 'must reuse when HEAD matches derived prefix/parentSlug');
+    assert.equal(commitWorktreeMock.mock.calls[0].arguments[0].branch, `${prefix}/${doc.parentSlug}`);
+  });
+
+  it('reuses an existing worktree when HEAD matches fanout.integration.branch, even if that differs from the pinned prefix', async () => {
+    const cwd = makeTmpCwd('orch-integrate-reuse-stored-');
+    pinLocalBranchPrefix(cwd);
+    const storedBranch = 'team_session/wise-pine-e904';
+    const doc = baseFanout({
+      integration: {
+        slug: null, pid: null, branch: storedBranch, worktree: `${cwd}-wise-pine-e904`,
+        candidates: ['orch/rapid-fox-x7q2', 'orch/merry-elk-r4b1'],
+        merged: [], skipped: [], overlappingFiles: [], state: 'merging', sha: null,
+      },
+    });
+    writeFanout(cwd, doc.parentSlug, doc);
+    fs.mkdirSync(`${cwd}-${doc.parentSlug}`, { recursive: true });
+
+    const { execFile } = makeFakeExecFile([
+      { match: (args) => args.includes('rev-parse') && args.includes('--abbrev-ref'), stdout: `${storedBranch}\n` },
+      { match: (args) => args.includes('merge') && !args.includes('--abort'), stdout: 'Merge made by the ort strategy.' },
+    ]);
+
+    const createWorktreeMock = mock.fn(() => ({
+      worktreePath: path.join(cwd, 'created'),
+      branch: storedBranch,
+    }));
+    const commitWorktreeMock = mock.fn((opts) => fakeCommitResult(opts.branch));
+    const MockAgentClass = createMockAgentClass({ 'test-runner': PASS_RUNNER });
+
+    const logSpy = mock.method(console, 'log', () => {});
+    try {
+      await runIntegratePipeline({
+        agent: 'claude',
+        AgentClass: MockAgentClass,
+        cwd,
+        parentSlug: doc.parentSlug,
+        jobSlug: 'tidy-heron-m2p9',
+        jobCwd: cwd,
+        execFile,
+        createWorktree: createWorktreeMock,
+        commitWorktree: commitWorktreeMock,
+      });
+    } finally {
+      logSpy.mock.restore();
+    }
+
+    assert.equal(createWorktreeMock.mock.calls.length, 0, 'must reuse when HEAD matches stored integration.branch');
+    assert.equal(commitWorktreeMock.mock.calls[0].arguments[0].branch, storedBranch);
   });
 
   it('on a conflicted merge, invokes the integrator agent exactly once with the conflicted paths; clears markers → completes the merge and records it merged', async () => {

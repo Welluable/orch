@@ -7,6 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runUnitPipeline, mergeOneUnit } from '../main.js';
 import { readSeq, writeSeq } from '../lib/seq.js';
+import { writeJob } from '../lib/jobs.js';
 import { allocateJob } from '../lib/job-lifecycle.js';
 import { writeConfig, localConfigPath } from '../lib/config.js';
 
@@ -43,8 +44,10 @@ import { writeConfig, localConfigPath } from '../lib/config.js';
  * `maxRounds`, `jobSlug`, `jobCwd`, `createWorktree`, `commitWorktree`,
  * `mergeBranches` / `abortMerge` / `conflictedFiles` / `hasConflictMarkers`,
  * `readSeq` / `patchUnit` / `patchTip`, `execFile`, `exit`.
- * - Reuses/creates integration worktree `orch/<parentSlug>` at `seq.base`
- *   (first time) / current tip thereafter — no reset of prior merges.
+ * - Reuses/creates the integration worktree at the stored parent
+ *   `run.json.branch`, or `${resolveBranchPrefix({ cwd })}/<parentSlug>` when
+ *   that name is still unset — at `seq.base` (first time) / current tip
+ *   thereafter. Never a hardcoded `orch/<parentSlug>`. No reset of prior merges.
  * - Merges the single `unitBranch` via orch-owned `mergeBranches`.
  * - On conflict: integrator once; markers cleared → complete merge commit;
  *   markers remain → mark unit `failed`, exit non-zero (stop-the-chain).
@@ -166,6 +169,29 @@ function fakeRunContext(cwd, slug) {
     taskPath: path.join(artifactDir, 'task.md'),
     statusPath: path.join(artifactDir, 'status.md'),
   };
+}
+
+function seedParentJob(cwd, slug, overrides = {}) {
+  writeJob(cwd, slug, {
+    slug,
+    task: 'implement the billing module',
+    agent: 'claude',
+    maxRounds: 5,
+    cwd,
+    pauseRequested: false,
+    branch: null,
+    worktree: null,
+    startedAt: new Date(0).toISOString(),
+    finishedAt: null,
+    exitCode: null,
+    logPath: path.join(cwd, '.orch', slug, 'orch.log'),
+    pid: process.pid,
+    state: 'running',
+    parent: null,
+    role: 'coordinator',
+    workerId: null,
+    ...overrides,
+  });
 }
 
 describe('runUnitPipeline — stage order and seq.json patches', () => {
@@ -369,6 +395,170 @@ describe('mergeOneUnit — merge then tip advance; failure marks failed', () => 
     assert.notEqual(unit.state, 'merge_failed');
     assert.ok(exit.mock.calls.length >= 1);
     assert.equal(exit.mock.calls[0].arguments[0], 1);
+  });
+
+  it('reuses an existing worktree when HEAD matches the derived prefix/parentSlug — not a hardcoded orch/<parentSlug>', async () => {
+    const cwd = makeTmpCwd('orch-seq-merge-reuse-derived-');
+    const prefix = pinLocalBranchPrefix(cwd);
+    const parentSlug = 'wise-pine-e904';
+    const expectedBranch = `${prefix}/${parentSlug}`;
+    const tipBefore = 'tipbbbbb00001111222233334444555566667777';
+    const tipAfter = 'tipccccc00001111222233334444555566667777';
+    const reusePath = `${cwd}-${parentSlug}`;
+    fs.mkdirSync(reusePath, { recursive: true });
+    seedParentJob(cwd, parentSlug, { branch: null });
+    writeSeq(cwd, parentSlug, baseSeq({
+      tip: tipBefore,
+      units: [
+        baseUnit({ id: '01-types', state: 'done', slug: 'rapid-fox-x7q2', sha: 'unitsha1', changedFiles: [] }),
+      ],
+    }));
+
+    const AgentClass = createMockAgentClass({
+      'test-runner': { ok: true, result: withSummary(JSON.stringify({ passed: true, summary: 'green' }), 'runner ok') },
+    });
+    const createWorktreeCalls = [];
+    const exit = mock.fn();
+
+    await mergeOneUnit({
+      cwd,
+      parentSlug,
+      unitId: '01-types',
+      unitBranch: 'orch/rapid-fox-x7q2',
+      agent: 'claude',
+      AgentClass,
+      jobSlug: parentSlug,
+      jobCwd: cwd,
+      createWorktree: async (opts) => {
+        createWorktreeCalls.push(opts);
+        return { worktreePath: path.join(cwd, `.orch-wt-${opts.slug}`), branch: `${prefix}/${opts.slug}` };
+      },
+      mergeBranches: async () => ({ merged: ['orch/rapid-fox-x7q2'], conflicts: [] }),
+      conflictedFiles: () => [],
+      hasConflictMarkers: () => false,
+      abortMerge: () => {},
+      commitWorktree: async () => ({ sha: tipAfter }),
+      execFile: (cmd, args) => {
+        if (args?.includes('--abbrev-ref')) return `${expectedBranch}\n`;
+        if (args?.includes('rev-parse')) return `${tipAfter}\n`;
+        return '';
+      },
+      log: () => {},
+      exit,
+    });
+
+    assert.equal(createWorktreeCalls.length, 0, 'must reuse when HEAD matches derived prefix/parentSlug');
+    assert.equal(readSeq(cwd, parentSlug).tip, tipAfter);
+  });
+
+  it('reuses an existing worktree when HEAD matches stored parent run.json.branch, even if that differs from the pinned prefix', async () => {
+    const cwd = makeTmpCwd('orch-seq-merge-reuse-stored-');
+    pinLocalBranchPrefix(cwd);
+    const parentSlug = 'wise-pine-e904';
+    const storedBranch = `team_session/${parentSlug}`;
+    const tipBefore = 'tipbbbbb00001111222233334444555566667777';
+    const tipAfter = 'tipccccc00001111222233334444555566667777';
+    const reusePath = `${cwd}-${parentSlug}`;
+    fs.mkdirSync(reusePath, { recursive: true });
+    seedParentJob(cwd, parentSlug, { branch: storedBranch, worktree: reusePath });
+    writeSeq(cwd, parentSlug, baseSeq({
+      tip: tipBefore,
+      units: [
+        baseUnit({ id: '01-types', state: 'done', slug: 'rapid-fox-x7q2', sha: 'unitsha1', changedFiles: [] }),
+      ],
+    }));
+
+    const AgentClass = createMockAgentClass({
+      'test-runner': { ok: true, result: withSummary(JSON.stringify({ passed: true, summary: 'green' }), 'runner ok') },
+    });
+    const createWorktreeCalls = [];
+    const exit = mock.fn();
+
+    await mergeOneUnit({
+      cwd,
+      parentSlug,
+      unitId: '01-types',
+      unitBranch: 'orch/rapid-fox-x7q2',
+      agent: 'claude',
+      AgentClass,
+      jobSlug: parentSlug,
+      jobCwd: cwd,
+      createWorktree: async (opts) => {
+        createWorktreeCalls.push(opts);
+        return { worktreePath: path.join(cwd, `.orch-wt-${opts.slug}`), branch: storedBranch };
+      },
+      mergeBranches: async () => ({ merged: ['orch/rapid-fox-x7q2'], conflicts: [] }),
+      conflictedFiles: () => [],
+      hasConflictMarkers: () => false,
+      abortMerge: () => {},
+      commitWorktree: async () => ({ sha: tipAfter }),
+      execFile: (cmd, args) => {
+        if (args?.includes('--abbrev-ref')) return `${storedBranch}\n`;
+        if (args?.includes('rev-parse')) return `${tipAfter}\n`;
+        return '';
+      },
+      log: () => {},
+      exit,
+    });
+
+    assert.equal(createWorktreeCalls.length, 0, 'must reuse when HEAD matches stored parent run.json.branch');
+    assert.equal(readSeq(cwd, parentSlug).tip, tipAfter);
+  });
+
+  it('does not reuse a worktree whose HEAD is still orch/<parentSlug> when the local prefix is pinned', async () => {
+    const cwd = makeTmpCwd('orch-seq-merge-no-orch-reuse-');
+    const prefix = pinLocalBranchPrefix(cwd);
+    const parentSlug = 'wise-pine-e904';
+    const tipBefore = 'tipbbbbb00001111222233334444555566667777';
+    const tipAfter = 'tipccccc00001111222233334444555566667777';
+    const reusePath = `${cwd}-${parentSlug}`;
+    fs.mkdirSync(reusePath, { recursive: true });
+    seedParentJob(cwd, parentSlug, { branch: null });
+    writeSeq(cwd, parentSlug, baseSeq({
+      tip: tipBefore,
+      units: [
+        baseUnit({ id: '01-types', state: 'done', slug: 'rapid-fox-x7q2', sha: 'unitsha1', changedFiles: [] }),
+      ],
+    }));
+
+    const AgentClass = createMockAgentClass({
+      'test-runner': { ok: true, result: withSummary(JSON.stringify({ passed: true, summary: 'green' }), 'runner ok') },
+    });
+    const createWorktreeCalls = [];
+    const exit = mock.fn();
+
+    await mergeOneUnit({
+      cwd,
+      parentSlug,
+      unitId: '01-types',
+      unitBranch: 'orch/rapid-fox-x7q2',
+      agent: 'claude',
+      AgentClass,
+      jobSlug: parentSlug,
+      jobCwd: cwd,
+      createWorktree: async (opts) => {
+        createWorktreeCalls.push(opts);
+        return {
+          worktreePath: path.join(cwd, `.orch-wt-${opts.slug}`),
+          branch: `${prefix}/${opts.slug}`,
+        };
+      },
+      mergeBranches: async () => ({ merged: ['orch/rapid-fox-x7q2'], conflicts: [] }),
+      conflictedFiles: () => [],
+      hasConflictMarkers: () => false,
+      abortMerge: () => {},
+      commitWorktree: async () => ({ sha: tipAfter }),
+      execFile: (cmd, args) => {
+        if (args?.includes('--abbrev-ref')) return `orch/${parentSlug}\n`;
+        if (args?.includes('rev-parse')) return `${tipAfter}\n`;
+        return '';
+      },
+      log: () => {},
+      exit,
+    });
+
+    assert.equal(createWorktreeCalls.length, 1, 'stale orch/<parentSlug> HEAD must not match a pinned prefix');
+    assert.equal(readSeq(cwd, parentSlug).tip, tipAfter);
   });
 });
 

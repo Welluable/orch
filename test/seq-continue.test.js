@@ -9,6 +9,7 @@ import { runContinuePipeline, runSeqContinuePipeline, cascadeStop, formatJobsTab
 import { readJob, writeJob, listJobs } from '../lib/jobs.js';
 import { readSeq, writeSeq } from '../lib/seq.js';
 import { validateContinue } from '../lib/continue.js';
+import { writeConfig, localConfigPath } from '../lib/config.js';
 
 /**
  * Contract this file pins down for seq Phase 4 continue / resume / cascade /
@@ -38,6 +39,11 @@ const mainPath = path.join(__dirname, '..', 'main.js');
 
 function makeTmpCwd(prefix = 'orch-seq-continue-') {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+}
+
+function pinLocalBranchPrefix(cwd, prefix = 'long_running_session') {
+  writeConfig(localConfigPath(cwd), { branchPrefix: prefix });
+  return prefix;
 }
 
 function runCli(args, { cwd = process.cwd(), env = process.env } = {}) {
@@ -268,7 +274,9 @@ describe('runContinuePipeline — successful seq unit continue patches seq.json'
 describe('runSeqContinuePipeline / --seq-continue', () => {
   it('merges a fixed done-but-unmerged unit, adjusts, and continues pending loop', async () => {
     const cwd = makeTmpCwd();
+    const prefix = pinLocalBranchPrefix(cwd);
     const parentSlug = 'wise-pine-e904';
+    const storedUnitBranch = 'team_session/merry-elk-r4b1';
     writeJob(cwd, parentSlug, {
       slug: parentSlug,
       task: 'implement the billing module',
@@ -287,6 +295,25 @@ describe('runSeqContinuePipeline / --seq-continue', () => {
       pauseRequested: false,
       parent: null,
       workerId: null,
+    });
+    writeJob(cwd, 'merry-elk-r4b1', {
+      slug: 'merry-elk-r4b1',
+      task: 'Implement API.',
+      agent: 'claude',
+      maxRounds: 5,
+      cwd,
+      state: 'done',
+      role: 'worker',
+      parent: parentSlug,
+      workerId: '02-api',
+      branch: storedUnitBranch,
+      worktree: path.join(path.dirname(cwd), `${path.basename(cwd)}-merry-elk-r4b1`),
+      pid: null,
+      startedAt: new Date(0).toISOString(),
+      finishedAt: new Date().toISOString(),
+      exitCode: 0,
+      logPath: path.join(cwd, '.orch', 'merry-elk-r4b1', 'orch.log'),
+      pauseRequested: false,
     });
     writeSeq(cwd, parentSlug, baseSeq({
       units: [
@@ -330,8 +357,8 @@ describe('runSeqContinuePipeline / --seq-continue', () => {
       AgentClass,
       jobSlug: parentSlug,
       jobCwd: cwd,
-      mergeOneUnit: async ({ unitId }) => {
-        mergeCalls.push(unitId);
+      mergeOneUnit: async ({ unitId, unitBranch }) => {
+        mergeCalls.push({ unitId, unitBranch });
         const seq = readSeq(cwd, parentSlug);
         writeSeq(cwd, parentSlug, { ...seq, tip: `tip-after-${unitId}` });
       },
@@ -386,7 +413,14 @@ describe('runSeqContinuePipeline / --seq-continue', () => {
       checkpointPause: async () => {},
     });
 
-    assert.ok(mergeCalls.includes('02-api'), `expected merge of fixed unit 02-api, got ${mergeCalls}`);
+    const mergedIds = mergeCalls.map((c) => c.unitId);
+    assert.ok(mergedIds.includes('02-api'), `expected merge of fixed unit 02-api, got ${mergedIds}`);
+    const apiMerge = mergeCalls.find((c) => c.unitId === '02-api');
+    assert.equal(apiMerge.unitBranch, storedUnitBranch, 'done-but-unmerged unitBranch must use stored unit run.json.branch');
+    const uiMerge = mergeCalls.find((c) => c.unitId === '03-ui');
+    assert.ok(uiMerge, `expected merge of spawned 03-ui, got ${mergedIds}`);
+    assert.equal(uiMerge.unitBranch, `${prefix}/spawned-03-ui`, 'spawned unitBranch must derive prefix/slug when run.json.branch is unset');
+    assert.notEqual(uiMerge.unitBranch, 'orch/spawned-03-ui');
   });
 
   it('CLI --seq-continue rejects an unknown parent without seq.json', async () => {
