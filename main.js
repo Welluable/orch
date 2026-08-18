@@ -440,6 +440,13 @@ function patchJobCursor(patchJobFn, jobCwd, jobSlug, fields) {
     return patchJobFn(jobCwd, jobSlug, fields);
 }
 
+/** Stored `run.json.branch` if a non-empty string; else `${resolveBranchPrefix({ cwd })}/${slug}`. */
+function resolveJobBranch(cwd, slug, stored) {
+    const candidate = stored ?? readJob(cwd, slug)?.branch;
+    if (typeof candidate === 'string' && candidate.length > 0) return candidate;
+    return `${resolveBranchPrefix({ cwd })}/${slug}`;
+}
+
 /** The test-writer ⇄ test-critic loop shared by `runPipeline` and `runWorkerPipeline`. */
 async function runTestLoop({
     prompt,
@@ -2485,7 +2492,8 @@ export async function runUnitPipeline(prompt, options = {}) {
 }
 
 /**
- * Merge one unit branch into `orch/<parentSlug>`, repair conflicts once via
+ * Merge one unit branch into the seq integration branch (stored parent
+ * `run.json.branch`, or the resolved prefix/parentSlug), repair conflicts once via
  * integrator, runner-first verify, then advance `seq.tip`. Merge/verify failure
  * marks the unit `failed` and exits non-zero.
  */
@@ -2548,7 +2556,7 @@ export async function mergeOneUnit(options = {}) {
         jobPatch({ phase: 'merge', stage: 'merge', round: null });
 
         const reuseWorktreePath = `${cwd}-${parentSlug}`;
-        const expectedBranch = `orch/${parentSlug}`;
+        const expectedBranch = resolveJobBranch(cwd, parentSlug);
         let worktree = null;
 
         if (fs.existsSync(reuseWorktreePath)) {
@@ -2753,7 +2761,11 @@ export async function runIntegratePipeline(options = {}) {
         jobPatch({ phase: 'worktree', stage: 'worktree', round: null });
 
         const reuseWorktreePath = `${cwd}-${parentSlug}`;
-        const expectedBranch = `orch/${parentSlug}`;
+        const expectedBranch = resolveJobBranch(
+            cwd,
+            parentSlug,
+            fanout.integration?.branch ?? readJob(jobCwd, integrationSlug)?.branch,
+        );
         let worktree = null;
 
         if (fs.existsSync(reuseWorktreePath)) {
@@ -2892,7 +2904,7 @@ export async function runIntegratePipeline(options = {}) {
         const message = `orch: ${parentSlug} ${fanout.task.split('\n')[0]}`;
         const commitResult = commitWorktreeFn({
             worktreePath: worktree.worktreePath,
-            branch: `orch/${parentSlug}`,
+            branch: worktree.branch,
             message,
         });
 
@@ -3010,7 +3022,8 @@ export function cascadeStop(cwd, parentSlug, { kill = (pid, signal) => process.k
 
 /**
  * Ensure the seq coordinator worktree/branch exists. Prefer reuse when the
- * sibling path already has `orch/<slug>`; otherwise create at `base`.
+ * sibling path already has the stored parent `run.json.branch` or
+ * `${resolveBranchPrefix({ cwd })}/<slug>`; otherwise create at `base`.
  * Worktrees are created at `--seq` / `--seq --from` execute time — not during
  * plan-only `--decompose` (see `.spec/decompose.md` open choice).
  */
@@ -3023,7 +3036,7 @@ function ensureSeqCoordinatorWorktree({
 }) {
     const repoRoot = execFileFn('git', ['-C', cwd, 'rev-parse', '--show-toplevel']).trim();
     const worktreePath = `${path.join(path.dirname(repoRoot), path.basename(repoRoot))}-${slug}`;
-    const branch = `orch/${slug}`;
+    const branch = resolveJobBranch(cwd, slug);
 
     if (fs.existsSync(worktreePath)) {
         try {
@@ -3629,7 +3642,7 @@ export async function runSeqPipeline(prompt, options = {}) {
                     exitFn(1);
                 } else {
                     console.log(`seq complete: ${seq.units.filter((u) => u.state === 'done').length}/${seq.units.length} merged`);
-                    console.log(`merge:  git merge orch/${jobSlug}`);
+                    console.log(`merge:  git merge ${resolveJobBranch(invocationCwd, jobSlug)}`);
                     exitFn(0);
                 }
                 return;
@@ -3661,7 +3674,7 @@ export async function runSeqPipeline(prompt, options = {}) {
                     cwd: invocationCwd,
                     parentSlug: jobSlug,
                     unitId: live.id,
-                    unitBranch: `orch/${live.slug}`,
+                    unitBranch: resolveJobBranch(invocationCwd, live.slug),
                     agent: options.agent,
                     AgentClass,
                     maxRounds,
@@ -3703,7 +3716,7 @@ export async function runSeqPipeline(prompt, options = {}) {
                 cwd: invocationCwd,
                 parentSlug: jobSlug,
                 unitId: firstPending.id,
-                unitBranch: `orch/${unitSlug}`,
+                unitBranch: resolveJobBranch(invocationCwd, unitSlug),
                 agent: options.agent,
                 AgentClass,
                 maxRounds,
@@ -4107,7 +4120,7 @@ export async function runSeqContinuePipeline(options = {}) {
                         cwd: invocationCwd,
                         parentSlug,
                         unitId: unit.id,
-                        unitBranch: `orch/${unit.slug}`,
+                        unitBranch: resolveJobBranch(invocationCwd, unit.slug),
                         agent: options.agent,
                         AgentClass,
                         maxRounds,
@@ -4158,7 +4171,7 @@ export async function runSeqContinuePipeline(options = {}) {
                 cwd: invocationCwd,
                 parentSlug,
                 unitId: pending.id,
-                unitBranch: `orch/${unitSlug}`,
+                unitBranch: resolveJobBranch(invocationCwd, unitSlug),
                 agent: options.agent,
                 AgentClass,
                 maxRounds,
@@ -4513,7 +4526,7 @@ export async function runFanoutPipeline(prompt, options = {}) {
             });
             patchWorkerFn(invocationCwd, jobSlug, worker.id, {
                 slug: workerSlug,
-                branch: `orch/${workerSlug}`,
+                branch: `${resolveBranchPrefix({ cwd: invocationCwd })}/${workerSlug}`,
                 state: 'running',
             });
 
@@ -4726,9 +4739,14 @@ export async function runFanoutPipeline(prompt, options = {}) {
 
             const finalIntegration = readFanoutFn(invocationCwd, jobSlug).integration;
             if (finalIntegration.state === 'done' && finalIntegration.sha) {
+                const hintBranch = resolveJobBranch(
+                    invocationCwd,
+                    jobSlug,
+                    finalIntegration.branch ?? readJob(invocationCwd, integrationSlug)?.branch,
+                );
                 console.log(`[integrate ${integrationSlug}] merged ${doneWorkers.length} branch${doneWorkers.length === 1 ? '' : 'es'}`);
-                console.log(`commit: ${finalIntegration.sha.slice(0, 7)} on ${finalIntegration.branch ?? `orch/${jobSlug}`}`);
-                console.log(`merge:  git merge ${finalIntegration.branch ?? `orch/${jobSlug}`}`);
+                console.log(`commit: ${finalIntegration.sha.slice(0, 7)} on ${hintBranch}`);
+                console.log(`merge:  git merge ${hintBranch}`);
             } else {
                 console.log(`[integrate ${integrationSlug}] failed`);
             }
@@ -4791,9 +4809,14 @@ export async function runFanoutPipeline(prompt, options = {}) {
 
             const finalIntegration = readFanoutFn(invocationCwd, jobSlug).integration;
             if (finalIntegration.state === 'done' && finalIntegration.sha) {
+                const hintBranch = resolveJobBranch(
+                    invocationCwd,
+                    jobSlug,
+                    finalIntegration.branch ?? readJob(invocationCwd, integrationSlug)?.branch,
+                );
                 console.log(`[integrate ${integrationSlug}] merged ${doneWorkers.length} branch${doneWorkers.length === 1 ? '' : 'es'}`);
-                console.log(`commit: ${finalIntegration.sha.slice(0, 7)} on ${finalIntegration.branch ?? `orch/${jobSlug}`}`);
-                console.log(`merge:  git merge ${finalIntegration.branch ?? `orch/${jobSlug}`}`);
+                console.log(`commit: ${finalIntegration.sha.slice(0, 7)} on ${hintBranch}`);
+                console.log(`merge:  git merge ${hintBranch}`);
             } else {
                 console.log(`[integrate ${integrationSlug}] failed`);
             }

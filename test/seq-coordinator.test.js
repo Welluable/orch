@@ -30,10 +30,15 @@ import { writeConfig, localConfigPath } from '../lib/config.js';
  *   (default 8) and injectable `mergeOneUnit` / seq I/O helpers.
  * - Stage order: triage → (simple → quick-fix; skip seq) → seq-decomposer
  *   (NO boundaries) with ≤2 repair rounds → decline = single-worktree
- *   pipeline with **no** seq.json → success = create/reuse
- *   `orch/<parentSlug>` at HEAD, write seq.json, loop concurrency 1:
- *   spawn first pending at tip → wait → fail stops chain (exit 1) → done →
- *   mergeOneUnit → adjust → continue until no pending.
+ *   pipeline with **no** seq.json → success = create/reuse the coordinator
+ *   worktree at stored parent `run.json.branch`, or
+ *   `${resolveBranchPrefix({ cwd })}/<parentSlug>` when that name is still
+ *   unset — never a hardcoded `orch/<parentSlug>` — at HEAD, write seq.json,
+ *   loop concurrency 1: spawn first pending at tip → wait → fail stops chain
+ *   (exit 1) → done → mergeOneUnit (unitBranch is the unit job’s stored
+ *   `run.json.branch`, else the derived prefix/slug) → adjust → continue
+ *   until no pending. Complete hint is `git merge <stored-or-derived parent
+ *   branch>`, not `git merge orch/<jobSlug>`.
  * - Spawn argv uses `--unit <parent>:<unitId>` (not `--worker` / `--seq`),
  *   env sets ORCH_JOB_SLUG, ORCH_DETACHED=1, ORCH_SEQ_DEPTH=1,
  *   ORCH_FANOUT_DEPTH=1. Unit role is `worker`.
@@ -460,8 +465,8 @@ describe('runSeqPipeline — successful decompose bootstrap + strict concurrency
     });
 
     let tipCounter = 0;
-    const mergeOneUnit = async ({ unitId }) => {
-      mergeCalls.push(unitId);
+    const mergeOneUnit = async ({ unitId, unitBranch }) => {
+      mergeCalls.push({ unitId, unitBranch });
       const seq = readSeq(cwd, jobSlug);
       tipCounter += 1;
       writeSeq(cwd, jobSlug, { ...seq, tip: `tip-${tipCounter}` });
@@ -479,24 +484,32 @@ describe('runSeqPipeline — successful decompose bootstrap + strict concurrency
       branch: `orch/${slug}`,
     }));
 
-    await runSeqPipeline('implement the billing module', {
-      cwd,
-      jobSlug,
-      jobCwd: cwd,
-      agent: 'claude',
-      maxUnits: 8,
-      AgentClass,
-      spawn: spawnFn,
-      allocateJob,
-      reconcileJob,
-      mergeOneUnit,
-      pollIntervalMs: 20,
-      execFile,
-      createWorktree,
-      exit,
-      patchJob: (c, slug, patch) => patchJob(c, slug, patch),
-      checkpointPause: async () => {},
+    const logs = [];
+    const logSpy = mock.method(console, 'log', (...args) => {
+      logs.push(args.map(String).join(' '));
     });
+    try {
+      await runSeqPipeline('implement the billing module', {
+        cwd,
+        jobSlug,
+        jobCwd: cwd,
+        agent: 'claude',
+        maxUnits: 8,
+        AgentClass,
+        spawn: spawnFn,
+        allocateJob,
+        reconcileJob,
+        mergeOneUnit,
+        pollIntervalMs: 20,
+        execFile,
+        createWorktree,
+        exit,
+        patchJob: (c, slug, patch) => patchJob(c, slug, patch),
+        checkpointPause: async () => {},
+      });
+    } finally {
+      logSpy.mock.restore();
+    }
 
     const seq = readSeq(cwd, jobSlug);
     assert.ok(seq, 'seq.json must exist after successful decompose');
@@ -520,7 +533,17 @@ describe('runSeqPipeline — successful decompose bootstrap + strict concurrency
     }
 
     // AC4: merge each green unit before the next starts; tip advances for unit N+1.
-    assert.deepEqual(mergeCalls, ['01-types', '02-api']);
+    assert.deepEqual(mergeCalls.map((c) => c.unitId), ['01-types', '02-api']);
+    for (const call of mergeCalls) {
+      const unit = seq.units.find((u) => u.id === call.unitId);
+      const stored = readJob(cwd, unit.slug)?.branch;
+      const expected = stored || `${prefix}/${unit.slug}`;
+      assert.equal(call.unitBranch, expected, `${call.unitId} unitBranch must be stored job branch or derived prefix/slug`);
+      assert.notEqual(call.unitBranch, `orch/${unit.slug}`, 'unitBranch must not hardcode orch/<slug>');
+    }
+    const joined = logs.join('\n');
+    assert.match(joined, new RegExp(`git merge ${prefix}/${jobSlug}`));
+    assert.doesNotMatch(joined, new RegExp(`git merge orch/${jobSlug}`));
     assert.equal(tipsAtUnitSpawn.length, 2);
     assert.equal(tipsAtUnitSpawn[0], baseTip, 'first unit bases at the initial tip');
     assert.equal(tipsAtUnitSpawn[1], 'tip-1', 'second unit must base at post-merge tip of unit 01');
@@ -536,6 +559,158 @@ describe('runSeqPipeline — successful decompose bootstrap + strict concurrency
       [0, 1],
       '01-types must already be merged before 02-api spawns (AC4 tip/schedule)',
     );
+  });
+
+  it('reuses the coordinator worktree when HEAD matches the derived prefix/slug — not a hardcoded orch/<parentSlug>', async () => {
+    const cwd = makeTmpCwd('orch-seq-coord-reuse-derived-');
+    const prefix = pinLocalBranchPrefix(cwd);
+    const jobSlug = 'wise-pine-e904';
+    const baseTip = 'basehead00001111222233334444555566667777';
+    const worktreePath = `${path.join(path.dirname(cwd), path.basename(cwd))}-${jobSlug}`;
+    fs.mkdirSync(worktreePath, { recursive: true });
+    fs.mkdirSync(path.join(cwd, '.orch', jobSlug), { recursive: true });
+    writeJob(cwd, jobSlug, {
+      slug: jobSlug,
+      prompt: 'implement the billing module',
+      agent: 'claude',
+      maxRounds: 5,
+      state: 'running',
+      role: 'coordinator',
+      pid: process.pid,
+      startedAt: new Date(0).toISOString(),
+      branch: null,
+    });
+
+    const AgentClass = createMockAgentClass({
+      triage: TRIAGE_COMPLEX,
+      'seq-decomposer': unitsReply(TWO_UNITS),
+      decomposer: unitsReply(TWO_UNITS),
+      adjust: adjustOk(),
+    });
+    const spawnFn = makeSettlingSpawn({
+      settleMs: 40,
+      cwd,
+      parentSlug: jobSlug,
+      outcomes: {
+        '01-types': { state: 'done', sha: 'sha-01' },
+        '02-api': { state: 'done', sha: 'sha-02' },
+      },
+    });
+    const createWorktree = mock.fn(async ({ slug }) => ({
+      worktreePath: path.join(cwd, `wt-${slug}`),
+      branch: `${prefix}/${slug}`,
+    }));
+    const { execFile } = makeFakeExecFile([
+      { match: (args) => args.includes('--show-toplevel'), stdout: `${cwd}\n` },
+      { match: (args) => args.includes('--abbrev-ref'), stdout: `${prefix}/${jobSlug}\n` },
+      { match: (args) => args.includes('rev-parse'), stdout: `${baseTip}\n` },
+    ]);
+
+    const logSpy = mock.method(console, 'log', () => {});
+    try {
+      await runSeqPipeline('implement the billing module', {
+        cwd,
+        jobSlug,
+        jobCwd: cwd,
+        agent: 'claude',
+        maxUnits: 8,
+        AgentClass,
+        spawn: spawnFn,
+        allocateJob: async (opts) => realAllocateJob({ ...opts, cwd }),
+        reconcileJob: (c, slug) => readJob(c, slug),
+        mergeOneUnit: async ({ unitId }) => {
+          const seq = readSeq(cwd, jobSlug);
+          writeSeq(cwd, jobSlug, { ...seq, tip: `tip-after-${unitId}` });
+        },
+        pollIntervalMs: 20,
+        execFile,
+        createWorktree,
+        exit: mock.fn(),
+        patchJob: (c, slug, patch) => patchJob(c, slug, patch),
+        checkpointPause: async () => {},
+      });
+    } finally {
+      logSpy.mock.restore();
+    }
+
+    assert.equal(createWorktree.mock.calls.length, 0, 'must reuse when HEAD matches derived prefix/slug');
+  });
+
+  it('reuses the coordinator worktree when HEAD matches stored parent run.json.branch, even if that differs from the pinned prefix', async () => {
+    const cwd = makeTmpCwd('orch-seq-coord-reuse-stored-');
+    pinLocalBranchPrefix(cwd);
+    const jobSlug = 'wise-pine-e904';
+    const storedBranch = `team_session/${jobSlug}`;
+    const baseTip = 'basehead00001111222233334444555566667777';
+    const worktreePath = `${path.join(path.dirname(cwd), path.basename(cwd))}-${jobSlug}`;
+    fs.mkdirSync(worktreePath, { recursive: true });
+    fs.mkdirSync(path.join(cwd, '.orch', jobSlug), { recursive: true });
+    writeJob(cwd, jobSlug, {
+      slug: jobSlug,
+      prompt: 'implement the billing module',
+      agent: 'claude',
+      maxRounds: 5,
+      state: 'running',
+      role: 'coordinator',
+      pid: process.pid,
+      startedAt: new Date(0).toISOString(),
+      branch: storedBranch,
+      worktree: worktreePath,
+    });
+
+    const AgentClass = createMockAgentClass({
+      triage: TRIAGE_COMPLEX,
+      'seq-decomposer': unitsReply(TWO_UNITS),
+      decomposer: unitsReply(TWO_UNITS),
+      adjust: adjustOk(),
+    });
+    const spawnFn = makeSettlingSpawn({
+      settleMs: 40,
+      cwd,
+      parentSlug: jobSlug,
+      outcomes: {
+        '01-types': { state: 'done', sha: 'sha-01' },
+        '02-api': { state: 'done', sha: 'sha-02' },
+      },
+    });
+    const createWorktree = mock.fn(async ({ slug }) => ({
+      worktreePath: path.join(cwd, `wt-${slug}`),
+      branch: storedBranch,
+    }));
+    const { execFile } = makeFakeExecFile([
+      { match: (args) => args.includes('--show-toplevel'), stdout: `${cwd}\n` },
+      { match: (args) => args.includes('--abbrev-ref'), stdout: `${storedBranch}\n` },
+      { match: (args) => args.includes('rev-parse'), stdout: `${baseTip}\n` },
+    ]);
+
+    const logSpy = mock.method(console, 'log', () => {});
+    try {
+      await runSeqPipeline('implement the billing module', {
+        cwd,
+        jobSlug,
+        jobCwd: cwd,
+        agent: 'claude',
+        maxUnits: 8,
+        AgentClass,
+        spawn: spawnFn,
+        allocateJob: async (opts) => realAllocateJob({ ...opts, cwd }),
+        reconcileJob: (c, slug) => readJob(c, slug),
+        mergeOneUnit: async ({ unitId }) => {
+          const seq = readSeq(cwd, jobSlug);
+          writeSeq(cwd, jobSlug, { ...seq, tip: `tip-after-${unitId}` });
+        },
+        pollIntervalMs: 20,
+        execFile,
+        createWorktree,
+        exit: mock.fn(),
+        patchJob: (c, slug, patch) => patchJob(c, slug, patch),
+        checkpointPause: async () => {},
+      });
+    } finally {
+      logSpy.mock.restore();
+    }
+
+    assert.equal(createWorktree.mock.calls.length, 0, 'must reuse when HEAD matches stored parent run.json.branch');
   });
 
   it('stops the chain on first failed unit without spawning later units; exits 1', async () => {

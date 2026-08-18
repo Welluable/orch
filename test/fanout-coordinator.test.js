@@ -84,8 +84,10 @@ import { writeConfig, localConfigPath } from '../lib/config.js';
  *   agent, maxRounds, state: 'starting', parent: jobSlug, role: 'worker',
  *   workerId })` reserves the slug and writes the child's initial
  *   `run.json`; the coordinator then patches that worker's `fanout.json`
- *   entry with `{ slug, branch: 'orch/<slug>', state: 'running' }` via
- *   `patchWorker`, spawns `process.execPath` with argv
+ *   entry with `{ slug, branch: '${prefix}/<slug>', state: 'running' }` via
+ *   `patchWorker` — `prefix` is `resolveBranchPrefix({ cwd })` (allocate just
+ *   wrote `branch: null`, so this is derived, never a hardcoded `orch/<slug>`),
+ *   then spawns `process.execPath` with argv
  *   `[__filename, subtask + buildWorkerEnvelope(...), '--agent', agent,
  *   '--max-rounds', String(maxRounds), '--worker', '<jobSlug>:<workerId>']`
  *   and env `{ ...process.env, ORCH_JOB_SLUG: workerSlug,
@@ -1146,8 +1148,9 @@ describe('runFanoutPipeline — exit codes', () => {
 });
 
 describe('runFanoutPipeline — overlap detection + integration candidates', () => {
-  it('sets integration.candidates to the done workers\' branches in order, without re-deriving changedFiles', async () => {
+  it('sets integration.candidates to the done workers\' derived prefix/slug branches in order, without re-deriving changedFiles', async () => {
     const cwd = makeTmpCwd('orch-fanout-overlaps-');
+    const prefix = pinLocalBranchPrefix(cwd);
     const jobSlug = 'wise-pine-e904';
     seedCoordinatorJob(cwd, jobSlug);
     const { execFile } = makeFakeExecFile([
@@ -1161,7 +1164,10 @@ describe('runFanoutPipeline — overlap detection + integration candidates', () 
     const MockAgentClass = createMockAgentClass({ triage: TRIAGE_COMPLEX, boundaries: BOUNDARIES_OK, decomposer: decomposeReply(workers) });
     const { spawnFn } = fakeChildSpawn({ cwd, parentSlug: jobSlug, outcomes: { a: 'done', b: 'done' }, integrationOutcome: 'done', delayMs: 10 });
 
-    const logSpy = mock.method(console, 'log', () => {});
+    const logs = [];
+    const logSpy = mock.method(console, 'log', (...args) => {
+      logs.push(args.map(String).join(' '));
+    });
     try {
       await runFanoutPipeline('do two independent things', {
         agent: 'claude',
@@ -1181,11 +1187,19 @@ describe('runFanoutPipeline — overlap detection + integration candidates', () 
     }
 
     const doc = readFanout(cwd, jobSlug);
-    assert.deepEqual(doc.integration.candidates, ['orch/a-slug', 'orch/b-slug']);
+    assert.equal(doc.workers.find((w) => w.id === 'a').branch, `${prefix}/a-slug`);
+    assert.equal(doc.workers.find((w) => w.id === 'b').branch, `${prefix}/b-slug`);
+    assert.deepEqual(doc.integration.candidates, [`${prefix}/a-slug`, `${prefix}/b-slug`]);
     // The coordinator must not overwrite what the worker children already
     // self-recorded via recordChangedFiles/patchWorker.
     assert.deepEqual(doc.workers.find((w) => w.id === 'a').changedFiles, ['src/a.ts']);
     assert.deepEqual(doc.workers.find((w) => w.id === 'b').changedFiles, ['src/b.ts']);
+
+    // Integrate-wait fallback: fakeChildSpawn leaves integration.branch null,
+    // so commit/merge hints must derive prefix/jobSlug — never a literal orch/.
+    const joined = logs.join('\n');
+    assert.match(joined, new RegExp(`git merge ${prefix}/${jobSlug}`));
+    assert.doesNotMatch(joined, new RegExp(`git merge orch/${jobSlug}`));
   });
 });
 
