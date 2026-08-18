@@ -12,12 +12,18 @@ import {
   runRecover,
 } from '../lib/resume.js';
 import { formatStatus, runResumePipeline } from '../main.js';
+import { writeConfig, localConfigPath } from '../lib/config.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const mainPath = path.join(__dirname, '..', 'main.js');
 
 function makeTmpCwd(prefix = 'orch-resume-') {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+}
+
+function pinLocalBranchPrefix(cwd, prefix = 'long_running_session') {
+  writeConfig(localConfigPath(cwd), { branchPrefix: prefix });
+  return prefix;
 }
 
 function runCli(args, { cwd = process.cwd(), env = process.env } = {}) {
@@ -480,6 +486,86 @@ describe('runResumePipeline — reentry without research', () => {
     assert.ok(!names.includes('research'));
     assert.equal(names[0], 'test-runner');
     assert.match(rounds[0], /2\/5/);
+  });
+});
+
+describe('runResumePipeline — worktree ensure-when-missing', () => {
+  it('createWorktree receives the pinned local branchPrefix when the recorded worktree is missing', async () => {
+    const cwd = makeTmpCwd();
+    const prefix = pinLocalBranchPrefix(cwd);
+    const { slug } = seedStoppedJob(cwd, {
+      worktree: null,
+      branch: null,
+      phase: 'worktree',
+      stage: 'worktree',
+      round: null,
+    });
+    const createWorktreeMock = mock.fn(() => ({
+      worktreePath: path.join(cwd, `wt-${slug}`),
+      branch: `orch/${slug}`,
+    }));
+    const MockAgentClass = createMockAgentClass(resumePassBehaviors());
+
+    const logSpy = mock.method(console, 'log', () => {});
+    try {
+      await runResumePipeline({
+        agent: 'claude',
+        AgentClass: MockAgentClass,
+        cwd,
+        slug,
+        jobSlug: slug,
+        jobCwd: cwd,
+        priorOutcome: readJob(cwd, slug).lastOutcome,
+        recoverBrief: '[Recover brief]\n[/Recover brief]',
+        prompt: 'setup playwright and shadcn/ui',
+        createWorktree: createWorktreeMock,
+        commitWorktree: async () => ({ committed: false, branch: `orch/${slug}`, sha: null }),
+        collectWorktreeChanges: async () => [],
+      });
+    } finally {
+      logSpy.mock.restore();
+    }
+
+    assert.equal(createWorktreeMock.mock.calls.length, 1);
+    assert.equal(createWorktreeMock.mock.calls[0].arguments[0].cwd, cwd);
+    assert.equal(createWorktreeMock.mock.calls[0].arguments[0].slug, slug);
+    assert.equal(createWorktreeMock.mock.calls[0].arguments[0].branchPrefix, prefix);
+  });
+
+  it('reuses run.json.branch when the worktree exists and does not call createWorktree', async () => {
+    const cwd = makeTmpCwd();
+    pinLocalBranchPrefix(cwd);
+    const { slug, worktreePath, record } = seedStoppedJob(cwd);
+    const priorBranch = record.branch;
+    const createWorktreeMock = mock.fn(() => {
+      throw new Error('createWorktree must not run on resume reuse');
+    });
+    const MockAgentClass = createMockAgentClass(resumePassBehaviors());
+
+    const logSpy = mock.method(console, 'log', () => {});
+    try {
+      await runResumePipeline({
+        agent: 'claude',
+        AgentClass: MockAgentClass,
+        cwd,
+        slug,
+        jobSlug: slug,
+        jobCwd: cwd,
+        worktreePath,
+        branch: priorBranch,
+        priorOutcome: record.lastOutcome,
+        recoverBrief: '[Recover brief]\n[/Recover brief]',
+        prompt: record.task,
+        createWorktree: createWorktreeMock,
+        commitWorktree: async () => ({ committed: false, branch: priorBranch, sha: null }),
+        collectWorktreeChanges: async () => [],
+      });
+    } finally {
+      logSpy.mock.restore();
+    }
+
+    assert.equal(createWorktreeMock.mock.calls.length, 0);
+    assert.equal(readJob(cwd, slug).branch, priorBranch);
   });
 });
 

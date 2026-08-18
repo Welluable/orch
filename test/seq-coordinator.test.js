@@ -15,6 +15,7 @@ import {
   checkpointPause as realCheckpointPause,
 } from '../lib/jobs.js';
 import { allocateJob as realAllocateJob } from '../lib/job-lifecycle.js';
+import { writeConfig, localConfigPath } from '../lib/config.js';
 
 /**
  * Contract this file pins down for the seq Phase 3 coordinator (see
@@ -61,6 +62,11 @@ const mainPath = path.join(__dirname, '..', 'main.js');
 
 function makeTmpCwd(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+}
+
+function pinLocalBranchPrefix(cwd, prefix = 'long_running_session') {
+  writeConfig(localConfigPath(cwd), { branchPrefix: prefix });
+  return prefix;
 }
 
 function runCli(args, { cwd = process.cwd(), env = process.env } = {}) {
@@ -298,6 +304,7 @@ describe('runSeqPipeline — triage short-circuit (simple never seqs)', () => {
 describe('runSeqPipeline — no boundaries; decomposer repair then decline', () => {
   it('never runs boundaries; repairs invalid decomposition then declines without seq.json', async () => {
     const cwd = makeTmpCwd('orch-seq-decline-');
+    const prefix = pinLocalBranchPrefix(cwd);
     const jobSlug = 'calm-otter-a1b2';
     const order = [];
     const invalid = unitsReply([{ id: '01-only', title: 'only', subtask: 'alone' }]);
@@ -351,10 +358,12 @@ describe('runSeqPipeline — no boundaries; decomposer repair then decline', () 
     assert.ok(decomposerCalls.length >= 1 && decomposerCalls.length <= 3);
     assert.equal(readSeq(cwd, jobSlug), null);
     assert.ok(createWorktree.mock.calls.length >= 1, 'decline path creates coordinator worktree');
+    assert.equal(createWorktree.mock.calls[0].arguments[0].branchPrefix, prefix);
   });
 
   it('decomposable:false declines to single-worktree pipeline without seq.json', async () => {
     const cwd = makeTmpCwd('orch-seq-decline-false-');
+    const prefix = pinLocalBranchPrefix(cwd);
     const jobSlug = 'calm-otter-a1b2';
     const AgentClass = createMockAgentClass({
       triage: TRIAGE_COMPLEX,
@@ -368,6 +377,10 @@ describe('runSeqPipeline — no boundaries; decomposer repair then decline', () 
       'test-runner': PASS_RUNNER,
     });
     const exit = mock.fn();
+    const createWorktree = mock.fn(async ({ slug }) => ({
+      worktreePath: path.join(cwd, `wt-${slug}`),
+      branch: `orch/${slug}`,
+    }));
 
     await runSeqPipeline('implement tightly coupled change', {
       cwd,
@@ -375,7 +388,7 @@ describe('runSeqPipeline — no boundaries; decomposer repair then decline', () 
       jobCwd: cwd,
       agent: 'claude',
       AgentClass,
-      createWorktree: async ({ slug }) => ({ worktreePath: path.join(cwd, `wt-${slug}`), branch: `orch/${slug}` }),
+      createWorktree,
       commitWorktree: async () => ({ sha: 'decline-sha' }),
       collectWorktreeChanges: async () => [],
       createRunContext: () => ({
@@ -392,12 +405,16 @@ describe('runSeqPipeline — no boundaries; decomposer repair then decline', () 
     });
 
     assert.equal(readSeq(cwd, jobSlug), null);
+    assert.ok(createWorktree.mock.calls.length >= 1, 'decline path creates a worktree');
+    assert.equal(createWorktree.mock.calls[0].arguments[0].slug, jobSlug);
+    assert.equal(createWorktree.mock.calls[0].arguments[0].branchPrefix, prefix);
   });
 });
 
 describe('runSeqPipeline — successful decompose bootstrap + strict concurrency 1', () => {
   it('writes seq.json, spawns BOTH units one at a time with --unit and depth env, merges in order, and bases unit N+1 at the post-merge tip', async () => {
     const cwd = makeTmpCwd('orch-seq-ok-');
+    const prefix = pinLocalBranchPrefix(cwd);
     const jobSlug = 'wise-pine-e904';
     const baseTip = 'basehead00001111222233334444555566667777';
     fs.mkdirSync(path.join(cwd, '.orch', jobSlug), { recursive: true });
@@ -457,6 +474,10 @@ describe('runSeqPipeline — successful decompose bootstrap + strict concurrency
     ]);
 
     const reconcileJob = (c, slug) => readJob(c, slug);
+    const createWorktree = mock.fn(async ({ slug }) => ({
+      worktreePath: path.join(cwd, `wt-${slug}`),
+      branch: `orch/${slug}`,
+    }));
 
     await runSeqPipeline('implement the billing module', {
       cwd,
@@ -471,10 +492,7 @@ describe('runSeqPipeline — successful decompose bootstrap + strict concurrency
       mergeOneUnit,
       pollIntervalMs: 20,
       execFile,
-      createWorktree: async ({ slug }) => ({
-        worktreePath: path.join(cwd, `wt-${slug}`),
-        branch: `orch/${slug}`,
-      }),
+      createWorktree,
       exit,
       patchJob: (c, slug, patch) => patchJob(c, slug, patch),
       checkpointPause: async () => {},
@@ -485,6 +503,9 @@ describe('runSeqPipeline — successful decompose bootstrap + strict concurrency
     assert.equal(seq.parentSlug, jobSlug);
     assert.equal(seq.units.length, 2);
     assert.equal(seq.maxUnits, 8);
+    assert.ok(createWorktree.mock.calls.length >= 1, 'ensureSeqCoordinatorWorktree must create');
+    assert.equal(createWorktree.mock.calls[0].arguments[0].slug, jobSlug);
+    assert.equal(createWorktree.mock.calls[0].arguments[0].branchPrefix, prefix);
 
     const spawnedIds = unitIdsFromSpawns(spawnFn.calls);
     assert.deepEqual(spawnedIds, ['01-types', '02-api'], 'both units must spawn exactly once, in order');

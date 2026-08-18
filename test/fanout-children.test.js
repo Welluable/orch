@@ -9,6 +9,7 @@ import { runWorkerPipeline, runIntegratePipeline } from '../main.js';
 import { readFanout, writeFanout } from '../lib/fanout.js';
 import { jobPaths, readJob } from '../lib/jobs.js';
 import { allocateJob } from '../lib/job-lifecycle.js';
+import { writeConfig, localConfigPath } from '../lib/config.js';
 
 /**
  * Contract this file pins down for the fan-out phase 2 child entrypoints
@@ -108,6 +109,11 @@ const mainPath = path.join(__dirname, '..', 'main.js');
 
 function makeTmpCwd(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+}
+
+function pinLocalBranchPrefix(cwd, prefix = 'long_running_session') {
+  writeConfig(localConfigPath(cwd), { branchPrefix: prefix });
+  return prefix;
 }
 
 function runCli(args, { cwd = process.cwd(), env = process.env } = {}) {
@@ -330,6 +336,7 @@ describe('runWorkerPipeline (--worker driver)', () => {
 
   it('creates the worktree from the fanout doc\'s recorded base', async () => {
     const cwd = makeTmpCwd('orch-worker-base-');
+    const prefix = pinLocalBranchPrefix(cwd);
     const doc = baseFanout({ base: 'deadfeed1234567890deadfeed1234567890dead' });
     writeFanout(cwd, doc.parentSlug, doc);
     const workerSlug = 'merry-elk-r4b1';
@@ -361,6 +368,7 @@ describe('runWorkerPipeline (--worker driver)', () => {
     const [callArgs] = createWorktreeMock.mock.calls[0].arguments;
     assert.equal(callArgs.base, doc.base);
     assert.equal(callArgs.cwd, cwd);
+    assert.equal(callArgs.branchPrefix, prefix);
   });
 
   it('on success, patches fanout.json.workers[].state to "done" with sha/changedFiles, and the worker\'s own run.json carries parent/role/workerId', async () => {
@@ -619,6 +627,7 @@ describe('runWorkerPipeline lastOutcome capture on terminal states', () => {
 describe('runIntegratePipeline (--integrate driver)', () => {
   it('never constructs triage/research/planner/test-writer/test-critic; verifies runner-first when merges are already green', async () => {
     const cwd = makeTmpCwd('orch-integrate-green-');
+    const prefix = pinLocalBranchPrefix(cwd);
     const doc = baseFanout();
     writeFanout(cwd, doc.parentSlug, doc);
     const integrationSlug = 'tidy-heron-m2p9';
@@ -629,6 +638,7 @@ describe('runIntegratePipeline (--integrate driver)', () => {
     ]);
 
     const MockAgentClass = createMockAgentClass({ 'test-runner': PASS_RUNNER });
+    const createWorktreeMock = mock.fn(() => worktree);
 
     const logSpy = mock.method(console, 'log', () => {});
     try {
@@ -640,7 +650,7 @@ describe('runIntegratePipeline (--integrate driver)', () => {
         jobSlug: integrationSlug,
         jobCwd: cwd,
         execFile,
-        createWorktree: mock.fn(() => worktree),
+        createWorktree: createWorktreeMock,
         commitWorktree: mock.fn(() => fakeCommitResult(`orch/${doc.parentSlug}`)),
       });
     } finally {
@@ -651,6 +661,10 @@ describe('runIntegratePipeline (--integrate driver)', () => {
       MockAgentClass.instances.map((i) => agentRole(i.name)),
       ['test-runner'],
     );
+    assert.equal(createWorktreeMock.mock.calls.length, 1);
+    assert.equal(createWorktreeMock.mock.calls[0].arguments[0].slug, doc.parentSlug);
+    assert.equal(createWorktreeMock.mock.calls[0].arguments[0].base, doc.base);
+    assert.equal(createWorktreeMock.mock.calls[0].arguments[0].branchPrefix, prefix);
 
     const integrationMdPath = path.join(cwd, '.orch', integrationSlug, 'integration.md');
     assert.ok(fs.existsSync(integrationMdPath), 'expected integration.md to be written');

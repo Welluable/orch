@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { runUnitPipeline, mergeOneUnit } from '../main.js';
 import { readSeq, writeSeq } from '../lib/seq.js';
 import { allocateJob } from '../lib/job-lifecycle.js';
+import { writeConfig, localConfigPath } from '../lib/config.js';
 
 /**
  * Contract this file pins down for the seq Phase 2 unit child path and
@@ -63,6 +64,11 @@ const mainPath = path.join(__dirname, '..', 'main.js');
 
 function makeTmpCwd(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+}
+
+function pinLocalBranchPrefix(cwd, prefix = 'long_running_session') {
+  writeConfig(localConfigPath(cwd), { branchPrefix: prefix });
+  return prefix;
 }
 
 function runCli(args, { cwd = process.cwd(), env = process.env } = {}) {
@@ -165,6 +171,7 @@ function fakeRunContext(cwd, slug) {
 describe('runUnitPipeline — stage order and seq.json patches', () => {
   it('skips triage, runs research→plan→worktree(base=tip)→tests→code→commit, then patches unit done', async () => {
     const cwd = makeTmpCwd('orch-seq-unit-');
+    const prefix = pinLocalBranchPrefix(cwd);
     const parentSlug = 'wise-pine-e904';
     const unitSlug = 'rapid-fox-x7q2';
     const tip = 'tipbbbbb00001111222233334444555566667777';
@@ -211,6 +218,7 @@ describe('runUnitPipeline — stage order and seq.json patches', () => {
     assert.equal(createWorktreeCalls.length, 1);
     assert.equal(createWorktreeCalls[0].base, tip);
     assert.equal(createWorktreeCalls[0].slug, unitSlug);
+    assert.equal(createWorktreeCalls[0].branchPrefix, prefix);
 
     const seq = readSeq(cwd, parentSlug);
     const unit = seq.units.find((u) => u.id === '01-types');
@@ -258,6 +266,7 @@ describe('runUnitPipeline — stage order and seq.json patches', () => {
 describe('mergeOneUnit — merge then tip advance; failure marks failed', () => {
   it('merges the unit branch, runner-first verifies, and advances seq.tip', async () => {
     const cwd = makeTmpCwd('orch-seq-merge-');
+    const prefix = pinLocalBranchPrefix(cwd);
     const parentSlug = 'wise-pine-e904';
     const tipBefore = 'tipbbbbb00001111222233334444555566667777';
     const tipAfter = 'tipccccc00001111222233334444555566667777';
@@ -274,6 +283,7 @@ describe('mergeOneUnit — merge then tip advance; failure marks failed', () => 
     });
     const logs = [];
     const exit = mock.fn();
+    const createWorktreeCalls = [];
 
     await mergeOneUnit({
       cwd,
@@ -284,11 +294,14 @@ describe('mergeOneUnit — merge then tip advance; failure marks failed', () => 
       AgentClass,
       jobSlug: parentSlug,
       jobCwd: cwd,
-      createWorktree: async ({ slug, base }) => ({
-        worktreePath: path.join(cwd, `.orch-wt-${slug}`),
-        branch: `orch/${slug}`,
-        base,
-      }),
+      createWorktree: async (opts) => {
+        createWorktreeCalls.push(opts);
+        return {
+          worktreePath: path.join(cwd, `.orch-wt-${opts.slug}`),
+          branch: `orch/${opts.slug}`,
+          base: opts.base,
+        };
+      },
       mergeBranches: async () => ({ merged: ['orch/rapid-fox-x7q2'], conflicts: [] }),
       conflictedFiles: () => [],
       hasConflictMarkers: () => false,
@@ -304,6 +317,10 @@ describe('mergeOneUnit — merge then tip advance; failure marks failed', () => 
 
     const seq = readSeq(cwd, parentSlug);
     assert.equal(seq.tip, tipAfter);
+    assert.equal(createWorktreeCalls.length, 1);
+    assert.equal(createWorktreeCalls[0].slug, parentSlug);
+    assert.equal(createWorktreeCalls[0].base, tipBefore);
+    assert.equal(createWorktreeCalls[0].branchPrefix, prefix);
     assert.ok(
       logs.some((line) => /merged\s+01-types/i.test(line) && /tip/i.test(line)),
       `expected merged 01-types → tip log, got: ${logs.join(' | ')}`,

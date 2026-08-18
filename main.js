@@ -108,6 +108,7 @@ import {
 import {
     resolveAgent,
     resolveNotify,
+    resolveBranchPrefix,
     writeConfig,
     printConfig,
     globalConfigPath,
@@ -1001,6 +1002,7 @@ export async function runPipeline(prompt, options) {
             const worktree = createWorktreeFn({
                 cwd: invocationCwd,
                 slug: runContext.slug,
+                branchPrefix: resolveBranchPrefix({ cwd: invocationCwd }),
                 ...(resolvedBase ? { base: `origin/${resolvedBase}` } : {}),
             });
             jobPatch({ branch: worktree.branch, worktree: worktree.worktreePath });
@@ -1100,6 +1102,7 @@ export async function runPipeline(prompt, options) {
         const worktree = createWorktreeFn({
             cwd: invocationCwd,
             slug: runContext.slug,
+            branchPrefix: resolveBranchPrefix({ cwd: invocationCwd }),
             ...(resolvedBase ? { base: `origin/${resolvedBase}` } : {}),
         });
         jobPatch({ branch: worktree.branch, worktree: worktree.worktreePath });
@@ -1782,7 +1785,11 @@ export async function runResumePipeline(options = {}) {
                 jobPatch({ phase: 'worktree', stage: 'worktree', round: null, branch: liveBranch, worktree: liveWorktree });
             } else {
                 jobPatch({ phase: 'worktree', stage: 'worktree', round: null });
-                const wt = createWorktreeFn({ cwd, slug: jobSlug });
+                const wt = createWorktreeFn({
+                    cwd,
+                    slug: jobSlug,
+                    branchPrefix: resolveBranchPrefix({ cwd }),
+                });
                 liveWorktree = wt.worktreePath;
                 liveBranch = wt.branch;
                 jobPatch({ branch: liveBranch, worktree: liveWorktree });
@@ -2151,7 +2158,12 @@ export async function runWorkerPipeline(prompt, options = {}) {
         printStageSummary('planner', resolveStageSummary('planner', plannerSummary, plannerContent));
 
         jobPatch({ phase: 'worktree', stage: 'worktree', round: null });
-        const worktree = createWorktreeFn({ cwd, slug: runContext.slug, base });
+        const worktree = createWorktreeFn({
+            cwd,
+            slug: runContext.slug,
+            base,
+            branchPrefix: resolveBranchPrefix({ cwd }),
+        });
         jobPatch({ branch: worktree.branch, worktree: worktree.worktreePath });
 
         fs.mkdirSync(path.dirname(runContext.statusPath), { recursive: true });
@@ -2348,7 +2360,12 @@ export async function runUnitPipeline(prompt, options = {}) {
         printStageSummary('planner', resolveStageSummary('planner', plannerSummary, plannerContent));
 
         jobPatch({ phase: 'worktree', stage: 'worktree', round: null });
-        const worktree = await createWorktreeFn({ cwd, slug: runContext.slug, base });
+        const worktree = await createWorktreeFn({
+            cwd,
+            slug: runContext.slug,
+            base,
+            branchPrefix: resolveBranchPrefix({ cwd }),
+        });
         jobPatch({ branch: worktree.branch, worktree: worktree.worktreePath });
 
         fs.mkdirSync(path.dirname(runContext.statusPath), { recursive: true });
@@ -2550,6 +2567,7 @@ export async function mergeOneUnit(options = {}) {
                 cwd,
                 slug: parentSlug,
                 base: seq.tip || seq.base,
+                branchPrefix: resolveBranchPrefix({ cwd }),
             });
         }
 
@@ -2747,7 +2765,12 @@ export async function runIntegratePipeline(options = {}) {
 
         const reused = Boolean(worktree);
         if (!worktree) {
-            worktree = createWorktreeFn({ cwd, slug: parentSlug, base: fanout.base });
+            worktree = createWorktreeFn({
+                cwd,
+                slug: parentSlug,
+                base: fanout.base,
+                branchPrefix: resolveBranchPrefix({ cwd }),
+            });
         }
 
         logIntegration(
@@ -3013,7 +3036,12 @@ function ensureSeqCoordinatorWorktree({
         }
     }
 
-    return createWorktreeFn({ cwd, slug, base });
+    return createWorktreeFn({
+        cwd,
+        slug,
+        base,
+        branchPrefix: resolveBranchPrefix({ cwd }),
+    });
 }
 
 /**
@@ -3366,7 +3394,11 @@ export async function runSeqPipeline(prompt, options = {}) {
         printStageSummary('planner', resolveStageSummary('planner', plannerSummary, plannerContent));
 
         jobPatch({ phase: 'worktree', stage: 'worktree', round: null });
-        const worktree = await createWorktreeFn({ cwd: invocationCwd, slug: runContext.slug });
+        const worktree = await createWorktreeFn({
+            cwd: invocationCwd,
+            slug: runContext.slug,
+            branchPrefix: resolveBranchPrefix({ cwd: invocationCwd }),
+        });
         jobPatch({ branch: worktree.branch, worktree: worktree.worktreePath });
 
         fs.mkdirSync(path.dirname(runContext.statusPath), { recursive: true });
@@ -4345,7 +4377,11 @@ export async function runFanoutPipeline(prompt, options = {}) {
             printStageSummary('planner', resolveStageSummary('planner', plannerSummary, plannerContent));
 
             jobPatch({ phase: 'worktree', stage: 'worktree', round: null });
-            const worktree = createWorktreeFn({ cwd: invocationCwd, slug: runContext.slug });
+            const worktree = createWorktreeFn({
+                cwd: invocationCwd,
+                slug: runContext.slug,
+                branchPrefix: resolveBranchPrefix({ cwd: invocationCwd }),
+            });
             jobPatch({ branch: worktree.branch, worktree: worktree.worktreePath });
 
             fs.mkdirSync(path.dirname(runContext.statusPath), { recursive: true });
