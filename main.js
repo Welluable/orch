@@ -5137,7 +5137,7 @@ program
     .option('--ask', 'Ask a read-only question about the codebase; print the reply and exit (skips triage and all write pipelines). Pair with --from <slug> for a same-session follow-up via ask.json')
     .option('--quick', 'Skip triage, run quick-fix directly in the current working tree; create no artifacts, worktrees, or commits')
     .option('--detach', 'Run the pipeline in the background and return immediately; manage it with orch list/status/pause/resume/stop/logs. Cannot be combined with --ask, --quick, or --dry-run')
-    .option('--pr', 'Always create a worktree, commit, push orch/<slug>, and open a pull request with gh (including triage → quick-fix; skips research/planner on that path). Requires gh on PATH and authenticated. Cannot be combined with --ask, --quick, or --dry-run')
+    .option('--pr', 'Always create a worktree, commit, push <prefix>/<slug>, and open a pull request with gh (including triage → quick-fix; skips research/planner on that path). Requires gh on PATH and authenticated. Cannot be combined with --ask, --quick, or --dry-run')
     .option('--base <branch>', 'Remote base branch for the worktree start point and (with --pr) the pull request base; defaults to the remote\'s default branch when --pr is set')
     .option('--max-rounds <n>', 'Max writer⇄critic and writer⇄runner iterations per implementer loop (ignored with --ask and --quick)', positiveIntParser('--max-rounds'), 5)
     .option('--fan-out', 'Decompose into parallel workers, then integrate once. Cannot be combined with --ask, --quick, --dry-run, --seq, or --decompose')
@@ -5174,6 +5174,9 @@ Examples:
   $ orch config --agent claude                           # pin global default
   $ orch config --agent agn --local                      # pin project default
   $ orch config --agent opencode                         # pin OpenCode as default
+  $ orch config --branch-prefix long_running_session     # pin global prefix
+  $ orch config --branch-prefix long_running_session --local  # pin project prefix
+  $ orch config --branch-prefix orch                     # restore builtin prefix
 
 Headless runs:
   $ orch "long-running task" --detach --agent claude   # start in the background, prints the run slug
