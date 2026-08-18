@@ -126,6 +126,64 @@ describe('createWorktree (injected execFile, argument-level)', () => {
     ]);
   });
 
+  it('uses an injected custom branchPrefix for the branch without changing the worktree path', () => {
+    const { execFile, calls } = makeFakeExecFile([
+      { match: isShowToplevel, stdout: '/repo/root\n' },
+      { match: isWorktreeAdd, stdout: '' },
+    ]);
+
+    const result = createWorktree({
+      cwd: '/repo/root',
+      slug: 'calm-otter-7f3a',
+      branchPrefix: 'sessions',
+      execFile,
+    });
+
+    assert.deepEqual(result, {
+      repoRoot: '/repo/root',
+      worktreePath: '/repo/root-calm-otter-7f3a',
+      branch: 'sessions/calm-otter-7f3a',
+    });
+    assert.deepEqual(calls[1].args, [
+      '-C',
+      '/repo/root',
+      'worktree',
+      'add',
+      '-b',
+      'sessions/calm-otter-7f3a',
+      '/repo/root-calm-otter-7f3a',
+    ]);
+  });
+
+  it('passes a nested branchPrefix through as one argv element and leaves the worktree path unchanged', () => {
+    const { execFile, calls } = makeFakeExecFile([
+      { match: isShowToplevel, stdout: '/repo/root\n' },
+      { match: isWorktreeAdd, stdout: '' },
+    ]);
+
+    const result = createWorktree({
+      cwd: '/repo/root',
+      slug: 'calm-otter-7f3a',
+      branchPrefix: 'manoj/sessions',
+      execFile,
+    });
+
+    assert.deepEqual(result, {
+      repoRoot: '/repo/root',
+      worktreePath: '/repo/root-calm-otter-7f3a',
+      branch: 'manoj/sessions/calm-otter-7f3a',
+    });
+    assert.deepEqual(calls[1].args, [
+      '-C',
+      '/repo/root',
+      'worktree',
+      'add',
+      '-b',
+      'manoj/sessions/calm-otter-7f3a',
+      '/repo/root-calm-otter-7f3a',
+    ]);
+  });
+
   it('rejects a non-git cwd by propagating the rev-parse failure', () => {
     const gitError = Object.assign(new Error('git failed'), {
       stderr: 'fatal: not a git repository (or any of the parent directories): .git',
