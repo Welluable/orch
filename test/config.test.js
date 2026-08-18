@@ -235,6 +235,322 @@ describe('lib/config helpers', () => {
     assert.match(out, /^notifyGlobal=true /m);
     assert.match(out, /^notifyLocal=false /m);
   });
+
+  it('writeConfig/loadConfig round-trip branchPrefix; omit the key until set', () => {
+    const dir = makeTmp('orch-cfg-bp-rt-');
+    const p = path.join(dir, '.orch', 'config');
+
+    writeConfig(p, { agent: 'claude' });
+    assert.equal(fs.readFileSync(p, 'utf8'), '{\n  "agent": "claude"\n}\n');
+    assert.equal('branchPrefix' in JSON.parse(fs.readFileSync(p, 'utf8')), false);
+    assert.deepEqual(loadConfig(p), { agent: 'claude' });
+
+    writeConfig(p, { branchPrefix: 'long_running_session' });
+    assert.equal(
+      fs.readFileSync(p, 'utf8'),
+      '{\n  "agent": "claude",\n  "branchPrefix": "long_running_session"\n}\n',
+    );
+    assert.deepEqual(loadConfig(p), {
+      agent: 'claude',
+      branchPrefix: 'long_running_session',
+    });
+
+    writeConfig(p, { branchPrefix: 'manoj/sessions' });
+    assert.deepEqual(loadConfig(p), {
+      agent: 'claude',
+      branchPrefix: 'manoj/sessions',
+    });
+
+    writeConfig(p, { branchPrefix: 'orch' });
+    assert.equal(JSON.parse(fs.readFileSync(p, 'utf8')).branchPrefix, 'orch');
+    assert.deepEqual(loadConfig(p), { agent: 'claude', branchPrefix: 'orch' });
+    assert.equal(
+      fs.readFileSync(p, 'utf8'),
+      '{\n  "agent": "claude",\n  "branchPrefix": "orch"\n}\n',
+    );
+
+    const onlyPrefix = path.join(dir, 'only', 'config');
+    writeConfig(onlyPrefix, { branchPrefix: 'long_running_session' });
+    assert.equal(
+      fs.readFileSync(onlyPrefix, 'utf8'),
+      '{\n  "branchPrefix": "long_running_session"\n}\n',
+    );
+    assert.deepEqual(loadConfig(onlyPrefix), { branchPrefix: 'long_running_session' });
+  });
+
+  it('writeConfig/loadConfig strip one trailing slash on branchPrefix; do not trim', async () => {
+    const { resolveBranchPrefix } = await import('../lib/config.js');
+    const dir = makeTmp('orch-cfg-bp-slash-');
+    const p = path.join(dir, '.orch', 'config');
+
+    writeConfig(p, { branchPrefix: 'foo/' });
+    assert.equal(JSON.parse(fs.readFileSync(p, 'utf8')).branchPrefix, 'foo');
+    assert.deepEqual(loadConfig(p), { branchPrefix: 'foo' });
+    assert.equal(fs.readFileSync(p, 'utf8'), '{\n  "branchPrefix": "foo"\n}\n');
+
+    fs.writeFileSync(p, '{"branchPrefix":"foo/"}\n');
+    assert.deepEqual(loadConfig(p), { branchPrefix: 'foo' });
+
+    const home = makeTmp('orch-cfg-bp-slash-home-');
+    const cwd = makeTmp('orch-cfg-bp-slash-cwd-');
+    writeConfig(localConfigPath(cwd), { branchPrefix: 'foo' });
+    const fromBare = resolveBranchPrefix({ cwd, homedir: home });
+    writeConfig(localConfigPath(cwd), { branchPrefix: 'foo/' });
+    const fromSlash = resolveBranchPrefix({ cwd, homedir: home });
+    assert.equal(fromBare, 'foo');
+    assert.equal(fromSlash, 'foo');
+
+    for (const value of [' foo', 'foo ']) {
+      assert.throws(
+        () => writeConfig(p, { branchPrefix: value }),
+        (err) => {
+          assert.equal(
+            err.message,
+            `invalid branchPrefix: ${JSON.stringify(value)} (expected a git-safe namespace)`,
+          );
+          return true;
+        },
+      );
+      fs.writeFileSync(p, `${JSON.stringify({ branchPrefix: value })}\n`);
+      assert.throws(
+        () => loadConfig(p, '.orch/config'),
+        (err) => {
+          assert.equal(
+            err.message,
+            `invalid branchPrefix in .orch/config: ${JSON.stringify(value)} (expected a git-safe namespace)`,
+          );
+          return true;
+        },
+      );
+    }
+  });
+
+  it('writeConfig merges branchPrefix with agent/notify without wiping either', () => {
+    const dir = makeTmp('orch-cfg-bp-merge-');
+    const p = path.join(dir, '.orch', 'config');
+
+    writeConfig(p, { agent: 'claude', notify: false });
+    writeConfig(p, { branchPrefix: 'long_running_session' });
+    assert.deepEqual(JSON.parse(fs.readFileSync(p, 'utf8')), {
+      agent: 'claude',
+      notify: false,
+      branchPrefix: 'long_running_session',
+    });
+    assert.equal(
+      fs.readFileSync(p, 'utf8'),
+      '{\n  "agent": "claude",\n  "notify": false,\n  "branchPrefix": "long_running_session"\n}\n',
+    );
+
+    writeConfig(p, { agent: 'agn' });
+    assert.deepEqual(JSON.parse(fs.readFileSync(p, 'utf8')), {
+      agent: 'agn',
+      notify: false,
+      branchPrefix: 'long_running_session',
+    });
+
+    writeConfig(p, { notify: true });
+    assert.deepEqual(JSON.parse(fs.readFileSync(p, 'utf8')), {
+      agent: 'agn',
+      notify: true,
+      branchPrefix: 'long_running_session',
+    });
+    assert.equal(
+      fs.readFileSync(p, 'utf8'),
+      '{\n  "agent": "agn",\n  "notify": true,\n  "branchPrefix": "long_running_session"\n}\n',
+    );
+  });
+
+  it('writeConfig copies existing on-disk branchPrefix through on agent/notify-only writes', () => {
+    const dir = makeTmp('orch-cfg-bp-copy-');
+    const p = path.join(dir, '.orch', 'config');
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, '{\n  "branchPrefix": "foo/"\n}\n');
+    writeConfig(p, { agent: 'claude' });
+    assert.deepEqual(JSON.parse(fs.readFileSync(p, 'utf8')), {
+      agent: 'claude',
+      branchPrefix: 'foo/',
+    });
+  });
+
+  it('loadConfig and writeConfig reject empty, whitespace, and non-string branchPrefix', () => {
+    const dir = makeTmp('orch-cfg-bp-bad-');
+    const p = path.join(dir, '.orch', 'config');
+    const invalid = ['', '   ', 1, true, null, [], {}];
+
+    for (const value of invalid) {
+      assert.throws(
+        () => writeConfig(p, { branchPrefix: value }),
+        (err) => {
+          assert.equal(
+            err.message,
+            `invalid branchPrefix: ${JSON.stringify(value)} (expected a git-safe namespace)`,
+          );
+          return true;
+        },
+      );
+
+      fs.mkdirSync(path.dirname(p), { recursive: true });
+      fs.writeFileSync(p, `${JSON.stringify({ branchPrefix: value })}\n`);
+      assert.throws(
+        () => loadConfig(p, '.orch/config'),
+        (err) => {
+          assert.equal(
+            err.message,
+            `invalid branchPrefix in .orch/config: ${JSON.stringify(value)} (expected a git-safe namespace)`,
+          );
+          return true;
+        },
+      );
+      assert.throws(
+        () => loadConfig(p, '~/.orch/config'),
+        (err) => {
+          assert.equal(
+            err.message,
+            `invalid branchPrefix in ~/.orch/config: ${JSON.stringify(value)} (expected a git-safe namespace)`,
+          );
+          return true;
+        },
+      );
+    }
+  });
+
+  it('loadConfig and writeConfig reject unsafe git branchPrefix names', () => {
+    const dir = makeTmp('orch-cfg-bp-unsafe-');
+    const p = path.join(dir, '.orch', 'config');
+    const unsafe = [
+      'has space',
+      '..',
+      'a//b',
+      'foo//',
+      '/foo',
+      '.foo',
+      'foo.',
+      'foo/.bar',
+      'foo@{bar',
+      'foo\\bar',
+      'a~b',
+      'a^b',
+      'a:b',
+      'a?b',
+      'a*b',
+      'a[b',
+      'a\x01b',
+      'a\x7fb',
+    ];
+
+    for (const value of unsafe) {
+      assert.throws(
+        () => writeConfig(p, { branchPrefix: value }),
+        (err) => {
+          assert.equal(
+            err.message,
+            `invalid branchPrefix: ${JSON.stringify(value)} (expected a git-safe namespace)`,
+          );
+          return true;
+        },
+      );
+
+      fs.mkdirSync(path.dirname(p), { recursive: true });
+      fs.writeFileSync(p, `${JSON.stringify({ branchPrefix: value })}\n`);
+      assert.throws(
+        () => loadConfig(p, '.orch/config'),
+        (err) => {
+          assert.equal(
+            err.message,
+            `invalid branchPrefix in .orch/config: ${JSON.stringify(value)} (expected a git-safe namespace)`,
+          );
+          return true;
+        },
+      );
+    }
+  });
+
+  it('resolveBranchPrefix prefers local > global > orch and never persists a default', async () => {
+    const { resolveBranchPrefix } = await import('../lib/config.js');
+    assert.equal(typeof resolveBranchPrefix, 'function', 'lib/config.js must export resolveBranchPrefix');
+
+    const home = makeTmp('orch-bp-home-');
+    const cwd = makeTmp('orch-bp-cwd-');
+    const globalPath = globalConfigPath({ homedir: home });
+    const localPath = localConfigPath(cwd);
+
+    assert.equal(resolveBranchPrefix({ cwd, homedir: home }), 'orch');
+    assert.equal(fs.existsSync(localPath), false);
+    assert.equal(fs.existsSync(globalPath), false);
+
+    writeConfig(localPath, { agent: 'claude' });
+    writeConfig(globalPath, { notify: true });
+    assert.equal(resolveBranchPrefix({ cwd, homedir: home }), 'orch');
+    assert.equal('branchPrefix' in JSON.parse(fs.readFileSync(localPath, 'utf8')), false);
+    assert.equal('branchPrefix' in JSON.parse(fs.readFileSync(globalPath, 'utf8')), false);
+
+    writeConfig(globalPath, { branchPrefix: 'from_global' });
+    assert.equal(resolveBranchPrefix({ cwd, homedir: home }), 'from_global');
+
+    writeConfig(localPath, { branchPrefix: 'from_local' });
+    assert.equal(resolveBranchPrefix({ cwd, homedir: home }), 'from_local');
+  });
+
+  it('resolveBranchPrefix throws on invalid prefix or bad JSON like invalid agent', async () => {
+    const { resolveBranchPrefix } = await import('../lib/config.js');
+    const home = makeTmp('orch-bp-bad-home-');
+    const cwd = makeTmp('orch-bp-bad-cwd-');
+    const globalPath = globalConfigPath({ homedir: home });
+    const localPath = localConfigPath(cwd);
+    fs.mkdirSync(path.dirname(globalPath), { recursive: true });
+    fs.mkdirSync(path.dirname(localPath), { recursive: true });
+
+    fs.writeFileSync(localPath, '{"branchPrefix":""}\n');
+    assert.throws(
+      () => resolveBranchPrefix({ cwd, homedir: home }),
+      (err) => {
+        assert.equal(
+          err.message,
+          'invalid branchPrefix in .orch/config: "" (expected a git-safe namespace)',
+        );
+        return true;
+      },
+    );
+
+    fs.rmSync(localPath, { force: true });
+    fs.writeFileSync(globalPath, '{"branchPrefix":"bad name"}\n');
+    assert.throws(
+      () => resolveBranchPrefix({ cwd, homedir: home }),
+      (err) => {
+        assert.equal(
+          err.message,
+          'invalid branchPrefix in ~/.orch/config: "bad name" (expected a git-safe namespace)',
+        );
+        return true;
+      },
+    );
+
+    writeConfig(localPath, { branchPrefix: 'ok' });
+    fs.writeFileSync(globalPath, '{broken');
+    assert.throws(
+      () => resolveBranchPrefix({ cwd, homedir: home }),
+      /could not parse ~\/\.orch\/config/,
+    );
+
+    fs.writeFileSync(localPath, '{nope');
+    assert.throws(
+      () => resolveBranchPrefix({ cwd, homedir: home }),
+      /could not parse \.orch\/config/,
+    );
+
+    writeConfig(localPath, { branchPrefix: 'ok' });
+    fs.writeFileSync(globalPath, '{"branchPrefix":""}\n');
+    assert.throws(
+      () => resolveBranchPrefix({ cwd, homedir: home }),
+      (err) => {
+        assert.equal(
+          err.message,
+          'invalid branchPrefix in ~/.orch/config: "" (expected a git-safe namespace)',
+        );
+        return true;
+      },
+    );
+  });
 });
 
 describe('orch config CLI', () => {
