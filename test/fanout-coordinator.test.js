@@ -10,6 +10,7 @@ import { readFanout, writeFanout, patchWorker, patchIntegration } from '../lib/f
 import { jobPaths, readJob, writeJob, patchJob } from '../lib/jobs.js';
 import { allocateJob as realAllocateJob } from '../lib/job-lifecycle.js';
 import { exitCodeForSignal } from '../lib/agent.js';
+import { writeConfig, localConfigPath } from '../lib/config.js';
 
 /**
  * Contract this file pins down for the fan-out phase 3 coordinator (see
@@ -145,6 +146,11 @@ const mainPath = path.join(__dirname, '..', 'main.js');
 
 function makeTmpCwd(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+}
+
+function pinLocalBranchPrefix(cwd, prefix = 'long_running_session') {
+  writeConfig(localConfigPath(cwd), { branchPrefix: prefix });
+  return prefix;
 }
 
 function sleep(ms) {
@@ -569,6 +575,7 @@ describe('runFanoutPipeline — boundaries + decomposer + validation repair loop
 describe('runFanoutPipeline — decline path (decomposable:false falls to single-worktree pipeline)', () => {
   it('runs research → planner → worktree → test loop → code loop → commit in the coordinator\'s own job directory; no workers scheduled', async () => {
     const cwd = makeTmpCwd('orch-fanout-decline-');
+    const prefix = pinLocalBranchPrefix(cwd);
     const jobSlug = 'wise-pine-e904';
     seedCoordinatorJob(cwd, jobSlug);
 
@@ -620,6 +627,7 @@ describe('runFanoutPipeline — decline path (decomposable:false falls to single
     );
     assert.equal(createWorktreeMock.mock.calls.length, 1);
     assert.equal(createWorktreeMock.mock.calls[0].arguments[0].slug, jobSlug);
+    assert.equal(createWorktreeMock.mock.calls[0].arguments[0].branchPrefix, prefix);
     assert.equal(commitWorktreeMock.mock.calls.length, 1);
     assert.equal(readFanout(cwd, jobSlug), null);
     assert.equal(readJob(cwd, jobSlug).state, 'done');

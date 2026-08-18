@@ -12,6 +12,7 @@ import {
   readAskSession,
   writeAskSession,
 } from '../lib/ask-session.js';
+import { writeConfig, localConfigPath } from '../lib/config.js';
 import * as agentLib from '../lib/agent.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -21,6 +22,30 @@ const mainPath = path.join(__dirname, '..', 'main.js');
  * assertions (mirrors test/headless.test.js's makeTmpCwd). */
 function makeTmpCwd(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+}
+
+const PINNED_BRANCH_PREFIX = 'long_running_session';
+
+function pinLocalBranchPrefix(cwd, prefix = PINNED_BRANCH_PREFIX) {
+  writeConfig(localConfigPath(cwd), { branchPrefix: prefix });
+  return prefix;
+}
+
+/** runPipeline creates at process.cwd(); pin/chdir against that, not jobCwd. */
+async function withChdirAndIsolatedHome(dir, fn) {
+  const prevCwd = process.cwd();
+  const prevHome = process.env.HOME;
+  const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-home-'));
+  process.env.HOME = isolatedHome;
+  process.chdir(dir);
+  try {
+    return await fn();
+  } finally {
+    process.chdir(prevCwd);
+    if (prevHome === undefined) delete process.env.HOME;
+    else process.env.HOME = prevHome;
+    fs.rmSync(isolatedHome, { recursive: true, force: true });
+  }
 }
 
 /** Wraps a captured-calls patchJob mock so it *also* writes through to the
@@ -143,6 +168,33 @@ describe('main.js CLI', () => {
       assert.equal(code, 1);
       assert.match(stdout, /^fail$/m);
       assert.match(stderr, /agent not found/i);
+    }
+  });
+
+  it('--dry-run never creates a worktree even with a pinned local branchPrefix', async () => {
+    const cwd = makeTmpCwd('orch-dry-prefix-');
+    const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-dry-home-'));
+    try {
+      pinLocalBranchPrefix(cwd);
+      const { stdout } = await runCli(['noop', '--dry-run', '--agent', 'claude'], {
+        cwd,
+        env: { ...process.env, HOME: isolatedHome },
+      });
+      assert.match(stdout, /^(pass|fail)$/m);
+      assert.doesNotMatch(stdout, /triage|research|planner|test-writer|code-writer/i);
+      const siblingPrefix = `${path.basename(cwd)}-`;
+      const siblings = fs.readdirSync(path.dirname(cwd)).filter((name) => name.startsWith(siblingPrefix));
+      assert.deepEqual(siblings, [], `dry-run must not create sibling worktrees, created: ${siblings.join(',')}`);
+      const orchDir = path.join(cwd, '.orch');
+      const orchEntries = fs.existsSync(orchDir) ? fs.readdirSync(orchDir) : [];
+      assert.deepEqual(
+        orchEntries.filter((entry) => entry !== 'config'),
+        [],
+        'dry-run must not allocate a job directory',
+      );
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true });
+      fs.rmSync(isolatedHome, { recursive: true, force: true });
     }
   });
 
@@ -656,6 +708,69 @@ describe('runPipeline cwd-scoped artifacts and orch-owned worktrees', () => {
     assert.equal(byRole['test-critic'].options?.cwd, worktree.worktreePath);
     assert.equal(byRole['code-writer'].options?.cwd, worktree.worktreePath);
     assert.equal(byRole['test-runner'].options?.cwd, worktree.worktreePath);
+  });
+
+  it('passes the pinned local branchPrefix into createWorktree on the complex path', async () => {
+    const tmpCwd = makeTmpCwd('orch-prefix-complex-');
+    const prefix = pinLocalBranchPrefix(tmpCwd);
+    try {
+      await withChdirAndIsolatedHome(tmpCwd, async () => {
+        const slug = 'prefix-complex-0000';
+        seedForegroundJob(tmpCwd, slug, 'do something complex');
+        const runContext = fakeRunContext(tmpCwd, slug);
+        const worktree = fakeWorktree(tmpCwd, slug);
+        const createWorktreeMock = mock.fn(() => worktree);
+        const MockAgentClass = createMockAgentClass(complexPassBehaviors());
+        const logSpy = mock.method(console, 'log', () => {});
+        try {
+          await runPipeline('do something complex', {
+            agent: 'claude',
+            AgentClass: MockAgentClass,
+            createRunContext: mock.fn(() => runContext),
+            createWorktree: createWorktreeMock,
+            commitWorktree: mock.fn(() => fakeCommitResult(worktree.branch)),
+            jobSlug: slug,
+            jobCwd: tmpCwd,
+            patchJob: realDiskPatchJobSpy([]),
+          });
+        } finally {
+          logSpy.mock.restore();
+        }
+
+        assert.equal(createWorktreeMock.mock.calls.length, 1);
+        assert.equal(createWorktreeMock.mock.calls[0].arguments[0].slug, slug);
+        assert.equal(createWorktreeMock.mock.calls[0].arguments[0].cwd, process.cwd());
+        assert.equal(createWorktreeMock.mock.calls[0].arguments[0].branchPrefix, prefix);
+      });
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('dry-run never calls createWorktree even with a pinned local branchPrefix', async () => {
+    const tmpCwd = makeTmpCwd('orch-prefix-dry-');
+    pinLocalBranchPrefix(tmpCwd);
+    try {
+      await withChdirAndIsolatedHome(tmpCwd, async () => {
+        const createWorktreeMock = mock.fn(() => fakeWorktree(tmpCwd));
+        const logSpy = mock.method(console, 'log', () => {});
+        const exitSpy = mock.method(process, 'exit', () => {});
+        try {
+          await runPipeline('noop', {
+            agent: 'claude',
+            dryRun: true,
+            AgentClass: createMockAgentClass(complexPassBehaviors()),
+            createWorktree: createWorktreeMock,
+          });
+        } finally {
+          logSpy.mock.restore();
+          exitSpy.mock.restore();
+        }
+        assert.equal(createWorktreeMock.mock.calls.length, 0);
+      });
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
   });
 
   it('research and planner prompts reference the exact absolute paths, not a <taskname> placeholder', async () => {
@@ -3595,6 +3710,7 @@ describe('runPipeline publish (--pr)', () => {
   it('with --pr: publish runs after commit; run.json gains pushedAt/prUrl/prNumber; status.md gains a PR section; merge hint is suppressed', async () => {
     const tmpCwd = makeTmpCwd('orch-publish-pr-');
     try {
+      const prefix = pinLocalBranchPrefix(tmpCwd);
       const slug = 'publish-pr-ok-0000';
       seedForegroundJob(tmpCwd, slug, 'Add publish phase');
       const runContext = fakeRunContext(tmpCwd, slug);
@@ -3615,7 +3731,7 @@ describe('runPipeline publish (--pr)', () => {
 
       const { logs, restore } = collectLogs();
       try {
-        await runPipeline('Add publish phase', {
+        await withChdirAndIsolatedHome(tmpCwd, () => runPipeline('Add publish phase', {
           agent: 'claude',
           pr: true,
           AgentClass: MockAgentClass,
@@ -3629,7 +3745,7 @@ describe('runPipeline publish (--pr)', () => {
           jobSlug: slug,
           jobCwd: tmpCwd,
           patchJob: patchJobMock,
-        });
+        }));
       } finally {
         restore();
       }
@@ -3637,6 +3753,7 @@ describe('runPipeline publish (--pr)', () => {
       assert.equal(resolveBaseBranchMock.mock.calls.length, 1);
       assert.equal(fetchBaseMock.mock.calls.length, 1);
       assert.equal(createWorktreeMock.mock.calls[0].arguments[0].base, 'origin/main');
+      assert.equal(createWorktreeMock.mock.calls[0].arguments[0].branchPrefix, prefix);
 
       assert.equal(publishMock.mock.calls.length, 1);
       const publishArg = publishMock.mock.calls[0].arguments[0];
@@ -3834,6 +3951,7 @@ describe('runPipeline publish (--pr)', () => {
   it('simple + --pr: worktree + commit + publish (no research/planner); logs pr url; job gains PR fields', async () => {
     const tmpCwd = makeTmpCwd('orch-publish-simple-pr-');
     try {
+      const prefix = pinLocalBranchPrefix(tmpCwd);
       const slug = 'publish-simple-pr-0000';
       seedForegroundJob(tmpCwd, slug, 'fix the typo');
       const runContext = fakeRunContext(tmpCwd, slug);
@@ -3861,7 +3979,7 @@ describe('runPipeline publish (--pr)', () => {
       const { logs, restore } = collectLogs();
       const exitSpy = mock.method(process, 'exit', () => {});
       try {
-        await runPipeline('fix the typo', {
+        await withChdirAndIsolatedHome(tmpCwd, () => runPipeline('fix the typo', {
           agent: 'claude',
           pr: true,
           AgentClass: MockAgentClass,
@@ -3875,7 +3993,7 @@ describe('runPipeline publish (--pr)', () => {
           jobSlug: slug,
           jobCwd: tmpCwd,
           patchJob: realDiskPatchJobSpy(patchCalls),
-        });
+        }));
       } finally {
         restore();
         exitSpy.mock.restore();
@@ -3886,6 +4004,7 @@ describe('runPipeline publish (--pr)', () => {
       assert.equal(createWorktreeMock.mock.calls.length, 1);
       assert.equal(createWorktreeMock.mock.calls[0].arguments[0].base, 'origin/main');
       assert.equal(createWorktreeMock.mock.calls[0].arguments[0].slug, slug);
+      assert.equal(createWorktreeMock.mock.calls[0].arguments[0].branchPrefix, prefix);
       assert.equal(commitWorktreeMock.mock.calls.length, 1);
       assert.equal(commitWorktreeMock.mock.calls[0].arguments[0].worktreePath, worktree.worktreePath);
       assert.equal(publishMock.mock.calls.length, 1);

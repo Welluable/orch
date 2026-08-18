@@ -6,6 +6,7 @@ import path from 'node:path';
 import { runContinuePipeline } from '../main.js';
 import { readJob, writeJob, reopenJob } from '../lib/jobs.js';
 import { validateContinue, snapshotPriorOutcome } from '../lib/continue.js';
+import { writeConfig, localConfigPath } from '../lib/config.js';
 
 /**
  * Contract this file pins down for `runContinuePipeline` — the net-new
@@ -71,6 +72,11 @@ import { validateContinue, snapshotPriorOutcome } from '../lib/continue.js';
 
 function makeTmpCwd(prefix = 'orch-continue-pipeline-') {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+}
+
+function pinLocalBranchPrefix(cwd, prefix = 'long_running_session') {
+  writeConfig(localConfigPath(cwd), { branchPrefix: prefix });
+  return prefix;
 }
 
 function agentRole(name) {
@@ -198,6 +204,7 @@ function seedForegroundContinueJob(cwd, slug, task) {
 describe('runContinuePipeline — skips triage and worktree creation', () => {
   it('constructs research → planner → test-writer → test-critic → code-writer → test-runner, with no triage', async () => {
     const cwd = makeTmpCwd();
+    pinLocalBranchPrefix(cwd);
     const slug = 'quirky-oasis-906b';
     const branch = `orch/${slug}`;
     const worktreePath = path.join(path.dirname(cwd), `${path.basename(cwd)}-${slug}`);
