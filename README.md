@@ -32,7 +32,7 @@ orch: commit: a1b2c3d on orch/verbose-flag-x7q2
   and frozen before any implementation code exists, so "done" means "passes
   the check," not "the agent said so."
 - **Isolated implementation.** Complex tasks run in a persistent sibling git
-  worktree on an `orch/<slug>` branch, so your working tree stays untouched
+  worktree on a `<prefix>/<slug>` branch, so your working tree stays untouched
   until you decide to merge.
 - **Agent-agnostic backends.** Pick the CLI you already trust with
   `--agent cursor|claude|agn|opencode` — orch owns the pipeline, the agent CLI does
@@ -78,11 +78,11 @@ From there, either a short path or the full phase sequence runs.
 | Quick-fix | A single agent edits directly; without `--pr`, in the current tree (no artifacts/worktree). With `--pr`, in a fresh worktree, then commit + publish. |
 | Research | Reads the codebase and invocation-directory context, writes `research.md`. |
 | Plan | Turns research into a concrete task checklist, writes `task.md`. |
-| Worktree | Creates a sibling git worktree and an `orch/<slug>` branch for isolated implementation. |
+| Worktree | Creates a sibling git worktree and a `<prefix>/<slug>` branch for isolated implementation. |
 | Test loop | `test-writer` ⇄ `test-critic` iterate until tests/acceptance criteria are frozen. |
 | Code loop | `code-writer` ⇄ `test-runner` iterate until the runner passes. |
 | Commit | Commits the passing state on the run's branch inside the worktree. |
-| Publish | With `--pr`: pushes `orch/<slug>` and opens a pull request via `gh`. |
+| Publish | With `--pr`: pushes `<prefix>/<slug>` and opens a pull request via `gh`. |
 
 `--ask`, `--quick`, and `--dry-run` are alternate entry paths that bypass some
 or all of this table — see [Execution modes](#execution-modes).
@@ -136,7 +136,7 @@ you invoked `orch`, plus a persistent sibling git worktree and branch:
   orch.log                            # full stdout/stderr of the run; --detach only
 
 <parent-of-repo>/<repo-name>-<slug>   # worktree
-orch/<slug>                           # branch
+<prefix>/<slug>                       # branch
 ```
 
 `research` and `planner` run in your invocation directory and write to the
@@ -155,11 +155,11 @@ runs, since foreground runs already stream their output to your terminal.
 ## Architecture
 
 ```text
-┌────────────┐     ┌──────────────────────┐     ┌────────────────────┐
-│   orch CLI │ ──► │ stages (triage,      │ ──► │  git worktree +     │
-│ (Commander)│     │ research, plan,      │     │  orch/<slug> branch │
-│            │     │ test/code loops)     │     │  (implementation)   │
-└────────────┘     └──────────┬───────────┘     └────────────────────┘
+┌────────────┐     ┌──────────────────────┐     ┌─────────────────────────┐
+│   orch CLI │ ──► │ stages (triage,      │ ──► │  git worktree +         │
+│ (Commander)│     │ research, plan,      │     │  <prefix>/<slug> branch │
+│            │     │ test/code loops)     │     │  (implementation)       │
+└────────────┘     └──────────┬───────────┘     └─────────────────────────┘
                                │
                                ▼
                     ┌──────────────────────┐
@@ -181,7 +181,7 @@ agent CLI does all the actual reading and writing of files.
 | `--ask` | Skips triage and all write pipelines; one read-only agent answers and orch prints the reply. | You want an answer about the codebase, not a change. |
 | `--dry-run` | Checks the selected agent CLI is on `PATH` and exits without running the pipeline. | You want to sanity-check your setup before a real run. |
 | `--detach` | Runs the pipeline in a background process and returns immediately, printing the run slug. Manage it with `orch list/status/pause/resume/stop/logs`. | You want to kick off a run and keep using your shell, or run several tasks concurrently. |
-| `--pr` | Always create a worktree, commit, push `orch/<slug>`, and open a PR with `gh` — including when triage routes to quick-fix (research/planner skipped on that path). | You want a PR instead of a local merge hint (required later for served jobs). |
+| `--pr` | Always create a worktree, commit, push `<prefix>/<slug>`, and open a PR with `gh` — including when triage routes to quick-fix (research/planner skipped on that path). | You want a PR instead of a local merge hint (required later for served jobs). |
 | `--decompose` | Plan-only sequential split: research → seq-decomposer → write `seq.json` (`state: planned`) and exit. No worktrees or unit spawns. | You want a reviewable backlog before spending N worktrees. |
 | `--seq --from <slug>` | Load a planned `seq.json` and run today's seq schedule loop (skips triage/research/decompose). | You approved a `--decompose` plan and want to implement it. |
 | `--ask --from <slug>` | Same-session **read-only** follow-up against `.orch/<slug>/ask.json` (reuses the ask slug; required follow-up prompt). | Continue an earlier `--ask` thread without starting a new slug. |
@@ -209,7 +209,7 @@ directory, each with its own slug.
 ### Pull requests
 
 `orch "<task>" --pr` always ends with a worktree-based publish: push
-`orch/<slug>` to `origin`, then open a PR with `gh` (or reuse an existing
+`<prefix>/<slug>` to `origin`, then open a PR with `gh` (or reuse an existing
 open PR for that head). When triage chooses quick-fix, orch still
 creates the worktree and publishes — it only skips research, planner, and
 the test/code loops. The PR title is the first line of the task; the
@@ -253,7 +253,7 @@ Usage: orch [options] [command] <task...>
   tree; creates no artifacts, worktrees, or commits.
 - `--detach` — runs the pipeline in the background and returns immediately,
   printing `started <slug> (pid <pid>)`; rejects `--ask`/`--quick`/`--dry-run`.
-- `--pr` — always create a worktree, commit, push `orch/<slug>`, and open a
+- `--pr` — always create a worktree, commit, push `<prefix>/<slug>`, and open a
   pull request with `gh` (including triage → quick-fix); requires `gh` on
   `PATH` and authenticated; rejects `--ask`/`--quick`/`--dry-run`. See
   [Pull requests](#pull-requests).
@@ -265,7 +265,7 @@ Usage: orch [options] [command] <task...>
 - `--fan-out` — decomposes the task into parallel workers coordinated by this
   process instead of running the single-worktree pipeline (see
   [Fan-out](#fan-out)); rejects `--ask`/`--quick`/`--dry-run`/`--seq`/`--decompose`.
-- `--seq` — decomposes into ordered units, merges each into `orch/<slug>`,
+- `--seq` — decomposes into ordered units, merges each into `<prefix>/<slug>`,
   then adjusts the near-term backlog (see
   [Sequential multi-unit (`--seq`)](#sequential-multi-unit---seq)); rejects
   `--fan-out`/`--ask`/`--quick`/`--dry-run`/`--decompose`. With `--from <slug>`,
@@ -299,13 +299,18 @@ Usage: orch [options] [command] <task...>
 
 Config:
 
-- `orch config` — prints the effective agent and notify settings and which
-  file(s) contributed (local / global / default). Does not prompt.
+- `orch config` — prints the effective agent, notify, and branchPrefix settings
+  and which file(s) contributed (local / global / default). Does not prompt.
 - `orch config --agent <cursor|claude|agn|opencode> [--global|--local]` — writes the
   default agent. Bare `--agent` (and `--global`) write `~/.orch/config`;
   `--local` writes `<cwd>/.orch/config`. There is no `orch init`.
 - `orch config --notify` / `--no-notify` `[--local|--global]` — set desktop
   notify on or off without wiping `agent` (keys merge on write).
+- `orch config --branch-prefix <ns> [--global|--local]` — pin the git branch
+  prefix (`<prefix>/<slug>`; default prefix `orch`). Bare `--branch-prefix`
+  (and `--global`) write `~/.orch/config`; `--local` writes `<cwd>/.orch/config`.
+  Restore the builtin with `--branch-prefix orch`. Keys merge on write (must
+  not wipe `agent`/`notify`).
 
 Job-control subcommands (see [Headless runs](#headless-runs)):
 
@@ -362,6 +367,9 @@ orch config
 orch config --agent claude
 orch config --agent agn --local
 orch config --agent opencode
+orch config --branch-prefix long_running_session
+orch config --branch-prefix long_running_session --local
+orch config --branch-prefix orch
 ```
 
 ## Headless runs
@@ -592,7 +600,7 @@ again.
 
 Big features fail in one context window. orch splits them into units agents
 can finish. `--fan-out` runs independent units in parallel; `--seq` runs
-ordered units one-by-one, merging each into `orch/<slug>` before adjusting
+ordered units one-by-one, merging each into `<prefix>/<slug>` before adjusting
 the next.
 
 | | `--fan-out` | `--seq` |
@@ -628,7 +636,7 @@ The flow, in order:
    backlog, or declines → today's single-worktree pipeline with no `seq.json`.
 3. **Schedule** runs concurrency 1: spawn the first pending unit at the current
    tip → wait → on failure stop the chain → on success merge into
-   `orch/<parent-slug>`, runner-first verify, advance tip, hybrid-adjust the
+   `<prefix>/<parent-slug>`, runner-first verify, advance tip, hybrid-adjust the
    next 1–2 pending units (or drop obsolete ones), continue.
 4. **Continue / resume.** Fix a failed unit with `orch resume <unit-slug>`,
    then `orch --seq-continue <parent>` (or `orch resume <parent>` when paused).
@@ -637,7 +645,7 @@ The flow, in order:
 
 `--max-units` (default `8`) caps both the initial backlog and adjust growth.
 Unit children set `ORCH_SEQ_DEPTH=1` and `ORCH_FANOUT_DEPTH=1` so they cannot
-nest `--seq` or `--fan-out`. Deliverable stays on `orch/<parent-slug>` until
+nest `--seq` or `--fan-out`. Deliverable stays on `<prefix>/<parent-slug>` until
 you merge it yourself.
 
 To plan first and implement later, use [`--decompose`](#decompose---decompose)
@@ -676,7 +684,7 @@ up to two repair rounds orch fails the job rather than inventing a unit.
 
 `--max-units` (default `8`) caps the backlog. `--detach` is allowed. Job
 `role` stays unset until `--seq --from` promotes the same slug to
-`coordinator`. The coordinator worktree/`orch/<slug>` branch is created at
+`coordinator`. The coordinator worktree/`<prefix>/<slug>` branch is created at
 **execute** time (`--from`), not during plan — tip may drift between plan and
 run; v1 advances tip to current `HEAD` when starting from `planned`.
 
@@ -703,7 +711,7 @@ layout shown in [Artifacts and worktrees](#artifacts-and-worktrees):
   orch.log                            # --detach only
 
 <parent-of-repo>/<repo-name>-<slug>   # worktree
-orch/<slug>                           # branch
+<prefix>/<slug>                       # branch
 ```
 
 Default quick-fixes, `--quick`, and `--ask` runs still get a `.orch/<slug>/`
