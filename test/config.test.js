@@ -691,6 +691,7 @@ describe('orch config CLI', () => {
     const { code, stderr } = await runCli(['config', '--local'], { cwd, env });
     assert.equal(code, 1);
     assert.match(stderr, /--global\/--local require/);
+    assert.match(stderr, /--branch-prefix/);
   });
 
   it('--agent foo is still rejected by Commander', async () => {
@@ -795,5 +796,108 @@ describe('orch config CLI', () => {
     assert.equal(code, 0);
     assert.match(stdout, /--notify/);
     assert.match(stdout, /--no-notify/);
+  });
+
+  it('help lists --branch-prefix', async () => {
+    const { code, stdout } = await runCli(
+      ['config', '--help'],
+      { cwd: makeTmp('orch-help-bp-'), env: freshEnv() },
+    );
+    assert.equal(code, 0);
+    assert.match(stdout, /--branch-prefix/);
+  });
+
+  it('orch config --branch-prefix long_running_session writes ~/.orch/config (not cwd)', async () => {
+    const env = freshEnv();
+    const { code, stdout, stderr } = await runCli(
+      ['config', '--branch-prefix', 'long_running_session'],
+      { cwd, env },
+    );
+    assert.equal(code, 0, stderr);
+    const globalPath = path.join(home, '.orch', 'config');
+    assert.match(stdout, /^wrote /m);
+    assert.match(stdout, /"branchPrefix"/);
+    assert.equal(
+      JSON.parse(fs.readFileSync(globalPath, 'utf8')).branchPrefix,
+      'long_running_session',
+    );
+    assert.equal(fs.existsSync(path.join(cwd, '.orch', 'config')), false);
+
+    const printed = await runCli(['config'], { cwd, env });
+    assert.equal(printed.code, 0, printed.stderr);
+    assert.match(printed.stdout, /^branchPrefix=long_running_session$/m);
+    assert.match(printed.stdout, /^branchPrefixSource=global /m);
+    assert.match(printed.stdout, /^branchPrefixGlobal=long_running_session /m);
+    assert.match(printed.stdout, /^branchPrefixLocal=unset /m);
+  });
+
+  it('orch config --branch-prefix long_running_session --local writes <cwd>/.orch/config', async () => {
+    const env = freshEnv();
+    const { code, stdout, stderr } = await runCli(
+      ['config', '--branch-prefix', 'long_running_session', '--local'],
+      { cwd, env },
+    );
+    assert.equal(code, 0, stderr);
+    const localPath = path.join(cwd, '.orch', 'config');
+    assert.match(stdout, /^wrote /m);
+    assert.match(stdout, /"branchPrefix"/);
+    assert.equal(
+      JSON.parse(fs.readFileSync(localPath, 'utf8')).branchPrefix,
+      'long_running_session',
+    );
+    assert.equal(fs.existsSync(path.join(home, '.orch', 'config')), false);
+  });
+
+  it('orch config --branch-prefix orch stores the string orch (source is not builtin)', async () => {
+    const env = freshEnv();
+    const { code, stdout, stderr } = await runCli(
+      ['config', '--branch-prefix', 'orch'],
+      { cwd, env },
+    );
+    assert.equal(code, 0, stderr);
+    const globalPath = path.join(home, '.orch', 'config');
+    assert.equal(JSON.parse(fs.readFileSync(globalPath, 'utf8')).branchPrefix, 'orch');
+    assert.match(stdout, /"branchPrefix": "orch"/);
+
+    const printed = await runCli(['config'], { cwd, env });
+    assert.equal(printed.code, 0, printed.stderr);
+    assert.match(printed.stdout, /^branchPrefix=orch$/m);
+    assert.match(printed.stdout, /^branchPrefixSource=global /m);
+    assert.doesNotMatch(printed.stdout, /^branchPrefixSource=default \(builtin\)$/m);
+
+    const localWrite = await runCli(
+      ['config', '--branch-prefix', 'orch', '--local'],
+      { cwd, env },
+    );
+    assert.equal(localWrite.code, 0, localWrite.stderr);
+    assert.equal(
+      JSON.parse(fs.readFileSync(path.join(cwd, '.orch', 'config'), 'utf8')).branchPrefix,
+      'orch',
+    );
+
+    const localPrinted = await runCli(['config'], { cwd, env });
+    assert.equal(localPrinted.code, 0, localPrinted.stderr);
+    assert.match(localPrinted.stdout, /^branchPrefix=orch$/m);
+    assert.match(localPrinted.stdout, /^branchPrefixSource=local /m);
+    assert.doesNotMatch(localPrinted.stdout, /^branchPrefixSource=default \(builtin\)$/m);
+  });
+
+  it('orch config prints builtin branchPrefix after notify when nothing is set', async () => {
+    const env = freshEnv();
+    const { code, stdout, stderr } = await runCli(['config'], { cwd, env });
+    assert.equal(code, 0, stderr);
+    assert.match(stdout, /^branchPrefix=orch$/m);
+    assert.match(stdout, /^branchPrefixSource=default \(builtin\)$/m);
+    assert.match(stdout, /^branchPrefixGlobal=unset /m);
+    assert.match(stdout, /^branchPrefixLocal=unset /m);
+
+    const notifyLocal = stdout.match(/^notifyLocal=.*$/m);
+    const branchPrefix = stdout.match(/^branchPrefix=.*$/m);
+    assert.ok(notifyLocal, 'expected notifyLocal= line');
+    assert.ok(branchPrefix, 'expected branchPrefix= line');
+    assert.ok(
+      stdout.indexOf(notifyLocal[0]) < stdout.indexOf(branchPrefix[0]),
+      'branchPrefix quartet must follow notify lines',
+    );
   });
 });
