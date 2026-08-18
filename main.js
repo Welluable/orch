@@ -5725,6 +5725,7 @@ program
     )
     .option('--notify', 'Set notify: true in the target config')
     .option('--no-notify', 'Set notify: false in the target config')
+    .option('--branch-prefix <ns>', 'Set the default git branch prefix')
     .option('--global', 'Write the global config (~/.orch/config); default when setting a value')
     .option('--local', 'Write the project-local config (.orch/config)')
     .action((options, command) => {
@@ -5751,10 +5752,11 @@ program
 
         const settingNotify = hasNotify || hasNoNotify;
         const settingAgent = Boolean(opts.agent);
-        const writing = settingAgent || settingNotify;
+        const settingBranchPrefix = opts.branchPrefix !== undefined;
+        const writing = settingAgent || settingNotify || settingBranchPrefix;
 
         if ((opts.global || opts.local) && !writing) {
-            console.error('Error: --global/--local require --agent, --notify, or --no-notify (omit flags to print config)');
+            console.error('Error: --global/--local require --agent, --notify, --no-notify, or --branch-prefix (omit flags to print config)');
             process.exit(1);
             return;
         }
@@ -5767,6 +5769,7 @@ program
             if (settingAgent) patch.agent = opts.agent;
             if (hasNotify) patch.notify = true;
             if (hasNoNotify) patch.notify = false;
+            if (settingBranchPrefix) patch.branchPrefix = opts.branchPrefix;
             try {
                 writeConfig(targetPath, patch);
             } catch (err) {
