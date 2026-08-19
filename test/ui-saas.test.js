@@ -136,62 +136,57 @@ function hasCssColor(css, hex) {
 }
 
 describe('ui-saas design tokens (design.md)', () => {
-  it('defines dark SaaS palette tokens in globals.css', () => {
+  it('defines light SaaS palette tokens in globals.css', () => {
     const cssPath = globalsCssPath();
     assert.ok(cssPath, 'expected ui/app/globals.css');
     const css = read(cssPath);
 
     assert.ok(
-      hasCssColor(css, '000000') || /--(?:bg|background)\s*:\s*#000\b/i.test(css),
-      'expected background token #000000 (pure black canvas)',
+      hasCssColor(css, 'ffffff') || /--(?:bg|background)\s*:\s*#fff\b/i.test(css),
+      'expected background token #ffffff (white canvas)',
     );
     assert.ok(
-      hasCssColor(css, '0d1117'),
-      'expected surface token #0d1117',
+      hasCssColor(css, 'f7f7f8'),
+      'expected surface token #f7f7f8',
     );
     assert.ok(
-      hasCssColor(css, '8dd6ff'),
-      'expected primary/accent token #8dd6ff',
+      hasCssColor(css, '8e8ea0'),
+      'expected primary/accent token #8e8ea0',
     );
     assert.ok(
-      hasCssColor(css, '111111') || /--(?:on-primary|accent-ink|primary-ink)\s*:\s*#111\b/i.test(css),
-      'expected on-primary #111111 for contrast on cyan CTAs',
+      hasCssColor(css, '000000') || /--(?:text|ink)\s*:\s*#000\b/i.test(css),
+      'expected text token #000000 for primary content text',
     );
     assert.ok(
-      hasCssColor(css, '484f58'),
-      'expected muted slate #484f58 for secondary UI (not YAML text-muted #000000 on dark)',
+      hasCssColor(css, '8e8ea0'),
+      'expected muted token #8e8ea0 for secondary UI',
     );
 
-    // design.md requires white (#ffffff) for primary text and borders — not only
-    // as an optional focus-ring color, and not as a leftover light --surface.
+    // design.md (light) requires black (#000000) primary text on a white canvas
+    // with a subtle rgba border, not the prior dark-theme white-on-black tokens.
     assert.ok(
-      /--(?:text|ink|fg|color-text|on-background|on-bg)\s*:\s*#(?:ffffff|fff)\b/i.test(css) ||
-        (/--(?:text|ink)\s*:\s*var\(--[^)]+\)/i.test(css) &&
-          hasCssColor(css, 'ffffff') &&
-          /(?:^|[{\s;])(?:color| --(?:text|ink))\s*:\s*#(?:ffffff|fff)\b/im.test(css)),
-      'expected white (#ffffff) primary text token (--text / --ink or equivalent)',
+      /--(?:text|ink|fg|color-text|on-background|on-bg)\s*:\s*#(?:000000|000)\b/i.test(css),
+      'expected black (#000000) primary text token (--text / --ink or equivalent)',
     );
     assert.ok(
-      /--(?:border|line|stroke|border-color)\s*:\s*#(?:ffffff|fff)\b/i.test(css),
-      'expected white (#ffffff) border token (--border / --line or equivalent)',
+      /--(?:border|line|stroke|border-color)\s*:\s*rgba\(\s*0,\s*0,\s*0,/i.test(css),
+      'expected rgba(0, 0, 0, ...) border token (--border / --line or equivalent)',
     );
-    // Light-theme surface white must not be the elevated surface on dark canvas.
+    // Dark-theme surface/background must not linger after the revert.
     assert.doesNotMatch(
       css,
-      /--surface\s*:\s*#(?:ffffff|fff)\b/i,
-      'must not keep light --surface #ffffff; use dark surface #0d1117 with white borders',
-    );
-
-    // Must not keep the prior light shell as the page background.
-    assert.doesNotMatch(
-      css,
-      /--bg\s*:\s*#f2f4f7/i,
-      'must replace light --bg #f2f4f7 with dark design tokens',
+      /--surface\s*:\s*#0d1117\b/i,
+      'must not keep dark --surface #0d1117; use light surface #f7f7f8',
     );
     assert.doesNotMatch(
       css,
-      /--accent\s*:\s*#0f6b5c/i,
-      'must replace teal --accent #0f6b5c with cyan primary #8dd6ff',
+      /--(?:bg|background)\s*:\s*#000000\b/i,
+      'must replace dark --bg #000000 with light background #ffffff',
+    );
+    assert.doesNotMatch(
+      css,
+      /--(?:primary|accent)\s*:\s*#8dd6ff\b/i,
+      'must replace cyan --accent #8dd6ff with monochrome primary #8e8ea0',
     );
   });
 
@@ -222,8 +217,8 @@ describe('ui-saas design tokens (design.md)', () => {
       'expected motion duration tokens (fast/base/slow ms)',
     );
     assert.ok(
-      /cubic-bezier\s*\(/i.test(css),
-      'expected design easing cubic-bezier(...)',
+      /--easing\s*:\s*ease\b|cubic-bezier\s*\(/i.test(css),
+      'expected design easing token (ease or cubic-bezier(...))',
     );
     assert.ok(
       /prefers-reduced-motion/i.test(css),
@@ -247,35 +242,35 @@ describe('ui-saas design tokens (design.md)', () => {
     );
   });
 
-  it('applies white text and white borders in base body/surface rules (not tokens alone)', () => {
+  it('applies black text and subtle borders in base body/surface rules (not tokens alone)', () => {
     const css = read(globalsCssPath());
 
-    // Token layer must define white text + white borders (design.md colors.text/border).
-    const textTokenWhite =
-      /--(?:text|ink|fg|color-text|on-background|on-bg)\s*:\s*#(?:ffffff|fff)\b/i.test(css);
-    const borderTokenWhite =
-      /--(?:border|line|stroke|border-color)\s*:\s*#(?:ffffff|fff)\b/i.test(css);
+    // Token layer must define black text + rgba borders (design.md light colors.text/border).
+    const textTokenBlack =
+      /--(?:text|ink|fg|color-text|on-background|on-bg)\s*:\s*#(?:000000|000)\b/i.test(css);
+    const borderTokenSubtle =
+      /--(?:border|line|stroke|border-color)\s*:\s*rgba\(\s*0,\s*0,\s*0,/i.test(css);
     assert.ok(
-      textTokenWhite,
-      'expected --text/--ink (or equiv) token value #ffffff for primary content text',
+      textTokenBlack,
+      'expected --text/--ink (or equiv) token value #000000 for primary content text',
     );
     assert.ok(
-      borderTokenWhite,
-      'expected --border/--line (or equiv) token value #ffffff for crisp dark-theme edges',
+      borderTokenSubtle,
+      'expected --border/--line (or equiv) token value rgba(0, 0, 0, ...) for light-theme edges',
     );
 
-    // Usage layer: body color and panel borders must reference those white tokens (or literal white).
+    // Usage layer: body color and panel borders must reference those black/subtle tokens.
     assert.ok(
-      /(?:body|html)[^{]*\{[^}]*color\s*:\s*(?:#(?:ffffff|fff)\b|var\(--(?:text|ink|fg|color-text|on-background|on-bg)\))/i.test(
+      /(?:body|html)[^{]*\{[^}]*color\s*:\s*(?:#(?:000000|000)\b|var\(--(?:text|ink|fg|color-text|on-background|on-bg)\))/i.test(
         css,
       ),
-      'body/html must set color to white or the white text token',
+      'body/html must set color to black or the black text token',
     );
     assert.ok(
-      /border(?:(?:-color)?\s*:\s*(?:[^;]*\s+)?(?:#(?:ffffff|fff)\b|var\(--(?:border|line|stroke)))/i.test(
+      /border(?:(?:-color)?\s*:\s*(?:[^;]*\s+)?(?:rgba\(\s*0,\s*0,\s*0,|var\(--(?:border|line|stroke)))/i.test(
         css,
       ),
-      'panels must use white (#ffffff) or white border-token borders',
+      'panels must use rgba(0, 0, 0, ...) or the border token',
     );
   });
 });
