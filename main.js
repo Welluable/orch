@@ -114,6 +114,7 @@ import {
     globalConfigPath,
     localConfigPath,
 } from './lib/config.js';
+import { installSkill } from './lib/skill.js';
 import { setNotifyEnabled } from './lib/notify.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -5177,6 +5178,8 @@ Examples:
   $ orch config --branch-prefix long_running_session     # pin global prefix
   $ orch config --branch-prefix long_running_session --local  # pin project prefix
   $ orch config --branch-prefix orch                     # restore builtin prefix
+  $ orch skill                                           # install orch skill (global)
+  $ orch skill --local                                   # install orch skill in this repo
 
 Headless runs:
   $ orch "long-running task" --detach --agent claude   # start in the background, prints the run slug
@@ -5846,6 +5849,31 @@ program
 
         try {
             printConfig({ cwd });
+        } catch (err) {
+            console.error(`Error: ${err.message}`);
+            process.exit(1);
+        }
+    });
+
+program
+    .command('skill')
+    .description('Install the orch skill into coding-agent skill directories')
+    .option('--global', 'Install into ~/.agents/skills/orch and ~/.claude/skills/orch (default)')
+    .option('--local', 'Install into .agents/skills/orch and .claude/skills/orch under the current directory')
+    .action((options) => {
+        if (options.global && options.local) {
+            console.error('Error: --global and --local are mutually exclusive');
+            process.exit(1);
+            return;
+        }
+        try {
+            const written = installSkill({
+                cwd: process.cwd(),
+                local: Boolean(options.local),
+            });
+            for (const dest of written) {
+                console.log(`wrote ${dest}`);
+            }
         } catch (err) {
             console.error(`Error: ${err.message}`);
             process.exit(1);
