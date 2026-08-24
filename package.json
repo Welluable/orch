@@ -1,6 +1,6 @@
 {
   "name": "@welluable/orch",
-  "version": "1.7.0",
+  "version": "1.8.0",
   "description": "CLI orchestrator: triage → research → plan → implement",
   "type": "module",
   "main": "main.js",
@@ -17,7 +17,7 @@
     "test": "node --test \"test/**/*.test.js\"",
     "commit": "agn 'commit with a detailed message and push'",
     "docs": "orch --quick 'Update README.md and orch --help so they match the current CLI. Only update what changes and add what is missing.'",
-    "release": "orch --quick 'Bump the minor version in package.json and package-lock.json, then publish to npm.' --agent agn"
+    "release": "orch --quick 'Bump the minor version in package.json and package-lock.json. Do not publish to npm.' --agent agn"
   },
   "keywords": [],
   "author": "",
