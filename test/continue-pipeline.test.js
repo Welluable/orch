@@ -242,6 +242,47 @@ describe('runContinuePipeline — skips triage and worktree creation', () => {
     assert.equal(createWorktreeSpy.mock.calls.length, 0);
   });
 
+  it('--skip-test-loop omits test-writer/test-critic and still commits', async () => {
+    const cwd = makeTmpCwd();
+    pinLocalBranchPrefix(cwd);
+    const slug = 'quirky-oasis-906b';
+    const branch = `orch/${slug}`;
+    const worktreePath = path.join(path.dirname(cwd), `${path.basename(cwd)}-${slug}`);
+    const runContext = fakeRunContext(cwd, slug);
+    seedPriorStatusMd(runContext, slug, branch, worktreePath);
+    seedForegroundContinueJob(cwd, slug, 'tighten the file-tracker tests');
+    const MockAgentClass = createMockAgentClass(continuePassBehaviors());
+
+    const logSpy = mock.method(console, 'log', () => {});
+    try {
+      await runContinuePipeline('tighten the file-tracker tests', {
+        agent: 'claude',
+        AgentClass: MockAgentClass,
+        cwd,
+        slug,
+        worktreePath,
+        branch,
+        continuation: 2,
+        priorOutcome: FAILED_PRIOR_OUTCOME,
+        skipTestLoop: true,
+        createRunContext: mock.fn(() => runContext),
+        commitWorktree: mock.fn(() => fakeCommitResult(branch)),
+        jobSlug: slug,
+        jobCwd: cwd,
+      });
+    } finally {
+      logSpy.mock.restore();
+    }
+
+    assert.deepEqual(
+      MockAgentClass.instances.map((i) => agentRole(i.name)),
+      ['research', 'planner', 'code-writer', 'test-runner'],
+    );
+    const printed = logSpy.mock.calls.map((c) => c.arguments.join(' ')).join('\n');
+    assert.match(printed, /test-loop: skipped/);
+    assert.equal(readJob(cwd, slug).skipTestLoop, true);
+  });
+
   it('calls createRunContext with the existing slug (never generates a new one)', async () => {
     const cwd = makeTmpCwd();
     const slug = 'quirky-oasis-906b';

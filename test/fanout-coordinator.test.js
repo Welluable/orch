@@ -872,6 +872,47 @@ describe('runFanoutPipeline — spawn mechanics (envelopes, hidden flags, env, r
     assert.equal(integrateCall.args[integrateFlagIdx + 1], jobSlug);
     assert.equal(integrateCall.options.env.ORCH_FANOUT_DEPTH, '1');
     assert.equal(integrateCall.options.cwd, cwd);
+    assert.ok(!workerCall.args.includes('--skip-test-loop'));
+  });
+
+  it('forwards --skip-test-loop on worker child argv when the coordinator had it', async () => {
+    const cwd = makeTmpCwd('orch-fanout-skip-test-loop-');
+    const jobSlug = 'wise-pine-e904';
+    seedCoordinatorJob(cwd, jobSlug);
+    const { execFile } = makeFakeExecFile([
+      { match: (args) => args.includes('rev-parse') && args.includes('HEAD'), stdout: 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678\n' },
+    ]);
+    const workers = [
+      { id: 'a', title: 'a workers', subtask: 'Implement invoice endpoints.', area: 'src/billing/invoices/', owns: ['src/billing/invoices/'], dependsOn: [], scaffold: false },
+      { id: 'b', title: 'b worker', subtask: 'Implement charge endpoints.', area: 'src/billing/charges/', owns: ['src/billing/charges/'], dependsOn: [], scaffold: false },
+    ];
+    const MockAgentClass = createMockAgentClass({ triage: TRIAGE_COMPLEX, boundaries: BOUNDARIES_OK, decomposer: decomposeReply(workers) });
+    const { spawnFn, calls } = fakeChildSpawn({ cwd, parentSlug: jobSlug, outcomes: { a: 'done', b: 'done' }, integrationOutcome: 'done', delayMs: 10 });
+
+    const logSpy = mock.method(console, 'log', () => {});
+    try {
+      await runFanoutPipeline('implement the billing module', {
+        agent: 'claude',
+        maxRounds: 3,
+        skipTestLoop: true,
+        AgentClass: MockAgentClass,
+        cwd,
+        jobSlug,
+        jobCwd: cwd,
+        maxWorkers: 4,
+        pollIntervalMs: 5,
+        execFile,
+        spawn: spawnFn,
+        allocateJob: makeDeterministicAllocateJob(),
+        exit: mock.fn(),
+      });
+    } finally {
+      logSpy.mock.restore();
+    }
+
+    const workerCall = calls.find((c) => c.args.includes('--worker'));
+    assert.ok(workerCall, 'expected a --worker spawn');
+    assert.ok(workerCall.args.includes('--skip-test-loop'));
   });
 });
 

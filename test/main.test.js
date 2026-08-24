@@ -137,13 +137,14 @@ describe('main.js CLI', () => {
     assert.match(stdout, /opencode/);
   });
 
-  it('help output mentions --agent, --verbose, --dry-run, --max-rounds, --ask, --quick, --pr, and --base', async () => {
+  it('help output mentions --agent, --verbose, --dry-run, --max-rounds, --skip-test-loop, --ask, --quick, --pr, and --base', async () => {
     const { code, stdout } = await runCli(['--help']);
     assert.equal(code, 0);
     assert.match(stdout, /--verbose/);
     assert.match(stdout, /--agent/);
     assert.match(stdout, /--dry-run/);
     assert.match(stdout, /--max-rounds/);
+    assert.match(stdout, /--skip-test-loop/);
     assert.match(stdout, /--ask/);
     assert.match(stdout, /--quick/);
     assert.match(stdout, /--pr/);
@@ -545,6 +546,46 @@ describe('runPipeline nested implementer stages', () => {
       ['triage', 'research', 'planner', 'test-writer', 'test-critic', 'code-writer', 'test-runner'],
     );
     assert.equal(commitWorktreeMock.mock.calls.length, 1);
+  });
+
+  it('--skip-test-loop omits test-writer/test-critic, keeps code-loop, and prints the skip note', async () => {
+    const tmpCwd = makeTmpCwd('orch-skip-test-loop-roles-');
+    try {
+      const slug = 'skip-test-loop-roles-0000';
+      seedForegroundJob(tmpCwd, slug, 'do something complex');
+      const runContext = fakeRunContext(tmpCwd, slug);
+      const worktree = fakeWorktree(tmpCwd, slug);
+      const MockAgentClass = createMockAgentClass(complexPassBehaviors());
+      const commitWorktreeMock = mock.fn(() => fakeCommitResult(worktree.branch));
+
+      const logSpy = mock.method(console, 'log', () => {});
+      try {
+        await runPipeline('do something complex', {
+          agent: 'claude',
+          AgentClass: MockAgentClass,
+          skipTestLoop: true,
+          createRunContext: mock.fn(() => runContext),
+          createWorktree: mock.fn(() => worktree),
+          commitWorktree: commitWorktreeMock,
+          jobSlug: slug,
+          jobCwd: tmpCwd,
+        });
+      } finally {
+        logSpy.mock.restore();
+      }
+
+      assert.deepEqual(
+        MockAgentClass.instances.map((i) => agentRole(i.name)),
+        ['triage', 'research', 'planner', 'code-writer', 'test-runner'],
+      );
+      assert.equal(commitWorktreeMock.mock.calls.length, 1);
+      const printed = logSpy.mock.calls.map((c) => c.arguments.join(' ')).join('\n');
+      assert.match(printed, /test-loop: skipped/);
+      const codeWriter = MockAgentClass.instances.find((i) => agentRole(i.name) === 'code-writer');
+      assert.doesNotMatch(codeWriter.instructions, /frozen verification\s+from the test loop/);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
   });
 
   it('labels implementer agents with roundLabel N/M suffixes (default maxRounds=5)', async () => {
@@ -3169,6 +3210,49 @@ describe('runPipeline job-record patching for the plain/full pipeline (universal
       assert.ok(record.finishedAt);
       assert.equal(record.branch, worktree.branch);
       assert.equal(record.worktree, worktree.worktreePath);
+      assert.equal('skipTestLoop' in record, false);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('--skip-test-loop persists skipTestLoop:true and never patches phase test-loop', async () => {
+    const tmpCwd = makeTmpCwd('orch-skip-test-loop-job-');
+    try {
+      const slug = 'skip-test-loop-job-0000';
+      seedForegroundJob(tmpCwd, slug, 'do something complex');
+      const runContext = fakeRunContext(tmpCwd);
+      const worktree = fakeWorktree(tmpCwd);
+      const MockAgentClass = createMockAgentClass(complexPassBehaviors());
+      const patchCalls = [];
+      const patchJobMock = realDiskPatchJobSpy(patchCalls);
+
+      const logSpy = mock.method(console, 'log', () => {});
+      try {
+        await runPipeline('do something complex', {
+          agent: 'claude',
+          AgentClass: MockAgentClass,
+          skipTestLoop: true,
+          createRunContext: mock.fn(() => runContext),
+          createWorktree: mock.fn(() => worktree),
+          commitWorktree: mock.fn(() => fakeCommitResult(worktree.branch)),
+          jobSlug: slug,
+          jobCwd: tmpCwd,
+          patchJob: patchJobMock,
+        });
+      } finally {
+        logSpy.mock.restore();
+      }
+
+      const phases = patchCalls.filter((c) => c.fields.phase).map((c) => c.fields.phase);
+      assert.equal(phases.includes('test-loop'), false);
+      assert.ok(phases.includes('code-loop'));
+      assert.ok(phases.includes('commit'));
+      assert.ok(phases.indexOf('code-loop') < phases.indexOf('commit'));
+
+      const record = readJob(tmpCwd, slug);
+      assert.equal(record.skipTestLoop, true);
+      assert.match(fs.readFileSync(runContext.statusPath, 'utf8'), /Test loop: skipped \(--skip-test-loop\)/);
     } finally {
       fs.rmSync(tmpCwd, { recursive: true, force: true });
     }
@@ -4542,6 +4626,69 @@ describe('--pr flag guards and startup gh check', () => {
     } finally {
       fs.rmSync(tmpCwd, { recursive: true, force: true });
       fs.rmSync(binDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('--skip-test-loop flag guards', () => {
+  for (const conflicting of ['--ask', '--quick']) {
+    it(`rejects --skip-test-loop combined with ${conflicting} (non-zero exit, no job created)`, async () => {
+      const tmpCwd = makeTmpCwd('orch-skip-test-loop-guard-');
+      try {
+        const { code, stderr } = await runCli(
+          ['a trivial task', '--skip-test-loop', conflicting],
+          { cwd: tmpCwd },
+        );
+        assert.notEqual(code, 0);
+        assert.match(stderr, /cannot be combined/i);
+        assert.equal(fs.existsSync(path.join(tmpCwd, '.orch')), false);
+      } finally {
+        fs.rmSync(tmpCwd, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+describe('runDetached forwards --skip-test-loop', () => {
+  it('includes --skip-test-loop in the child argv when set, and omits it otherwise', async () => {
+    const tmpCwd = makeTmpCwd('orch-detach-skip-test-loop-');
+    try {
+      const spawnWith = fakeDetachSpawn(424243);
+      const logSpy = mock.method(console, 'log', () => {});
+      try {
+        await runDetached('implement the flag', {
+          agent: 'claude',
+          maxRounds: 5,
+          cwd: tmpCwd,
+          skipTestLoop: true,
+          spawn: spawnWith,
+          exit: mock.fn(),
+        });
+      } finally {
+        logSpy.mock.restore();
+      }
+      const [, withArgs] = spawnWith.mock.calls[0].arguments;
+      assert.ok(withArgs.includes('--skip-test-loop'));
+      assert.equal(readJob(tmpCwd, spawnWith.mock.calls[0].arguments[2].env.ORCH_JOB_SLUG).skipTestLoop, true);
+
+      const spawnWithout = fakeDetachSpawn(424244);
+      const logSpy2 = mock.method(console, 'log', () => {});
+      try {
+        await runDetached('implement the flag', {
+          agent: 'claude',
+          maxRounds: 5,
+          cwd: tmpCwd,
+          spawn: spawnWithout,
+          exit: mock.fn(),
+        });
+      } finally {
+        logSpy2.mock.restore();
+      }
+      const [, withoutArgs, withoutOpts] = spawnWithout.mock.calls[0].arguments;
+      assert.ok(!withoutArgs.includes('--skip-test-loop'));
+      assert.equal('skipTestLoop' in readJob(tmpCwd, withoutOpts.env.ORCH_JOB_SLUG), false);
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
     }
   });
 });

@@ -487,6 +487,74 @@ describe('runResumePipeline — reentry without research', () => {
     assert.equal(names[0], 'test-runner');
     assert.match(rounds[0], /2\/5/);
   });
+
+  it('job with skipTestLoop:true at worktree skips test-loop and enters code-loop', async () => {
+    const cwd = makeTmpCwd();
+    const { slug, worktreePath } = seedStoppedJob(cwd, {
+      phase: 'worktree',
+      stage: 'worktree',
+      round: null,
+      skipTestLoop: true,
+    });
+    fs.writeFileSync(path.join(cwd, '.orch', slug, 'research.md'), 'research');
+    fs.writeFileSync(path.join(cwd, '.orch', slug, 'task.md'), 'task checklist');
+
+    const names = [];
+    const MockAgentClass = createMockAgentClass(resumePassBehaviors({
+      'code-writer': (agent) => {
+        names.push(agentRole(agent.name));
+        return { ok: true, result: withSummary('code written', 'wrote code') };
+      },
+      'test-runner': (agent) => {
+        names.push(agentRole(agent.name));
+        return PASS_RUNNER;
+      },
+      'test-writer': () => {
+        names.push('test-writer');
+        return { ok: true, result: withSummary('tests', 'wrote') };
+      },
+      'test-critic': () => {
+        names.push('test-critic');
+        return PASS_CRITIC;
+      },
+      research: () => {
+        names.push('research');
+        return { ok: true, result: withSummary('r', 'r') };
+      },
+      planner: () => {
+        names.push('planner');
+        return { ok: true, result: withSummary('p', 'p') };
+      },
+    }));
+
+    const logSpy = mock.method(console, 'log', () => {});
+    try {
+      await runResumePipeline({
+        agent: 'claude',
+        AgentClass: MockAgentClass,
+        cwd,
+        slug,
+        jobSlug: slug,
+        worktreePath,
+        branch: `orch/${slug}`,
+        priorOutcome: { ...readJob(cwd, slug).lastOutcome, phase: 'worktree', stage: 'worktree', round: null },
+        recoverBrief: '[Recover brief]\n[/Recover brief]',
+        prompt: 'setup playwright and shadcn/ui',
+        commitWorktree: async () => ({ committed: false, branch: `orch/${slug}`, sha: null }),
+        collectWorktreeChanges: async () => [],
+      });
+    } finally {
+      logSpy.mock.restore();
+    }
+
+    assert.ok(!names.includes('test-writer'));
+    assert.ok(!names.includes('test-critic'));
+    assert.ok(!names.includes('research'));
+    assert.ok(!names.includes('planner'));
+    assert.ok(names.includes('code-writer'));
+    const printed = logSpy.mock.calls.map((c) => c.arguments.join(' ')).join('\n');
+    assert.match(printed, /test-loop: skipped/);
+  });
 });
 
 describe('runResumePipeline — worktree ensure-when-missing', () => {

@@ -12,7 +12,12 @@ export function codeWriterAgentArgs({
     round,
     acceptedVerification,
     runnerFeedback,
+    skipTestLoop = false,
 }) {
+    const implementBullet = skipTestLoop
+        ? `* Implement the task checklist / prompt; the existing test suite is the gate; do not delete or weaken existing tests; do not treat missing new tests as a reason to fail the writer.`
+        : `* Implement the steps in the task checklist against the frozen verification
+                      from the test loop.`;
     const feedbackBlock =
         round === 1
             ? `
@@ -36,8 +41,7 @@ export function codeWriterAgentArgs({
                     * ${researchConsumerHardRule(researchPath)}
                     * Read the task checklist at the exact path: ${taskPath} and the
                       current status at the exact path: ${statusPath}
-                    * Implement the steps in the task checklist against the frozen verification
-                      from the test loop.
+                    ${implementBullet}
                     * Keep the exact status file at ${statusPath} updated as steps
                       complete.
                     * Do not run the test suite as a gate — that is the test-runner's job. Do not

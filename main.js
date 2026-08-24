@@ -380,6 +380,48 @@ function appendLoopStatus(statusPath, title, { round, maxRounds, passed, summary
     );
 }
 
+function shouldSkipTestLoop(options, jobRecord) {
+    return Boolean(options?.skipTestLoop) || jobRecord?.skipTestLoop === true;
+}
+
+function acceptedVerificationForCodeLoop({ skipTestLoop, prompt, taskPath, testAccepted }) {
+    if (!skipTestLoop && testAccepted) {
+        return [testAccepted.verdict?.summary, testAccepted.writerContent].filter(Boolean).join('\n');
+    }
+    if (taskPath && fs.existsSync(taskPath)) {
+        return fs.readFileSync(taskPath, 'utf8').slice(0, 2000);
+    }
+    return String(prompt ?? '');
+}
+
+function noteTestLoopSkipped(statusPath) {
+    console.log('test-loop: skipped');
+    if (statusPath) {
+        fs.appendFileSync(statusPath, '- Test loop: skipped (--skip-test-loop)\n');
+    }
+}
+
+function persistSkipTestLoop(jobPatch, skipTestLoop) {
+    if (skipTestLoop) jobPatch({ skipTestLoop: true });
+}
+
+function skipTestLoopFields(skipTestLoop) {
+    return skipTestLoop === true ? { skipTestLoop: true } : {};
+}
+
+function appendSkipTestLoopArg(args, skipTestLoop) {
+    if (skipTestLoop === true) args.push('--skip-test-loop');
+}
+
+async function maybeRunTestLoop({ skipTestLoop, prompt, taskPath, statusPath, ...loopArgs }) {
+    if (skipTestLoop) {
+        noteTestLoopSkipped(statusPath);
+        return acceptedVerificationForCodeLoop({ skipTestLoop: true, prompt, taskPath });
+    }
+    const testAccepted = await runTestLoop({ prompt, taskPath, statusPath, ...loopArgs });
+    return acceptedVerificationForCodeLoop({ skipTestLoop: false, prompt, taskPath, testAccepted });
+}
+
 function roundLabel(role, round, maxRounds) {
     return `${role} ${round}/${maxRounds}`;
 }
@@ -590,6 +632,7 @@ async function runCodeLoop({
     runnerFirst = false,
     loopTitle = 'Code loop',
     startAt = null,
+    skipTestLoop = false,
 }) {
     let codeAccepted = null;
     let runnerFeedback = null;
@@ -619,6 +662,7 @@ async function runCodeLoop({
                 round,
                 acceptedVerification,
                 runnerFeedback,
+                skipTestLoop,
             });
             const codeWriterTracker = new FileTracker({ cwd: worktreePath });
             const codeWriter = new AgentClass(
@@ -859,6 +903,7 @@ export async function runPipeline(prompt, options) {
         if (!jobSlug) return;
         await checkpointPauseFn(jobCwd, jobSlug, { pollIntervalMs: pausePollIntervalMs });
     };
+    const skipTestLoop = Boolean(options.skipTestLoop);
 
     console.log(`cwd:   ${invocationCwd}`);
     console.log(`agent: ${options.agent}`);
@@ -942,6 +987,8 @@ export async function runPipeline(prompt, options) {
         }
         return;
     }
+
+    persistSkipTestLoop(jobPatch, skipTestLoop);
 
     const triage = triageAgentArgs({ prompt, cwd: invocationCwd });
     const triageAgent = new AgentClass(
@@ -1120,8 +1167,9 @@ export async function runPipeline(prompt, options) {
             `# Status\n\n- Slug: \`${runContext.slug}\`\n- Branch: \`${worktree.branch}\`\n- Worktree: \`${worktree.worktreePath}\`\n`,
         );
 
-        // --- test loop: test-writer ⇄ test-critic ---
-        const testAccepted = await runTestLoop({
+        // --- test loop: test-writer ⇄ test-critic (or skip) ---
+        const acceptedVerification = await maybeRunTestLoop({
+            skipTestLoop,
             prompt,
             worktreePath: worktree.worktreePath,
             branch: worktree.branch,
@@ -1136,13 +1184,6 @@ export async function runPipeline(prompt, options) {
         });
 
         // --- code loop: code-writer ⇄ test-runner ---
-        const acceptedVerification = [
-            testAccepted.verdict.summary,
-            testAccepted.writerContent,
-        ]
-            .filter(Boolean)
-            .join('\n');
-
         const codeAccepted = await runCodeLoop({
             prompt,
             worktreePath: worktree.worktreePath,
@@ -1156,6 +1197,7 @@ export async function runPipeline(prompt, options) {
             jobPatch,
             jobCheckpoint,
             acceptedVerification,
+            skipTestLoop,
         });
 
         commitAndMaybePublish({
@@ -1221,6 +1263,7 @@ export async function runDetached(prompt, options = {}) {
         notify,
         pr = false,
         base,
+        skipTestLoop = false,
         jobSlug: preallocatedSlug,
         createRunContext: createRunContextFn = createRunContext,
         spawn: spawnFn = spawn,
@@ -1266,6 +1309,7 @@ export async function runDetached(prompt, options = {}) {
             agent,
             maxRounds,
             ...(fromSlug ? { role: 'coordinator', finishedAt: null, exitCode: null } : {}),
+            ...skipTestLoopFields(skipTestLoop),
         });
     } else {
         ({ slug } = allocateJob({
@@ -1276,6 +1320,7 @@ export async function runDetached(prompt, options = {}) {
             state: 'starting',
             createRunContext: createRunContextFn,
             role: coordinator ? 'coordinator' : null,
+            ...skipTestLoopFields(skipTestLoop),
         }));
     }
     const { dir, logPath } = jobPaths(cwd, slug);
@@ -1302,6 +1347,7 @@ export async function runDetached(prompt, options = {}) {
     }
     if (pr) childArgs.push('--pr');
     if (base) childArgs.push('--base', base);
+    appendSkipTestLoopArg(childArgs, skipTestLoop);
     appendNotifyArgs(childArgs, notify);
 
     const child = spawnFn(process.execPath, childArgs, {
@@ -1443,7 +1489,10 @@ export async function runContinuePipeline(prompt, options = {}) {
         const { content: plannerContent, summary: plannerSummary } = splitStageSummary(plannerResult.result);
         printStageSummary('planner', resolveStageSummary('planner', plannerSummary, plannerContent));
 
-        const testAccepted = await runTestLoop({
+        const skipTestLoop = Boolean(options.skipTestLoop);
+        persistSkipTestLoop(jobPatch, skipTestLoop);
+        const acceptedVerification = await maybeRunTestLoop({
+            skipTestLoop,
             prompt,
             worktreePath,
             branch,
@@ -1456,10 +1505,6 @@ export async function runContinuePipeline(prompt, options = {}) {
             jobPatch,
             jobCheckpoint,
         });
-
-        const acceptedVerification = [testAccepted.verdict.summary, testAccepted.writerContent]
-            .filter(Boolean)
-            .join('\n');
 
         const codeAccepted = await runCodeLoop({
             prompt,
@@ -1474,6 +1519,7 @@ export async function runContinuePipeline(prompt, options = {}) {
             jobPatch,
             jobCheckpoint,
             acceptedVerification,
+            skipTestLoop,
         });
 
         jobPatch({ phase: 'commit', stage: 'commit', round: null });
@@ -1585,6 +1631,7 @@ export async function runContinueDetached(slug, prompt, options = {}) {
         cwd = process.cwd(),
         spawn: spawnFn = spawn,
         exit = (code) => process.exit(code),
+        skipTestLoop = false,
         validateContinue: validateContinueFn = validateContinue,
         reopenJob: reopenJobFn = reopenJob,
         snapshotPriorOutcome: snapshotPriorOutcomeFn = snapshotPriorOutcome,
@@ -1626,6 +1673,7 @@ export async function runContinueDetached(slug, prompt, options = {}) {
         String(maxRounds),
     ];
     if (verbose) childArgs.push('--verbose');
+    appendSkipTestLoopArg(childArgs, skipTestLoop);
     appendNotifyArgs(childArgs, options.notify);
 
     const child = spawnFn(process.execPath, childArgs, {
@@ -1642,6 +1690,7 @@ export async function runContinueDetached(slug, prompt, options = {}) {
         maxRounds,
         pid: child.pid,
         prior,
+        skipTestLoop: skipTestLoop === true,
     });
 
     console.log(`started ${slug} (pid ${child.pid}, continuation ${updated.continuation})`);
@@ -1804,7 +1853,9 @@ export async function runResumePipeline(options = {}) {
         }
 
         let acceptedVerification = '';
-        const enterTest = !phase || ['research', 'plan', 'worktree', 'test-loop'].includes(phase);
+        const skipTestLoop = shouldSkipTestLoop(options, jobRecord);
+        const wouldEnterTest = !phase || ['research', 'plan', 'worktree', 'test-loop'].includes(phase);
+        const enterTest = !skipTestLoop && wouldEnterTest;
         const enterCode = !phase || ['research', 'plan', 'worktree', 'test-loop', 'code-loop'].includes(phase);
         const enterCommit = true;
 
@@ -1813,7 +1864,8 @@ export async function runResumePipeline(options = {}) {
                 ? { stage: stage ?? 'test-writer', round: round ?? 1 }
                 : null;
             const testPrompt = phase === 'test-loop' ? withRecover(prompt) : prompt;
-            const testAccepted = await runTestLoop({
+            acceptedVerification = await maybeRunTestLoop({
+                skipTestLoop: false,
                 prompt: testPrompt,
                 worktreePath: liveWorktree,
                 branch: liveBranch,
@@ -1827,9 +1879,13 @@ export async function runResumePipeline(options = {}) {
                 jobCheckpoint,
                 startAt: testStartAt,
             });
-            acceptedVerification = [testAccepted.verdict.summary, testAccepted.writerContent]
-                .filter(Boolean)
-                .join('\n');
+        } else if (skipTestLoop && wouldEnterTest && phase !== 'code-loop' && phase !== 'commit') {
+            acceptedVerification = await maybeRunTestLoop({
+                skipTestLoop: true,
+                prompt,
+                taskPath: runContext.taskPath,
+                statusPath: runContext.statusPath,
+            });
         } else if (hasTask) {
             // Code-loop / commit reentry: best-effort verification from task.md
             acceptedVerification = fs.readFileSync(runContext.taskPath, 'utf8').slice(0, 2000);
@@ -1854,6 +1910,7 @@ export async function runResumePipeline(options = {}) {
                 jobCheckpoint,
                 acceptedVerification,
                 startAt: codeStartAt,
+                skipTestLoop,
             });
 
             if (enterCommit) {
@@ -2179,7 +2236,10 @@ export async function runWorkerPipeline(prompt, options = {}) {
             `# Status\n\n- Slug: \`${runContext.slug}\`\n- Branch: \`${worktree.branch}\`\n- Worktree: \`${worktree.worktreePath}\`\n- Parent: \`${parentSlug}\`\n- Worker: \`${workerId}\`\n`,
         );
 
-        const testAccepted = await runTestLoop({
+        const skipTestLoop = Boolean(options.skipTestLoop);
+        persistSkipTestLoop(jobPatch, skipTestLoop);
+        const acceptedVerification = await maybeRunTestLoop({
+            skipTestLoop,
             prompt,
             worktreePath: worktree.worktreePath,
             branch: worktree.branch,
@@ -2192,10 +2252,6 @@ export async function runWorkerPipeline(prompt, options = {}) {
             jobPatch,
             jobCheckpoint,
         });
-
-        const acceptedVerification = [testAccepted.verdict.summary, testAccepted.writerContent]
-            .filter(Boolean)
-            .join('\n');
 
         const codeAccepted = await runCodeLoop({
             prompt,
@@ -2210,6 +2266,7 @@ export async function runWorkerPipeline(prompt, options = {}) {
             jobPatch,
             jobCheckpoint,
             acceptedVerification,
+            skipTestLoop,
         });
 
         jobPatch({ phase: 'commit', stage: 'commit', round: null });
@@ -2381,7 +2438,10 @@ export async function runUnitPipeline(prompt, options = {}) {
             `# Status\n\n- Slug: \`${runContext.slug}\`\n- Branch: \`${worktree.branch}\`\n- Worktree: \`${worktree.worktreePath}\`\n- Parent: \`${parentSlug}\`\n- Worker: \`${unitId}\`\n`,
         );
 
-        const testAccepted = await runTestLoop({
+        const skipTestLoop = Boolean(options.skipTestLoop);
+        persistSkipTestLoop(jobPatch, skipTestLoop);
+        const acceptedVerification = await maybeRunTestLoop({
+            skipTestLoop,
             prompt,
             worktreePath: worktree.worktreePath,
             branch: worktree.branch,
@@ -2394,10 +2454,6 @@ export async function runUnitPipeline(prompt, options = {}) {
             jobPatch,
             jobCheckpoint,
         });
-
-        const acceptedVerification = [testAccepted.verdict.summary, testAccepted.writerContent]
-            .filter(Boolean)
-            .join('\n');
 
         const codeAccepted = await runCodeLoop({
             prompt,
@@ -2412,6 +2468,7 @@ export async function runUnitPipeline(prompt, options = {}) {
             jobPatch,
             jobCheckpoint,
             acceptedVerification,
+            skipTestLoop,
         });
 
         jobPatch({ phase: 'commit', stage: 'commit', round: null });
@@ -3346,6 +3403,7 @@ export async function runSeqPipeline(prompt, options = {}) {
     console.log(`cwd:   ${invocationCwd}`);
     console.log(`agent: ${options.agent}`);
     console.log();
+    persistSkipTestLoop(jobPatch, Boolean(options.skipTestLoop));
 
     let interrupted = false;
     const onSignal = (signal) => {
@@ -3420,7 +3478,10 @@ export async function runSeqPipeline(prompt, options = {}) {
             `# Status\n\n- Slug: \`${runContext.slug}\`\n- Branch: \`${worktree.branch}\`\n- Worktree: \`${worktree.worktreePath}\`\n`,
         );
 
-        const testAccepted = await runTestLoop({
+        const skipTestLoop = Boolean(options.skipTestLoop);
+        persistSkipTestLoop(jobPatch, skipTestLoop);
+        const acceptedVerification = await maybeRunTestLoop({
+            skipTestLoop,
             prompt: taskPrompt,
             worktreePath: worktree.worktreePath,
             branch: worktree.branch,
@@ -3433,8 +3494,6 @@ export async function runSeqPipeline(prompt, options = {}) {
             jobPatch,
             jobCheckpoint,
         });
-
-        const acceptedVerification = [testAccepted.verdict.summary, testAccepted.writerContent].filter(Boolean).join('\n');
 
         await runCodeLoop({
             prompt: taskPrompt,
@@ -3449,6 +3508,7 @@ export async function runSeqPipeline(prompt, options = {}) {
             jobPatch,
             jobCheckpoint,
             acceptedVerification,
+            skipTestLoop,
         });
 
         jobPatch({ phase: 'commit', stage: 'commit', round: null });
@@ -3546,6 +3606,7 @@ export async function runSeqPipeline(prompt, options = {}) {
             parent: jobSlug,
             role: 'worker',
             workerId: unit.id,
+            ...skipTestLoopFields(options.skipTestLoop),
         });
         const unitSlug = allocated.slug;
         patchUnitFn(invocationCwd, jobSlug, unit.id, {
@@ -3561,6 +3622,7 @@ export async function runSeqPipeline(prompt, options = {}) {
             '--max-rounds', String(maxRounds),
             '--unit', `${jobSlug}:${unit.id}`,
         ];
+        appendSkipTestLoopArg(childArgs, options.skipTestLoop);
         const child = spawnFn(process.execPath, childArgs, {
             cwd: invocationCwd,
             env: {
@@ -4062,6 +4124,7 @@ export async function runSeqContinuePipeline(options = {}) {
             parent: parentSlug,
             role: 'worker',
             workerId: unit.id,
+            ...skipTestLoopFields(options.skipTestLoop),
         });
         const unitSlug = allocated.slug;
         patchUnitFn(invocationCwd, parentSlug, unit.id, { slug: unitSlug, state: 'running' });
@@ -4073,6 +4136,7 @@ export async function runSeqContinuePipeline(options = {}) {
             '--max-rounds', String(maxRounds),
             '--unit', `${parentSlug}:${unit.id}`,
         ];
+        appendSkipTestLoopArg(childArgs, options.skipTestLoop);
         const child = spawnFn(process.execPath, childArgs, {
             cwd: invocationCwd,
             env: {
@@ -4247,6 +4311,7 @@ export async function runFanoutPipeline(prompt, options = {}) {
     console.log(`cwd:   ${invocationCwd}`);
     console.log(`agent: ${options.agent}`);
     console.log();
+    persistSkipTestLoop(jobPatch, Boolean(options.skipTestLoop));
 
     let interrupted = false;
     const onSignal = (signal) => {
@@ -4403,7 +4468,10 @@ export async function runFanoutPipeline(prompt, options = {}) {
                 `# Status\n\n- Slug: \`${runContext.slug}\`\n- Branch: \`${worktree.branch}\`\n- Worktree: \`${worktree.worktreePath}\`\n`,
             );
 
-            const testAccepted = await runTestLoop({
+            const skipTestLoop = Boolean(options.skipTestLoop);
+            persistSkipTestLoop(jobPatch, skipTestLoop);
+            const acceptedVerification = await maybeRunTestLoop({
+                skipTestLoop,
                 prompt,
                 worktreePath: worktree.worktreePath,
                 branch: worktree.branch,
@@ -4416,8 +4484,6 @@ export async function runFanoutPipeline(prompt, options = {}) {
                 jobPatch,
                 jobCheckpoint,
             });
-
-            const acceptedVerification = [testAccepted.verdict.summary, testAccepted.writerContent].filter(Boolean).join('\n');
 
             await runCodeLoop({
                 prompt,
@@ -4432,6 +4498,7 @@ export async function runFanoutPipeline(prompt, options = {}) {
                 jobPatch,
                 jobCheckpoint,
                 acceptedVerification,
+                skipTestLoop,
             });
 
             jobPatch({ phase: 'commit', stage: 'commit', round: null });
@@ -4523,6 +4590,7 @@ export async function runFanoutPipeline(prompt, options = {}) {
                 parent: jobSlug,
                 role: 'worker',
                 workerId: worker.id,
+                ...skipTestLoopFields(options.skipTestLoop),
             });
             patchWorkerFn(invocationCwd, jobSlug, worker.id, {
                 slug: workerSlug,
@@ -4538,6 +4606,7 @@ export async function runFanoutPipeline(prompt, options = {}) {
                 '--max-rounds', String(maxRounds),
                 '--worker', `${jobSlug}:${worker.id}`,
             ];
+            appendSkipTestLoopArg(childArgs, options.skipTestLoop);
             const child = spawnFn(process.execPath, childArgs, {
                 cwd: invocationCwd,
                 env: { ...process.env, ORCH_JOB_SLUG: workerSlug, ORCH_DETACHED: '1', ORCH_FANOUT_DEPTH: '1' },
@@ -4930,6 +4999,7 @@ async function runWorkerFromCli(options) {
             parent: parentSlug,
             role: 'worker',
             workerId,
+            ...skipTestLoopFields(options.skipTestLoop),
         });
         jobSlug = alloc.slug;
     }
@@ -4945,6 +5015,7 @@ async function runWorkerFromCli(options) {
         base: fanout.base,
         jobSlug,
         jobCwd: cwd,
+        skipTestLoop: options.skipTestLoop,
     });
 }
 
@@ -4996,6 +5067,7 @@ async function runUnitFromCli(options) {
             parent: parentSlug,
             role: 'worker',
             workerId: unitId,
+            ...skipTestLoopFields(options.skipTestLoop),
         });
         jobSlug = alloc.slug;
     }
@@ -5011,6 +5083,7 @@ async function runUnitFromCli(options) {
         base: seq.tip,
         jobSlug,
         jobCwd: cwd,
+        skipTestLoop: options.skipTestLoop,
     });
 }
 
@@ -5140,6 +5213,7 @@ program
     .option('--pr', 'Always create a worktree, commit, push <prefix>/<slug>, and open a pull request with gh (including triage → quick-fix; skips research/planner on that path). Requires gh on PATH and authenticated. Cannot be combined with --ask, --quick, or --dry-run')
     .option('--base <branch>', 'Remote base branch for the worktree start point and (with --pr) the pull request base; defaults to the remote\'s default branch when --pr is set')
     .option('--max-rounds <n>', 'Max writer⇄critic and writer⇄runner iterations per implementer loop (ignored with --ask and --quick)', positiveIntParser('--max-rounds'), 5)
+    .option('--skip-test-loop', 'Skip the test-writer ⇄ test-critic loop; go straight to code-writer ⇄ test-runner. Does not skip the existing test runner')
     .option('--fan-out', 'Decompose into parallel workers, then integrate once. Cannot be combined with --ask, --quick, --dry-run, --seq, or --decompose')
     .option('--seq', 'Decompose into ordered units; merge each, then adjust the next. With --from <slug>, run a planned backlog without re-decomposing. Cannot be combined with --fan-out, --ask, --quick, --dry-run, or --decompose')
     .option('--decompose', 'Plan-only sequential decomposition: research, write seq.json (state planned), and exit. Run later with --seq --from <slug>. Cannot be combined with --seq, --fan-out, --ask, --quick, --dry-run, or --from')
@@ -5181,6 +5255,7 @@ Examples:
 Headless runs:
   $ orch "long-running task" --detach --agent claude   # start in the background, prints the run slug
   $ orch "implement the flag" --pr --agent claude      # push and open a PR after commit
+  $ orch "implement the flag" --skip-test-loop --agent claude
   $ orch "implement the flag" --pr --base develop      # PR against develop; worktree starts at origin/develop
   $ orch list                                          # show all tracked runs
   $ orch status [slug]                                 # show full status (defaults to most recent)
@@ -5218,6 +5293,17 @@ Decompose (plan only):
         options.cliAgentExplicit = cliAgentExplicit;
         applyNotifyEnabled(options, { dryRun: Boolean(options.dryRun) });
 
+        if (options.skipTestLoop) {
+            const skipConflicts = ['ask', 'quick']
+                .filter((key) => options[key])
+                .map((key) => `--${key}`);
+            if (skipConflicts.length > 0) {
+                console.error(`Error: --skip-test-loop cannot be combined with ${skipConflicts.join(', ')}`);
+                process.exit(1);
+                return;
+            }
+        }
+
         if (options.seqContinue) {
             const cwd = process.cwd();
             const parentSlug = options.seqContinue;
@@ -5240,6 +5326,7 @@ Decompose (plan only):
                 parentSlug,
                 jobSlug,
                 jobCwd: cwd,
+                skipTestLoop: options.skipTestLoop,
             });
             return;
         }
@@ -5398,6 +5485,7 @@ Decompose (plan only):
                     state: 'running',
                     pid: process.pid,
                     // role stays unset until --seq --from promotes to coordinator
+                    ...skipTestLoopFields(options.skipTestLoop),
                 });
                 slug = alloc.slug;
             }
@@ -5449,6 +5537,7 @@ Decompose (plan only):
                     state: 'running',
                     pid: process.pid,
                     role: 'coordinator',
+                    ...skipTestLoopFields(options.skipTestLoop),
                 });
                 slug = alloc.slug;
             }
@@ -5501,6 +5590,7 @@ Decompose (plan only):
                     state: 'running',
                     pid: process.pid,
                     role: 'coordinator',
+                    ...skipTestLoopFields(options.skipTestLoop),
                 });
                 slug = alloc.slug;
             }
@@ -5573,6 +5663,7 @@ Decompose (plan only):
                         maxRounds: options.ask || options.quick ? null : options.maxRounds,
                         state: 'running',
                         pid: process.pid,
+                        ...skipTestLoopFields(options.skipTestLoop),
                     });
                     slug = alloc.slug;
                 }
@@ -5668,6 +5759,7 @@ program
     .option('--quick', 'Rejected: continue does not support --quick')
     .option('--detach', 'Run the continue in the background under the same slug')
     .option('--max-rounds <n>', 'Max writer⇄critic and writer⇄runner iterations per implementer loop', positiveIntParser('--max-rounds'), 5)
+    .option('--skip-test-loop', 'Skip the test-writer ⇄ test-critic loop; go straight to code-writer ⇄ test-runner. Does not skip the existing test runner')
     .option('--notify', 'Enable desktop notification when the continue job reaches a terminal state')
     .option('--no-notify', 'Disable desktop notifications for this continue')
     .addOption(
@@ -5686,6 +5778,17 @@ program
 
         opts.agent = resolveAgentOrExit(opts.agent, cwd);
         applyNotifyEnabled(opts, { cwd, dryRun: Boolean(opts.dryRun) });
+
+        if (opts.skipTestLoop) {
+            const skipConflicts = ['ask', 'quick']
+                .filter((key) => opts[key])
+                .map((key) => `--${key}`);
+            if (skipConflicts.length > 0) {
+                console.error(`Error: --skip-test-loop cannot be combined with ${skipConflicts.join(', ')}`);
+                process.exit(1);
+                return;
+            }
+        }
 
         let record;
         try {
@@ -5707,6 +5810,7 @@ program
                 verbose: opts.verbose,
                 cwd,
                 notify: cliNotifyFromOptions(opts),
+                skipTestLoop: opts.skipTestLoop,
             });
             return;
         }
@@ -5739,6 +5843,7 @@ program
                 maxRounds: opts.maxRounds,
                 pid: process.pid,
                 prior: priorOutcome,
+                skipTestLoop: opts.skipTestLoop === true,
             });
             continuation = updated.continuation;
             setJobSlug(slug);
@@ -5775,6 +5880,7 @@ program
             continuation,
             jobSlug: slug,
             jobCwd: cwd,
+            skipTestLoop: opts.skipTestLoop,
         });
     });
 

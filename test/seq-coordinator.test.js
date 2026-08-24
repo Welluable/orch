@@ -526,6 +526,7 @@ describe('runSeqPipeline — successful decompose bootstrap + strict concurrency
     for (const call of spawnFn.calls.filter((c) => c.args.includes('--unit'))) {
       assert.ok(!call.args.includes('--seq'), 'unit must never receive --seq');
       assert.ok(!call.args.includes('--fan-out'));
+      assert.ok(!call.args.includes('--skip-test-loop'));
       assert.equal(call.options.env.ORCH_DETACHED, '1');
       assert.equal(call.options.env.ORCH_SEQ_DEPTH, '1');
       assert.equal(call.options.env.ORCH_FANOUT_DEPTH, '1');
@@ -1159,6 +1160,82 @@ describe('--seq --detach', () => {
     assert.equal(record.pid, 65432);
     assert.equal(record.state, 'running');
     assert.equal(exit.mock.calls[0].arguments[0], 0);
+  });
+});
+
+describe('runSeqPipeline — forwards --skip-test-loop to unit children', () => {
+  it('includes --skip-test-loop on --unit child argv when the coordinator had it', async () => {
+    const cwd = makeTmpCwd('orch-seq-skip-test-loop-');
+    pinLocalBranchPrefix(cwd);
+    const jobSlug = 'wise-pine-e904';
+    const baseTip = 'basehead00001111222233334444555566667777';
+    fs.mkdirSync(path.join(cwd, '.orch', jobSlug), { recursive: true });
+    writeJob(cwd, jobSlug, {
+      slug: jobSlug,
+      prompt: 'implement the billing module',
+      agent: 'claude',
+      maxRounds: 5,
+      state: 'running',
+      role: 'coordinator',
+      pid: process.pid,
+      startedAt: new Date(0).toISOString(),
+    });
+
+    const AgentClass = createMockAgentClass({
+      triage: TRIAGE_COMPLEX,
+      'seq-decomposer': unitsReply(TWO_UNITS),
+      decomposer: unitsReply(TWO_UNITS),
+      adjust: adjustOk(),
+    });
+    const spawnFn = makeSettlingSpawn({
+      settleMs: 20,
+      cwd,
+      parentSlug: jobSlug,
+      outcomes: {
+        '01-types': { state: 'done', sha: 'sha-01' },
+        '02-api': { state: 'done', sha: 'sha-02' },
+      },
+    });
+    let tipCounter = 0;
+    const mergeOneUnit = async () => {
+      const seq = readSeq(cwd, jobSlug);
+      tipCounter += 1;
+      writeSeq(cwd, jobSlug, { ...seq, tip: `tip-${tipCounter}` });
+    };
+
+    const logSpy = mock.method(console, 'log', () => {});
+    try {
+      await runSeqPipeline('implement the billing module', {
+        cwd,
+        jobSlug,
+        jobCwd: cwd,
+        agent: 'claude',
+        maxUnits: 8,
+        skipTestLoop: true,
+        AgentClass,
+        spawn: spawnFn,
+        allocateJob: async (opts) => realAllocateJob({ ...opts, cwd }),
+        reconcileJob: (c, slug) => readJob(c, slug),
+        mergeOneUnit,
+        pollIntervalMs: 20,
+        execFile: makeFakeExecFile([{ match: (args) => args.includes('rev-parse'), stdout: `${baseTip}\n` }]).execFile,
+        createWorktree: mock.fn(async ({ slug }) => ({
+          worktreePath: path.join(cwd, `wt-${slug}`),
+          branch: `orch/${slug}`,
+        })),
+        exit: mock.fn(),
+        patchJob: (c, slug, patch) => patchJob(c, slug, patch),
+        checkpointPause: async () => {},
+      });
+    } finally {
+      logSpy.mock.restore();
+    }
+
+    const unitCalls = spawnFn.calls.filter((c) => c.args.includes('--unit'));
+    assert.ok(unitCalls.length >= 1);
+    for (const call of unitCalls) {
+      assert.ok(call.args.includes('--skip-test-loop'));
+    }
   });
 });
 

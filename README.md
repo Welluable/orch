@@ -103,7 +103,8 @@ prints the reply.
 ### Verification loops
 
 Once a run reaches the worktree, two writer⇄critic loops gate the work in
-sequence:
+sequence. `--skip-test-loop` omits the test-writer ⇄ test-critic loop and still
+runs test-runner:
 
 ```text
 test-writer ──┐
@@ -177,6 +178,7 @@ agent CLI does all the actual reading and writing of files.
 | Mode | Behavior | Use when |
 | --- | --- | --- |
 | Default | Full triage → (quick-fix or research/plan/worktree/test-loop/code-loop/commit) pipeline. | You want orch to decide the right amount of ceremony. |
+| `--skip-test-loop` | Same write pipeline, but omits test-writer ⇄ test-critic and goes straight to code-writer ⇄ test-runner. Does not skip the existing test runner. | You already have tests/criteria and want implementation only. |
 | `--quick` | Skips triage, runs `quick-fix` directly in the current tree; no artifacts, worktree, or commits. | You already know it's a small, direct edit. |
 | `--ask` | Skips triage and all write pipelines; one read-only agent answers and orch prints the reply. | You want an answer about the codebase, not a change. |
 | `--dry-run` | Checks the selected agent CLI is on `PATH` and exits without running the pipeline. | You want to sanity-check your setup before a real run. |
@@ -262,6 +264,9 @@ Usage: orch [options] [command] <task...>
   the remote's default branch when `--pr` is set without `--base`.
 - `--max-rounds <n>` — max writer⇄critic and writer⇄runner iterations per
   implementer loop; defaults to `5`, ignored with `--ask` and `--quick`.
+- `--skip-test-loop` — skip the test-writer ⇄ test-critic loop and go straight
+  to code-writer ⇄ test-runner; does not skip the existing test runner;
+  incompatible with `--ask` / `--quick`.
 - `--fan-out` — decomposes the task into parallel workers coordinated by this
   process instead of running the single-worktree pipeline (see
   [Fan-out](#fan-out)); rejects `--ask`/`--quick`/`--dry-run`/`--seq`/`--decompose`.

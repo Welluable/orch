@@ -375,6 +375,25 @@ describe('codeWriterAgentArgs', () => {
     assert.ok(args.instructions.includes(feedback));
     assert.doesNotMatch(args.instructions, /\[Accepted Verification\]/);
   });
+
+  it('skipTestLoop replaces the frozen-verification bullet; omitted keeps it', () => {
+    const skipped = codeWriterAgentArgs({
+      ...base,
+      round: 1,
+      acceptedVerification: 'ok',
+      skipTestLoop: true,
+    });
+    assert.doesNotMatch(skipped.instructions, /frozen verification\s+from the test loop/);
+    assert.match(skipped.instructions, /existing test suite is the gate/);
+    assert.match(skipped.instructions, /\[Accepted Verification\]/);
+
+    const normal = codeWriterAgentArgs({
+      ...base,
+      round: 1,
+      acceptedVerification: 'ok',
+    });
+    assert.match(normal.instructions, /frozen verification\s+from the test loop/);
+  });
 });
 
 describe('testRunnerAgentArgs', () => {

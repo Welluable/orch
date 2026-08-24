@@ -223,6 +223,7 @@ describe('runDetached (detach-parent path)', () => {
       assert.ok(args.includes('claude'));
       assert.ok(args.includes('--max-rounds'));
       assert.ok(args.includes('5'));
+      assert.ok(!args.includes('--skip-test-loop'));
 
       assert.equal(spawnOptions.detached, true);
       assert.equal(spawnOptions.stdio[0], 'ignore');
@@ -245,6 +246,47 @@ describe('runDetached (detach-parent path)', () => {
 
       const printed = logSpy.mock.calls.map((c) => c.arguments.join(' ')).join('\n');
       assert.match(printed, new RegExp(`started ${slug} \\(pid 54321\\)`));
+    } finally {
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('forwards --skip-test-loop on child argv when set, and omits it otherwise', async () => {
+    const tmpCwd = makeTmpCwd('orch-detach-skip-test-loop-');
+    try {
+      const spawnWith = fakeSpawn(54330);
+      const logSpy = mock.method(console, 'log', () => {});
+      try {
+        await runDetached('do a trivial thing', {
+          agent: 'claude',
+          maxRounds: 5,
+          cwd: tmpCwd,
+          skipTestLoop: true,
+          spawn: spawnWith,
+          exit: mock.fn(),
+        });
+      } finally {
+        logSpy.mock.restore();
+      }
+      const [, withArgs, withOpts] = spawnWith.mock.calls[0].arguments;
+      assert.ok(withArgs.includes('--skip-test-loop'));
+      assert.equal(readJob(tmpCwd, withOpts.env.ORCH_JOB_SLUG).skipTestLoop, true);
+
+      const spawnWithout = fakeSpawn(54331);
+      const logSpy2 = mock.method(console, 'log', () => {});
+      try {
+        await runDetached('do a trivial thing', {
+          agent: 'claude',
+          maxRounds: 5,
+          cwd: tmpCwd,
+          spawn: spawnWithout,
+          exit: mock.fn(),
+        });
+      } finally {
+        logSpy2.mock.restore();
+      }
+      const [, withoutArgs] = spawnWithout.mock.calls[0].arguments;
+      assert.ok(!withoutArgs.includes('--skip-test-loop'));
     } finally {
       fs.rmSync(tmpCwd, { recursive: true, force: true });
     }

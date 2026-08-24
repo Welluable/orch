@@ -82,9 +82,9 @@ const mainPath = path.join(__dirname, '..', 'main.js');
  *
  * ## `orch continue <slug> <task...>` CLI
  *
- * - Options: `-v/--verbose`, `--agent`, `--max-rounds`, `--detach`,
- *   `--dry-run`; `--ask`/`--quick` are accepted (so a clear custom error
- *   prints) but always rejected.
+ * - Options: `-v/--verbose`, `--agent`, `--max-rounds`, `--skip-test-loop`,
+ *   `--detach`, `--dry-run`; `--ask`/`--quick` are accepted (so a clear custom
+ *   error prints) but always rejected.
  * - `--dry-run` on an eligible slug: exit 0, prints something, and leaves
  *   `run.json` completely unchanged (no `state: "running"`, no
  *   `continuation` bump).
@@ -572,6 +572,12 @@ describe('orch continue — CLI eligibility wiring', () => {
     const { code, stdout } = await runCli(['--help']);
     assert.equal(code, 0);
     assert.match(stdout, /orch continue/);
+  });
+
+  it('continue --help mentions --skip-test-loop', async () => {
+    const { code, stdout } = await runCli(['continue', '--help']);
+    assert.equal(code, 0);
+    assert.match(stdout, /--skip-test-loop/);
   });
 });
 

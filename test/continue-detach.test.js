@@ -264,6 +264,46 @@ describe('runContinueDetached — reopen + spawn wiring', () => {
     assert.equal(spawnOptions.env.ORCH_JOB_SLUG, slug);
   });
 
+  it('forwards --skip-test-loop on the child argv when set, and omits it otherwise', async () => {
+    const cwd = makeTmpCwd();
+    const { slug } = seedEligibleContinueJob(cwd);
+    const spawnWith = fakeSpawn(54326);
+    const logSpy = mock.method(console, 'log', () => {});
+    try {
+      await runContinueDetached(slug, 'follow-up polish', {
+        agent: 'claude',
+        maxRounds: 5,
+        cwd,
+        skipTestLoop: true,
+        spawn: spawnWith,
+        exit: mock.fn(),
+      });
+    } finally {
+      logSpy.mock.restore();
+    }
+    const [, withArgs] = spawnWith.mock.calls[0].arguments;
+    assert.ok(withArgs.includes('--skip-test-loop'));
+    assert.equal(readJob(cwd, slug).skipTestLoop, true);
+
+    const { slug: slug2 } = seedEligibleContinueJob(cwd, { slug: 'continue-noskip-0001' });
+    const spawnWithout = fakeSpawn(54327);
+    const logSpy2 = mock.method(console, 'log', () => {});
+    try {
+      await runContinueDetached(slug2, 'follow-up polish', {
+        agent: 'claude',
+        maxRounds: 5,
+        cwd,
+        spawn: spawnWithout,
+        exit: mock.fn(),
+      });
+    } finally {
+      logSpy2.mock.restore();
+    }
+    const [, withoutArgs] = spawnWithout.mock.calls[0].arguments;
+    assert.ok(!withoutArgs.includes('--skip-test-loop'));
+    assert.equal('skipTestLoop' in readJob(cwd, slug2), false);
+  });
+
   it('reuses the existing orch.log path in append mode — prior content survives', async () => {
     const cwd = makeTmpCwd();
     const { slug } = seedEligibleContinueJob(cwd);
