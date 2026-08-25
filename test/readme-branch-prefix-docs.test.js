@@ -66,8 +66,16 @@ function sliceAtHeading(md, heading, marker) {
 
 function configBlock(md) {
   const cli = section(md, 'CLI Reference');
-  const match = cli.match(/^Config:\s*\n([\s\S]*?)(?=^Job-control subcommands)/m);
-  assert.ok(match, 'expected Config: block before Job-control in CLI Reference');
+  // Stop at Skill: (new) or Job-control so a Skill block is not swallowed into Config.
+  const match = cli.match(/^Config:\s*\n([\s\S]*?)(?=^(?:Skill:|Job-control))/m);
+  assert.ok(match, 'expected Config: block before Skill: or Job-control in CLI Reference');
+  return match[1];
+}
+
+function skillBlock(md) {
+  const cli = section(md, 'CLI Reference');
+  const match = cli.match(/^Skill:\s*\n([\s\S]*?)(?=^Job-control)/m);
+  assert.ok(match, 'expected Skill: block after Config: and before Job-control in CLI Reference');
   return match[1];
 }
 
@@ -356,6 +364,63 @@ describe('06-docs README Config / Artifacts branch-prefix copy', () => {
   });
 });
 
+describe('06-docs README Skill command + Quick Start', () => {
+  it('CLI Reference has a Skill: block after Config: and before Job-control', () => {
+    const md = readme();
+    const cli = section(md, 'CLI Reference');
+    const configAt = cli.search(/^Config:\s*$/m);
+    const skillAt = cli.search(/^Skill:\s*$/m);
+    const jobsAt = cli.search(/^Job-control /m);
+    assert.ok(configAt >= 0, 'CLI Reference must keep a Config: heading');
+    assert.ok(skillAt >= 0, 'CLI Reference must have a Skill: heading after Config:');
+    assert.ok(jobsAt >= 0, 'CLI Reference must keep Job-control after Skill:');
+    assert.ok(configAt < skillAt, 'Skill: must follow Config:');
+    assert.ok(skillAt < jobsAt, 'Skill: must precede Job-control');
+
+    const cfg = configBlock(md);
+    assert.doesNotMatch(cfg, /^Skill:/m);
+    assert.doesNotMatch(cfg, /orch skill\b/, 'Config: must not swallow Skill bullets');
+
+    const skill = skillBlock(md);
+    assert.match(skill, /orch skill\b/);
+    assert.match(skill, /--global/);
+    assert.match(skill, /--local/);
+    assert.match(skill, /~\/\.agents\/skills\/orch/);
+    assert.match(skill, /~\/\.claude\/skills\/orch/);
+    assert.match(skill, /\.agents\/skills\/orch/);
+    assert.match(skill, /\.claude\/skills\/orch/);
+  });
+
+  it('Examples bash block adds orch skill and orch skill --local after config lines', () => {
+    const bash = cliExamplesBash(readme());
+    assert.match(bash, /^orch skill$/m);
+    assert.match(bash, /^orch skill --local$/m);
+
+    const lastPrefix = bash.indexOf('orch config --branch-prefix orch');
+    const skillAt = bash.search(/^orch skill$/m);
+    const skillLocalAt = bash.search(/^orch skill --local$/m);
+    assert.ok(lastPrefix >= 0);
+    assert.ok(skillAt > lastPrefix, 'orch skill must follow the config examples');
+    assert.ok(skillLocalAt > skillAt, 'orch skill --local must follow bare orch skill');
+  });
+
+  it('Quick Start points at orch skill right after npm install -g', () => {
+    const qs = section(readme(), 'Quick Start');
+    const installAt = qs.indexOf('npm install -g @welluable/orch');
+    assert.ok(installAt >= 0, 'Quick Start must keep npm install -g @welluable/orch');
+    const afterInstall = qs.slice(installAt);
+    const nextFence = afterInstall.indexOf('```', afterInstall.indexOf('\n'));
+    const afterFence = nextFence >= 0 ? afterInstall.slice(nextFence) : afterInstall;
+    const firstTask = afterFence.search(/orch "/);
+    const window = firstTask >= 0 ? afterFence.slice(0, firstTask) : afterFence;
+    assert.match(
+      window,
+      /orch skill\b/,
+      'Quick Start must mention orch skill in a sentence after npm install -g and before the first orch "<task>" example',
+    );
+  });
+});
+
 describe('06-docs main.js --pr help and addHelpText config examples', () => {
   it('--pr option help uses <prefix>/<slug>, not orch/<slug>', () => {
     const src = mainJs();
@@ -400,6 +465,31 @@ describe('06-docs main.js --pr help and addHelpText config examples', () => {
     const firstPrefix = afterAgent.indexOf(SPEC_PREFIX_EXAMPLES[0]);
     assert.ok(headlessAt < 0 || firstPrefix < headlessAt,
       '--branch-prefix examples must sit with the other orch config lines, before Headless runs');
+  });
+
+  it('addHelpText includes orch skill / orch skill --local with the config examples', () => {
+    const block = addHelpTextBlock(mainJs());
+    assert.match(block, /\$ orch skill\b/);
+    assert.match(block, /\$ orch skill --local\b/);
+
+    const lastConfig = block.indexOf('$ orch config --branch-prefix orch');
+    const skillAt = block.search(/\$ orch skill\b/);
+    const skillLocalAt = block.indexOf('$ orch skill --local');
+    const headlessAt = block.search(/Headless runs:/);
+    assert.ok(lastConfig >= 0, 'expected the builtin-prefix config example as an anchor');
+    assert.ok(skillAt >= 0, 'expected `$ orch skill` in addHelpText');
+    assert.ok(
+      skillAt > lastConfig,
+      'orch skill examples must follow the orch config examples',
+    );
+    assert.ok(
+      skillLocalAt > skillAt,
+      '`$ orch skill --local` must follow bare `$ orch skill`',
+    );
+    assert.ok(
+      headlessAt < 0 || skillLocalAt < headlessAt,
+      'orch skill examples must sit with config examples, before Headless runs',
+    );
   });
 
   it('leaves config .description and --branch-prefix option wiring alone', () => {

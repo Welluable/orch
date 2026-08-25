@@ -50,6 +50,9 @@ orch: commit: a1b2c3d on orch/verbose-flag-x7q2
 npm install -g @welluable/orch
 ```
 
+Run `orch skill` to install the orch Agent Skill so Cursor, Claude Code, Codex,
+and OpenCode will shell out to orch instead of reimplementing the pipeline.
+
 Make sure an agent CLI is on your `PATH` — orch defaults to `--agent cursor`
 (the Cursor Agent CLI, command `agent`); `claude`, `agn`, and `opencode` are also
 supported. Pin a default with `orch config --agent <name>` so you don't need
@@ -317,6 +320,16 @@ Config:
   Restore the builtin with `--branch-prefix orch`. Keys merge on write (must
   not wipe `agent`/`notify`).
 
+Skill:
+
+- `orch skill` — copies the packaged Agent Skill into coding-agent skill dirs
+  so Cursor, Claude Code, Codex, and OpenCode shell out to `orch`. Default
+  (`--global`) writes `~/.agents/skills/orch/SKILL.md` and
+  `~/.claude/skills/orch/SKILL.md`. Overwrites without `--force`.
+- `orch skill --local` — writes `<cwd>/.agents/skills/orch/SKILL.md` and
+  `<cwd>/.claude/skills/orch/SKILL.md` instead. `--global` and `--local` are
+  mutually exclusive.
+
 Job-control subcommands (see [Headless runs](#headless-runs)):
 
 - `orch list` — lists all runs tracked under `.orch/` in the current directory.
@@ -375,6 +388,8 @@ orch config --agent opencode
 orch config --branch-prefix long_running_session
 orch config --branch-prefix long_running_session --local
 orch config --branch-prefix orch
+orch skill
+orch skill --local
 ```
 
 ## Headless runs
